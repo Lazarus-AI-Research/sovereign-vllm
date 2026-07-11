@@ -1,0 +1,39 @@
+[project]
+name = "sovereign-runtime"
+version = "0.1.0.dev0"
+description = "Lazarus Sovereign Runtime appliance layer over vLLM"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+    "jsonschema",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "prometheus-client",
+]
+
+[project.optional-dependencies]
+# The inference engine is an extra so the appliance layer can be developed and
+# unit-tested on hosts that cannot install vLLM (e.g. macOS). Keep the pin in
+# sync with constraints.txt.
+engine = [
+    "vllm==0.25.0",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+run-sovereign-runtime = "lazarus.appliance.launcher:main"
+sovereign-runtime-healthcheck = "lazarus.appliance.healthcheck:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lazarus"]
+
+[tool.ruff]
+line-length = 100
