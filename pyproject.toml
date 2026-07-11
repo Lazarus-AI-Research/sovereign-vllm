@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pyyaml",
     "jsonschema",
+    "pydantic>=2",
     "fastapi",
     "uvicorn",
     "httpx",
