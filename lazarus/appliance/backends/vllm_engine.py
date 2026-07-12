@@ -147,8 +147,21 @@ class VllmBackend(EngineBackend):
             args = parser.parse_args(filtered)
 
             engine = AsyncLLM.from_engine_args(AsyncEngineArgs.from_cli_args(args))
-            app = build_app(args)
-            await init_app_state(engine, app.state, args)
+            # supported_tasks gates which routers (generate vs pooling) mount.
+            supported_tasks = None
+            getter = getattr(engine, "get_supported_tasks", None)
+            if getter is not None:
+                result = getter()
+                supported_tasks = await result if asyncio.iscoroutine(result) else result
+            model_config = getattr(engine, "model_config", None)
+            try:
+                app = build_app(args, supported_tasks, model_config)
+            except TypeError:  # older signature
+                app = build_app(args)
+            try:
+                await init_app_state(engine, app.state, args, supported_tasks)
+            except TypeError:
+                await init_app_state(engine, app.state, args)
             client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://sovereign-role",
