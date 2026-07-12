@@ -156,8 +156,30 @@ class Appliance:
                 return
 
 
+def _ensure_toolchain_on_path() -> None:
+    """Make the appliance's bundled build tools discoverable (design.md §24).
+
+    vLLM/flashinfer JIT-compile CUDA kernels (e.g. the sampling module) at
+    engine warmup by shelling out to ``ninja``. When the runtime is launched
+    without the venv "activated" — as the supervisor does, invoking the entry
+    script directly — ``sys.executable``'s bin dir is not on PATH, so
+    ``shutil.which("ninja")`` returns None and the build dies with
+    ``FileNotFoundError: 'ninja'``. A self-contained appliance must find its
+    own bundled toolchain regardless of how it was launched, so prepend the
+    interpreter's bin dir to PATH. Idempotent; child engine processes inherit
+    this via the environment.
+    """
+    bindir = os.path.dirname(os.path.abspath(sys.executable))
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if bindir and bindir not in parts:
+        os.environ["PATH"] = os.pathsep.join([bindir, *parts]) if parts and parts[0] else bindir
+        logger.info("prepended interpreter bin dir to PATH for JIT toolchain: %s", bindir)
+
+
 def main() -> int:
     import uvicorn
+
+    _ensure_toolchain_on_path()
 
     logging.basicConfig(
         level=logging.INFO,
