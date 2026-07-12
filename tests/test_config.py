@@ -7,7 +7,7 @@ from lazarus.appliance.config import ConfigError, load_config
 def test_valid_config_parses(config_file):
     config = load_config(config_file)
     assert config.roles.generation.served_model_name == "assistant-dev"
-    assert config.alias_to_role() == {"assistant-dev": "generation", "embedding-dev": "embedding"}
+    assert config.alias_to_role() == {"assistant-dev": "generation", "embedding-omni-default": "embedding"}
     assert config.roles.embedding.throttle_when_generation_queue_above == 2
 
 

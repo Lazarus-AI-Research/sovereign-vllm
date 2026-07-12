@@ -48,7 +48,7 @@ def test_manifest_reports_discovered_dimensions(healthy):
 
 def test_models_chat_and_embeddings(healthy):
     ids = {m["id"] for m in healthy.get("/v1/models").json()["data"]}
-    assert ids == {"assistant-dev", "embedding-dev"}
+    assert ids == {"assistant-dev", "embedding-omni-default"}
 
     chat = healthy.post(
         "/v1/chat/completions",
@@ -57,7 +57,7 @@ def test_models_chat_and_embeddings(healthy):
     assert chat.status_code == 200
     assert chat.json()["choices"][0]["message"]["content"]
 
-    emb = healthy.post("/v1/embeddings", json={"model": "embedding-dev", "input": "hello"})
+    emb = healthy.post("/v1/embeddings", json={"model": "embedding-omni-default", "input": "hello"})
     vector = emb.json()["data"][0]["embedding"]
     assert len(vector) == 384
     assert abs(math.sqrt(sum(v * v for v in vector)) - 1.0) < 1e-6
@@ -76,7 +76,7 @@ def test_streaming_ends_with_done(healthy):
 def test_role_mismatch_404(healthy):
     resp = healthy.post(
         "/v1/chat/completions",
-        json={"model": "embedding-dev", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "embedding-omni-default", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 404
 
