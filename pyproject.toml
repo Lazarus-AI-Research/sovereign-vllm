@@ -25,6 +25,11 @@ dev = [
     "ruff",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+# Loaded by vLLM in every process (incl. engine workers): registers the
+# thinker-only Qwen2.5-Omni architecture for LCO embedding checkpoints (M12).
+lazarus_lco_omni = "lazarus.models.embedding.lco_omni:register"
+
 [project.scripts]
 run-sovereign-runtime = "lazarus.appliance.launcher:main"
 sovereign-runtime-healthcheck = "lazarus.appliance.healthcheck:main"
