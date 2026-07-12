@@ -65,12 +65,26 @@ class VllmBackend(EngineBackend):
                 recoverable=False,
             ) from exc
 
+        # §24 step 6: the appliance downloads/verifies weights itself, in the
+        # downloading state, before any engine starts. The engine then loads
+        # from the local cache — engine-core child processes never touch the
+        # network (whose shared HTTP clients do not survive the fork).
         on_state("downloading")
+        for name, role in config.roles.items():
+            if role.enabled and role.source == "huggingface":
+                try:
+                    await self._download(role)
+                except Exception as exc:
+                    logger.exception("download failed for role %s", name)
+                    self._roles[name] = RoleInfo(status="unhealthy", error_code=_download_error_code(exc))
+
         # RolesSection.items() is ordered: generation loads before embedding.
         for name, role in config.roles.items():
             if not role.enabled:
                 self._roles[name] = RoleInfo(status="disabled")
                 continue
+            if self._roles.get(name) and self._roles[name].status == "unhealthy":
+                continue  # download already failed
             on_state("loading")
             if name == "generation":
                 await self._load_generation(role)
@@ -80,6 +94,19 @@ class VllmBackend(EngineBackend):
                 # vision/audio/rerank roles are post-MVP (§27).
                 self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_LOAD_FAILED")
                 logger.warning("role %s is not supported by this backend yet", name)
+
+    async def _download(self, role: RoleConfig) -> None:
+        import asyncio
+        import functools
+
+        from huggingface_hub import snapshot_download
+
+        kwargs: dict = {"repo_id": role.model}
+        if role.revision and role.revision not in ("<immutable-revision>",):
+            kwargs["revision"] = role.revision
+        loop = asyncio.get_running_loop()
+        path = await loop.run_in_executor(None, functools.partial(snapshot_download, **kwargs))
+        logger.info("weights for %s at %s", role.model, path)
 
     def _engine_kwargs(self, role: RoleConfig) -> dict:
         kwargs = dict(
@@ -335,3 +362,12 @@ def _error_code(exc: Exception) -> str:
     if "not found" in message or "404" in message or "does not exist" in message:
         return "MODEL_NOT_FOUND"
     return "MODEL_LOAD_FAILED"
+
+
+def _download_error_code(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "revision" in message:
+        return "MODEL_REVISION_NOT_FOUND"
+    if "404" in message or "not found" in message or "repository" in message:
+        return "MODEL_NOT_FOUND"
+    return "MODEL_DOWNLOAD_FAILED"
