@@ -40,6 +40,11 @@ class RoleConfig(BaseModel):
     # Escape hatch (§2.9 warn-don't-block): extra engine CLI flags appended
     # to the role's engine argv. Unknown flags are dropped with a warning.
     engine_args: list[str] = []
+    # Tool calling is on by default for generation: unset = infer the parser
+    # from the model; "off" disables; any other value = explicit parser name.
+    tool_call_parser: str | None = None
+    # Same contract for reasoning separation (thinking → reasoning_content).
+    reasoning_parser: str | None = None
 
     def missing_load_fields(self) -> list[str]:
         if not self.enabled:

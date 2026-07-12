@@ -53,3 +53,11 @@ def test_disabled_role_needs_no_model(tmp_path, config_file):
     path.write_text(yaml.safe_dump(data))
     config = load_config(path)
     assert "embedding" not in config.enabled_roles()
+
+
+def test_tool_parser_field(tmp_path, config_file):
+    data = yaml.safe_load(config_file.read_text())
+    data["roles"]["generation"]["tool_call_parser"] = "off"
+    path = tmp_path / "tools-off.yaml"
+    path.write_text(yaml.safe_dump(data))
+    assert load_config(path).roles.generation.tool_call_parser == "off"

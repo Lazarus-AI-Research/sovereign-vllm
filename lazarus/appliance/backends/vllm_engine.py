@@ -99,6 +99,51 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         path = await loop.run_in_executor(None, functools.partial(snapshot_download, **kwargs))
         logger.info("weights for %s at %s", role.model, path)
 
+    # Appliance defaults: capabilities every deployment wants, applied to
+    # every role. Unknown flags are dropped per engine version, so this list
+    # can stay aspirational. Note --disable-log-requests is privacy (§2.4):
+    # engine request logs can include prompt previews.
+    APPLIANCE_DEFAULT_FLAGS = [
+        "--enable-server-load-tracking",
+        "--enable-request-id-headers",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--disable-log-requests",
+    ]
+
+    @staticmethod
+    def _infer_tool_parser(model: str) -> str | None:
+        """Pick a tool-call parser from the model name. Only confident
+        matches: a wrong parser corrupts outputs, so unknown models get no
+        tool calling unless the admin sets tool_call_parser explicitly."""
+        lowered = model.lower()
+        for pattern, parser in (
+            ("functiongemma", "functiongemma"),
+            ("gemma-4", "gemma4"),
+            ("gemma4", "gemma4"),
+            ("qwen3-coder", "qwen3_coder"),
+            ("qwen", "hermes"),
+            ("llama-4", "llama4_pythonic"),
+        ):
+            if pattern in lowered:
+                return parser
+        return None
+
+    @staticmethod
+    def _infer_reasoning_parser(model: str) -> str | None:
+        """Reasoning separation keeps thinking out of message content."""
+        lowered = model.lower()
+        for pattern, parser in (
+            ("gemma-4", "gemma4"),
+            ("gemma4", "gemma4"),
+            ("qwen3", "qwen3"),
+            ("deepseek-r1", "deepseek_r1"),
+            ("kimi", "kimi_k2"),
+        ):
+            if pattern in lowered:
+                return parser
+        return None
+
     def _role_argv(self, name: str, role: RoleConfig) -> list[str]:
         argv = [
             "--model", role.model,
@@ -111,6 +156,21 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         if self.backend_id not in ("cpu", "mock"):
             fraction = round(MEMORY_HEADROOM * role.memory_weight / 100.0, 3)
             argv += ["--gpu-memory-utilization", str(fraction)]
+        argv += self.APPLIANCE_DEFAULT_FLAGS
+        if name == "generation" and role.tool_call_parser != "off":
+            parser = role.tool_call_parser or self._infer_tool_parser(role.model or "")
+            if parser:
+                argv += ["--enable-auto-tool-choice", "--tool-call-parser", parser]
+            else:
+                logger.warning(
+                    "no tool-call parser known for %s; tool calling disabled "
+                    "(set roles.generation.tool_call_parser to enable)",
+                    role.model,
+                )
+        if name == "generation" and role.reasoning_parser != "off":
+            parser = role.reasoning_parser or self._infer_reasoning_parser(role.model or "")
+            if parser:
+                argv += ["--reasoning-parser", parser]
         if role.engine_args:
             argv += role.engine_args
         if name == "embedding":

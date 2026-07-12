@@ -66,3 +66,38 @@ def test_proxy_requires_known_role(client):
         json={},
     )
     assert resp.status_code == 404
+
+
+def test_tool_parser_inference():
+    from lazarus.appliance.backends.vllm_engine import VllmBackend
+
+    infer = VllmBackend._infer_tool_parser
+    assert infer("google/gemma-4-E2B-it") == "gemma4"
+    assert infer("Qwen/Qwen3-32B") == "hermes"
+    assert infer("Qwen/Qwen3-Coder-30B") == "qwen3_coder"
+    assert infer("some/unknown-model") is None
+
+
+def test_generation_argv_defaults():
+    from lazarus.appliance.backends.vllm_engine import VllmBackend
+    from lazarus.appliance.config import RoleConfig
+
+    backend = VllmBackend.__new__(VllmBackend)
+    backend.backend_id = "cuda"
+    role = RoleConfig(
+        enabled=True, task="generate", source="huggingface",
+        model="google/gemma-4-E2B-it", served_model_name="assistant-large",
+    )
+    argv = backend._role_argv("generation", role)
+    joined = " ".join(argv)
+    assert "--enable-auto-tool-choice" in joined
+    assert "--tool-call-parser gemma4" in joined
+    assert "--reasoning-parser gemma4" in joined
+    assert "--enable-server-load-tracking" in joined
+    assert "--disable-log-requests" in joined
+
+    role.tool_call_parser = "off"
+    role.reasoning_parser = "off"
+    joined = " ".join(backend._role_argv("generation", role))
+    assert "--enable-auto-tool-choice" not in joined
+    assert "--reasoning-parser" not in joined
