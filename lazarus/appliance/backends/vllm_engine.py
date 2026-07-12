@@ -115,13 +115,18 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             argv += role.engine_args
         if name == "embedding":
             argv += ["--runner", "pooling"]
+            # vLLM 0.25 renamed --override-pooler-config to --pooler-config and
+            # PoolerConfig's `normalize` to `use_activation` (the embed head's
+            # activation IS the L2 normalization). The old spelling was being
+            # silently dropped by the unknown-flag filter, so the config's
+            # pooling/normalization fields never reached the engine.
             pooler: dict = {}
             if role.pooling:
                 pooler["pooling_type"] = role.pooling.upper()
             if role.normalization:
-                pooler["normalize"] = role.normalization != "none"
+                pooler["use_activation"] = role.normalization != "none"
             if pooler:
-                argv += ["--override-pooler-config", json.dumps(pooler)]
+                argv += ["--pooler-config", json.dumps(pooler)]
         return argv
 
     async def _start_role(self, name: str, role: RoleConfig) -> None:
