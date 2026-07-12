@@ -12,11 +12,14 @@ token_env: SOVEREIGN_AGENT_TOKEN
 llama_server: llama-server
 
 roles:
+  # Default generation via Google's official QAT release
+  # (source: google/gemma-4-E2B-it-qat-q4_0-gguf).
   generation:
-    model_path: /opt/sovereign/models/gemma-4-E2B-it-Q4_K_M.gguf
+    model_path: /opt/sovereign/models/gemma-4-E2B_q4_0-it.gguf
+    mmproj_path: /opt/sovereign/models/gemma-4-E2B-it-mmproj.gguf
     port: 9101
     context_length: 8192
-    args: ["--jinja"]
+    args: ["--jinja", "--reasoning-budget", "0"]
 
   # Default omni embedding via GGUF + multimodal projector
   # (source: marksverdhei/LCO-Embedding-Omni-3B-2605-GGUF).
