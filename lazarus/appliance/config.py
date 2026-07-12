@@ -37,6 +37,9 @@ class RoleConfig(BaseModel):
     pooling: Literal["last", "mean", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     throttle_when_generation_queue_above: int | None = Field(default=None, ge=0)
+    # Escape hatch (§2.9 warn-don't-block): extra engine CLI flags appended
+    # to the role's engine argv. Unknown flags are dropped with a warning.
+    engine_args: list[str] = []
 
     def missing_load_fields(self) -> list[str]:
         if not self.enabled:

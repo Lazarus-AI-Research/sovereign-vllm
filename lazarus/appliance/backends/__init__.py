@@ -28,4 +28,8 @@ def select_backend() -> EngineBackend:
         from lazarus.appliance.backends.vllm_engine import VllmBackend
 
         return VllmBackend()
+    if name == "agent":
+        from lazarus.appliance.backends.agent import AgentBackend
+
+        return AgentBackend()
     raise ValueError(f"unknown SOVEREIGN_ENGINE_BACKEND: {name!r}")

@@ -26,11 +26,12 @@ import functools
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 
 import httpx
 
 from lazarus.appliance.backends.base import BackendStartError, EngineBackend, RoleInfo
+from lazarus.appliance.backends.roleclient import RoleClientMixin
 from lazarus.appliance.config import RoleConfig, RuntimeConfig
 
 logger = logging.getLogger("sovereign.vllm")
@@ -47,7 +48,7 @@ class _RoleApp:
         self.client = client
 
 
-class VllmBackend(EngineBackend):
+class VllmBackend(RoleClientMixin, EngineBackend):
     def __init__(self) -> None:
         self.backend_id = os.environ.get("VLLM_BACKEND", "cpu")
         self._roles: dict[str, RoleInfo] = {}
@@ -110,6 +111,8 @@ class VllmBackend(EngineBackend):
         if self.backend_id not in ("cpu", "mock"):
             fraction = round(MEMORY_HEADROOM * role.memory_weight / 100.0, 3)
             argv += ["--gpu-memory-utilization", str(fraction)]
+        if role.engine_args:
+            argv += role.engine_args
         if name == "embedding":
             argv += ["--runner", "pooling"]
             pooler: dict = {}
@@ -237,37 +240,8 @@ class VllmBackend(EngineBackend):
             pass
         return {"vendor": "cpu", "device_count": 0, "unified_memory": False}
 
-    # ── OpenAI surface (used by the startup smoke test and probes; live
-    #    traffic is forwarded raw by the API layer via role_client) ────────
-
-    async def _post(self, role: str, path: str, body: dict) -> dict:
-        client = self.role_client(role)
-        if client is None:
-            raise RuntimeError(f"{role} role is not loaded")
-        resp = await client.post(path, json=body)
-        if resp.status_code != 200:
-            raise RuntimeError(f"{path}: {resp.status_code}: {resp.text[:300]}")
-        return resp.json()
-
-    async def chat_completion(self, body: dict) -> dict:
-        return await self._post("generation", "/v1/chat/completions", body)
-
-    async def chat_completion_stream(self, body: dict) -> AsyncIterator:
-        client = self.role_client("generation")
-        if client is None:
-            raise RuntimeError("generation role is not loaded")
-        async with client.stream(
-            "POST", "/v1/chat/completions", json={**body, "stream": True}
-        ) as resp:
-            async for line in resp.aiter_lines():
-                if line:
-                    yield line + "\n\n"
-
-    async def completion(self, body: dict) -> dict:
-        return await self._post("generation", "/v1/completions", body)
-
-    async def embeddings(self, body: dict) -> dict:
-        return await self._post("embedding", "/v1/embeddings", body)
+    # OpenAI-surface methods (smoke test + probes) come from RoleClientMixin;
+    # live traffic is forwarded raw by the API layer via role_client.
 
 
 def _error_code(exc: Exception) -> str:

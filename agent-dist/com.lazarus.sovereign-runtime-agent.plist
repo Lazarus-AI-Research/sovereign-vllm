@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Sovereign host inference agent (Metal Phase 2, design.md §2.6).
+     Installed to ~/Library/LaunchAgents by install-agent.sh; placeholders
+     (__AGENT_BIN__, __AGENT_CONFIG__, __AGENT_TOKEN__, __LOG_DIR__) are
+     filled at install time. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lazarus.sovereign-runtime-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENT_BIN__</string>
+        <string>--config</string>
+        <string>__AGENT_CONFIG__</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SOVEREIGN_AGENT_TOKEN</key>
+        <string>__AGENT_TOKEN__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/agent.log</string>
+</dict>
+</plist>

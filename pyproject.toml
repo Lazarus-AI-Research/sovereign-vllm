@@ -28,6 +28,7 @@ dev = [
 [project.scripts]
 run-sovereign-runtime = "lazarus.appliance.launcher:main"
 sovereign-runtime-healthcheck = "lazarus.appliance.healthcheck:main"
+sovereign-runtime-agent = "lazarus.agent.server:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,28 @@
+# Sovereign host inference agent configuration (~/.sovereign/agent.yaml).
+# Models are GGUF files on the host; weights live in the deploy ./models
+# mount so container and host share one copy.
+#
+# §10.3 note: the agent serves what llama.cpp supports. Platforms may run
+# generation-only (or a text fallback) while omni embedding conformance is
+# pending; the runtime manifest reports exactly what is loaded.
+
+listen: 127.0.0.1
+port: 9100
+token_env: SOVEREIGN_AGENT_TOKEN
+llama_server: llama-server
+
+roles:
+  generation:
+    model_path: /opt/sovereign/models/gemma-4-E2B-it-Q4_K_M.gguf
+    port: 9101
+    context_length: 8192
+    args: ["--jinja"]
+
+  # Default omni embedding via GGUF + multimodal projector
+  # (source: marksverdhei/LCO-Embedding-Omni-3B-2605-GGUF).
+  embedding:
+    model_path: /opt/sovereign/models/LCO-Embedding-Omni-3B-2605-Q4_K_M.gguf
+    mmproj_path: /opt/sovereign/models/mmproj-LCO-Embedding-Omni-3B-2605-F16.gguf
+    port: 9102
+    context_length: 4096
+    args: ["--embedding", "--pooling", "last"]
