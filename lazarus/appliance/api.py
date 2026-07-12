@@ -225,12 +225,68 @@ def build_app(
             return _not_ready()
         return None
 
-    async def run_role(role: str, alias: str, call):
+    async def forward(role: str, path: str, raw_body: bytes):
+        """Raw in-process forward to the role's vLLM app (streaming intact).
+        Returns None when the backend has no per-role app (fake backend)."""
+        role_client = getattr(backend, "role_client", None)
+        client = role_client(role) if role_client else None
+        if client is None:
+            return None
+        upstream = client.build_request(
+            "POST", path, content=raw_body, headers={"Content-Type": "application/json"}
+        )
+        resp = await client.send(upstream, stream=True)
+
+        async def relay():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+
+        return StreamingResponse(
+            relay(),
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type"),
+        )
+
+    async def openai_endpoint(
+        request: Request, role: str, required_fields: tuple[str, ...]
+    ):
+        raw_body = await request.body()
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            return _error(400, "request body must be JSON", "invalid_request_error")
+        if denied := route(body, role, required_fields):
+            return denied
+        alias = body["model"]
         try:
             async with admission.slot(role):
-                result = await call()
-            REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
-            return result
+                if (response := await forward(role, request.url.path, raw_body)) is not None:
+                    REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
+                    return response
+                # Fake-backend path (tests/CI): dict-based handlers.
+                if request.url.path.endswith("chat/completions") and body.get("stream"):
+
+                    async def sse():
+                        async for chunk in backend.chat_completion_stream(body):
+                            if isinstance(chunk, str):
+                                yield chunk if chunk.endswith("\n\n") else chunk + "\n\n"
+                            else:
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                    REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
+                    return StreamingResponse(sse(), media_type="text/event-stream")
+                if request.url.path.endswith("chat/completions"):
+                    result = await backend.chat_completion(body)
+                elif request.url.path.endswith("/completions"):
+                    result = await backend.completion(body)
+                else:
+                    result = await backend.embeddings(body)
+                REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
+                return result
         except Throttled:
             REQUESTS.labels(role=role, served_model=alias, outcome="throttled").inc()
             return JSONResponse(
@@ -245,52 +301,14 @@ def build_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _error(400, "request body must be JSON", "invalid_request_error")
-        if denied := route(body, "generation", ("model", "messages")):
-            return denied
-        alias = body["model"]
-
-        if body.get("stream"):
-
-            async def sse():
-                saw_done = False
-                async for chunk in backend.chat_completion_stream(body):
-                    if isinstance(chunk, str):
-                        # vLLM serving yields pre-framed SSE strings
-                        if "[DONE]" in chunk:
-                            saw_done = True
-                        yield chunk if chunk.endswith("\n\n") else chunk + "\n\n"
-                    else:
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                if not saw_done:
-                    yield "data: [DONE]\n\n"
-
-            REQUESTS.labels(role="generation", served_model=alias, outcome="ok").inc()
-            return StreamingResponse(sse(), media_type="text/event-stream")
-
-        return await run_role("generation", alias, lambda: backend.chat_completion(body))
+        return await openai_endpoint(request, "generation", ("model", "messages"))
 
     @app.post("/v1/completions")
     async def completions(request: Request):
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _error(400, "request body must be JSON", "invalid_request_error")
-        if denied := route(body, "generation", ("model", "prompt")):
-            return denied
-        return await run_role("generation", body["model"], lambda: backend.completion(body))
+        return await openai_endpoint(request, "generation", ("model", "prompt"))
 
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return _error(400, "request body must be JSON", "invalid_request_error")
-        if denied := route(body, "embedding", ("model", "input")):
-            return denied
-        return await run_role("embedding", body["model"], lambda: backend.embeddings(body))
+        return await openai_endpoint(request, "embedding", ("model", "input"))
 
     return app

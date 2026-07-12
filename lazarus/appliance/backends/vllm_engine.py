@@ -1,57 +1,57 @@
 """In-process vLLM backend: one supervised process, multiple engines
 (design.md §9 — generation + embedding roles behind one port).
 
-Imports are lazy: this module is only loaded when SOVEREIGN_ENGINE_BACKEND is
-"vllm" (the default in runtime images). Delegates OpenAI protocol handling to
-vLLM's own serving layer so behavior matches `vllm serve` exactly.
+Architecture: each role gets vLLM's OWN fully-assembled OpenAI FastAPI app
+(`build_app` + `init_app_state` — the same assembly `vllm serve` uses),
+running in-process. The appliance dispatches role-routed /v1 traffic to the
+role's app over an in-process ASGI transport. This delegates protocol
+behavior wholesale to the pinned vLLM instead of mirroring its internal
+serving constructors, which reorganize between releases.
 
-Multi-role notes:
-- Roles load strictly serially, generation first (§24 steps 8–9), so GPU
-  memory profiling never races between engines.
+Multi-role invariants:
+- Roles load strictly serially, generation first (§24 steps 8–9), so memory
+  profiling never races between engines.
+- The appliance downloads weights itself in the downloading state (§24 step
+  6); engine child processes never touch the network.
 - memory_weight maps to per-engine gpu_memory_utilization with fixed headroom
-  on accelerator backends; the CPU backend sizes its KV cache via
-  VLLM_CPU_KVCACHE_SPACE instead (§3.5: best-effort, observed via metrics).
+  on accelerator backends (§3.5 best-effort); CPU sizes KV cache via
+  VLLM_CPU_KVCACHE_SPACE.
 - Embedding dimensions are probed after load, never assumed (§10.1).
-
-STATUS: written against vLLM 0.25 (pinned in constraints.txt); the serving
-constructor surface drifts between releases, so kwargs are filtered by
-signature. The conformance harness inside the runtime image is the gate.
 """
 
 from __future__ import annotations
 
-import inspect
+import asyncio
+import functools
+import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable
+
+import httpx
 
 from lazarus.appliance.backends.base import BackendStartError, EngineBackend, RoleInfo
 from lazarus.appliance.config import RoleConfig, RuntimeConfig
 
 logger = logging.getLogger("sovereign.vllm")
 
-# Fraction of accelerator memory the two engines may divide between them;
-# the remainder absorbs per-engine CUDA context and cudagraph overhead.
+# Fraction of accelerator memory the engines may divide between them; the
+# remainder absorbs per-engine CUDA context and cudagraph overhead.
 MEMORY_HEADROOM = 0.92
 
 
-def _filtered_kwargs(callable_, /, **kwargs):
-    """Drop kwargs the callable doesn't accept — tolerates serving-layer
-    signature drift across pinned-version bumps in overlay mode."""
-    signature = inspect.signature(callable_)
-    if any(p.kind == p.VAR_KEYWORD for p in signature.parameters.values()):
-        return kwargs
-    return {key: value for key, value in kwargs.items() if key in signature.parameters}
+class _RoleApp:
+    def __init__(self, engine, app, client: httpx.AsyncClient):
+        self.engine = engine
+        self.app = app
+        self.client = client
 
 
 class VllmBackend(EngineBackend):
     def __init__(self) -> None:
         self.backend_id = os.environ.get("VLLM_BACKEND", "cpu")
         self._roles: dict[str, RoleInfo] = {}
-        self._engines: dict[str, object] = {}
-        self._serving_chat = None
-        self._serving_completion = None
-        self._serving_embedding = None
+        self._apps: dict[str, _RoleApp] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -65,10 +65,6 @@ class VllmBackend(EngineBackend):
                 recoverable=False,
             ) from exc
 
-        # §24 step 6: the appliance downloads/verifies weights itself, in the
-        # downloading state, before any engine starts. The engine then loads
-        # from the local cache — engine-core child processes never touch the
-        # network (whose shared HTTP clients do not survive the fork).
         on_state("downloading")
         for name, role in config.roles.items():
             if role.enabled and role.source == "huggingface":
@@ -78,27 +74,21 @@ class VllmBackend(EngineBackend):
                     logger.exception("download failed for role %s", name)
                     self._roles[name] = RoleInfo(status="unhealthy", error_code=_download_error_code(exc))
 
-        # RolesSection.items() is ordered: generation loads before embedding.
         for name, role in config.roles.items():
             if not role.enabled:
                 self._roles[name] = RoleInfo(status="disabled")
                 continue
             if self._roles.get(name) and self._roles[name].status == "unhealthy":
                 continue  # download already failed
-            on_state("loading")
-            if name == "generation":
-                await self._load_generation(role)
-            elif name == "embedding":
-                await self._load_embedding(role)
-            else:
+            if name not in ("generation", "embedding"):
                 # vision/audio/rerank roles are post-MVP (§27).
                 self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_LOAD_FAILED")
                 logger.warning("role %s is not supported by this backend yet", name)
+                continue
+            on_state("loading")
+            await self._start_role(name, role)
 
     async def _download(self, role: RoleConfig) -> None:
-        import asyncio
-        import functools
-
         from huggingface_hub import snapshot_download
 
         kwargs: dict = {"repo_id": role.model}
@@ -108,180 +98,109 @@ class VllmBackend(EngineBackend):
         path = await loop.run_in_executor(None, functools.partial(snapshot_download, **kwargs))
         logger.info("weights for %s at %s", role.model, path)
 
-    def _engine_kwargs(self, role: RoleConfig) -> dict:
-        kwargs = dict(
-            model=role.model,
-            served_model_name=[role.served_model_name],
-        )
+    def _role_argv(self, name: str, role: RoleConfig) -> list[str]:
+        argv = [
+            "--model", role.model,
+            "--served-model-name", role.served_model_name,
+        ]
         if role.revision and role.revision not in ("<immutable-revision>", "main"):
-            kwargs["revision"] = role.revision
+            argv += ["--revision", role.revision]
         if role.max_model_len:
-            kwargs["max_model_len"] = role.max_model_len
+            argv += ["--max-model-len", str(role.max_model_len)]
         if self.backend_id not in ("cpu", "mock"):
-            # §3.5: best-effort weight → per-engine memory fraction.
-            kwargs["gpu_memory_utilization"] = round(
-                MEMORY_HEADROOM * role.memory_weight / 100.0, 3
-            )
-        return kwargs
+            fraction = round(MEMORY_HEADROOM * role.memory_weight / 100.0, 3)
+            argv += ["--gpu-memory-utilization", str(fraction)]
+        if name == "embedding":
+            argv += ["--runner", "pooling"]
+            pooler: dict = {}
+            if role.pooling:
+                pooler["pooling_type"] = role.pooling.upper()
+            if role.normalization:
+                pooler["normalize"] = role.normalization != "none"
+            if pooler:
+                argv += ["--override-pooler-config", json.dumps(pooler)]
+        return argv
 
-    async def _build_engine(self, extra_kwargs: dict):
-        from vllm.engine.arg_utils import AsyncEngineArgs
-
+    async def _start_role(self, name: str, role: RoleConfig) -> None:
         try:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.entrypoints.openai.api_server import build_app, init_app_state
+            from vllm.entrypoints.openai.cli_args import make_arg_parser
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
             from vllm.v1.engine.async_llm import AsyncLLM
-        except ImportError:  # pre-V1 fallback
-            from vllm.engine.async_llm_engine import AsyncLLMEngine as AsyncLLM
 
-        args = AsyncEngineArgs(**_filtered_kwargs(AsyncEngineArgs, **extra_kwargs))
-        engine = AsyncLLM.from_engine_args(args)
-        model_config = await self._maybe_await(engine.get_model_config())
-        return engine, model_config
+            parser = make_arg_parser(FlexibleArgumentParser())
+            argv = self._role_argv(name, role)
+            # Drop flags this vLLM version doesn't know (overlay-mode drift).
+            known = parser._option_string_actions
+            filtered: list[str] = []
+            skip = False
+            for i, token in enumerate(argv):
+                if skip:
+                    skip = False
+                    continue
+                if token.startswith("--") and token not in known:
+                    logger.warning("dropping unsupported engine flag %s", token)
+                    skip = i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                    continue
+                filtered.append(token)
+            args = parser.parse_args(filtered)
 
-    async def _load_generation(self, role: RoleConfig) -> None:
-        try:
-            engine, model_config = await self._build_engine(self._engine_kwargs(role))
-            self._engines["generation"] = engine
-            await self._build_generation_serving(engine, model_config, role)
+            engine = AsyncLLM.from_engine_args(AsyncEngineArgs.from_cli_args(args))
+            app = build_app(args)
+            await init_app_state(engine, app.state, args)
+            client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://sovereign-role",
+                timeout=600.0,
+            )
+            self._apps[name] = _RoleApp(engine, app, client)
         except Exception as exc:  # load failure → role unhealthy, process alive (§3.2)
-            logger.exception("generation role failed to load")
-            self._roles["generation"] = RoleInfo(status="unhealthy", error_code=_error_code(exc))
+            logger.exception("%s role failed to load", name)
+            self._roles[name] = RoleInfo(status="unhealthy", error_code=_error_code(exc))
             return
 
-        self._roles["generation"] = RoleInfo(
+        info = RoleInfo(
             status="healthy",
             engine_model=role.model,
             revision=role.revision or "main",
-            context_length=getattr(model_config, "max_model_len", None) or role.max_model_len,
+            context_length=getattr(getattr(engine, "model_config", None), "max_model_len", None)
+            or role.max_model_len,
         )
+        self._roles[name] = info
 
-    async def _load_embedding(self, role: RoleConfig) -> None:
-        kwargs = self._engine_kwargs(role)
-        # Across 0.2x releases the embed task moved from task= to runner=;
-        # pass both, _filtered_kwargs keeps whichever exists.
-        kwargs["task"] = "embed"
-        kwargs["runner"] = "pooling"
-        pooler = self._pooler_config(role)
-        if pooler is not None:
-            kwargs["override_pooler_config"] = pooler
-        try:
-            engine, model_config = await self._build_engine(kwargs)
-            self._engines["embedding"] = engine
-            await self._build_embedding_serving(engine, model_config, role)
-            dimensions = await self._probe_dimensions(role)
-        except Exception as exc:
-            logger.exception("embedding role failed to load")
-            self._roles["embedding"] = RoleInfo(status="unhealthy", error_code=_error_code(exc))
-            return
-
-        self._roles["embedding"] = RoleInfo(
-            status="healthy",
-            engine_model=role.model,
-            revision=role.revision or "main",
-            context_length=getattr(model_config, "max_model_len", None) or role.max_model_len,
-            dimensions=dimensions,
-            modalities=["text"],
-        )
-
-    @staticmethod
-    def _pooler_config(role: RoleConfig):
-        try:
-            from vllm.config import PoolerConfig
-        except ImportError:
-            return None
-        pooling = (role.pooling or "last").upper()
-        return PoolerConfig(
-            **_filtered_kwargs(
-                PoolerConfig,
-                pooling_type=pooling,
-                normalize=role.normalization != "none",
-            )
-        )
-
-    @staticmethod
-    async def _maybe_await(value):
-        if inspect.isawaitable(value):
-            return await value
-        return value
-
-    async def _serving_models(self, engine, model_config, role: RoleConfig):
-        from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-
-        serving_models = OpenAIServingModels(
-            **_filtered_kwargs(
-                OpenAIServingModels,
-                engine_client=engine,
-                model_config=model_config,
-                base_model_paths=[BaseModelPath(name=role.served_model_name, model_path=role.model)],
-                lora_modules=None,
-            )
-        )
-        init = getattr(serving_models, "init_static_loras", None)
-        if init is not None:
-            await self._maybe_await(init())
-        return serving_models
-
-    async def _build_generation_serving(self, engine, model_config, role: RoleConfig) -> None:
-        from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-        from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-
-        serving_models = await self._serving_models(engine, model_config, role)
-        self._serving_chat = OpenAIServingChat(
-            **_filtered_kwargs(
-                OpenAIServingChat,
-                engine_client=engine,
-                model_config=model_config,
-                models=serving_models,
-                response_role="assistant",
-                request_logger=None,
-                chat_template=None,
-                chat_template_content_format="auto",
-                enable_auto_tools=False,
-                tool_parser=None,
-            )
-        )
-        self._serving_completion = OpenAIServingCompletion(
-            **_filtered_kwargs(
-                OpenAIServingCompletion,
-                engine_client=engine,
-                model_config=model_config,
-                models=serving_models,
-                request_logger=None,
-            )
-        )
-
-    async def _build_embedding_serving(self, engine, model_config, role: RoleConfig) -> None:
-        from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-
-        serving_models = await self._serving_models(engine, model_config, role)
-        self._serving_embedding = OpenAIServingEmbedding(
-            **_filtered_kwargs(
-                OpenAIServingEmbedding,
-                engine_client=engine,
-                model_config=model_config,
-                models=serving_models,
-                request_logger=None,
-                chat_template=None,
-                chat_template_content_format="auto",
-            )
-        )
-
-    async def _probe_dimensions(self, role: RoleConfig) -> int:
-        """§10.1: discover the output dimension from the loaded checkpoint."""
-        result = await self.embeddings({"model": role.served_model_name, "input": "dimension probe"})
-        vector = result["data"][0]["embedding"]
-        return len(vector)
+        if name == "embedding":
+            try:
+                result = await self.embeddings(
+                    {"model": role.served_model_name, "input": "dimension probe"}
+                )
+                info.dimensions = len(result["data"][0]["embedding"])
+                info.modalities = ["text"]
+            except Exception as exc:
+                logger.exception("embedding dimension probe failed")
+                info.status = "unhealthy"
+                info.error_code = "DIMENSION_MISMATCH"
+                self._roles[name] = info
+                _ = exc
 
     async def shutdown(self) -> None:
-        engines, self._engines = dict(self._engines), {}
-        for engine in engines.values():
-            shutdown = getattr(engine, "shutdown", None)
+        apps, self._apps = dict(self._apps), {}
+        for role_app in apps.values():
+            await role_app.client.aclose()
+            shutdown = getattr(role_app.engine, "shutdown", None)
             if shutdown is not None:
-                await self._maybe_await(shutdown())
+                result = shutdown()
+                if asyncio.iscoroutine(result):
+                    await result
 
     # ── introspection ────────────────────────────────────────────────────
 
     def role_info(self, role: str) -> RoleInfo:
         return self._roles.get(role, RoleInfo(status="disabled"))
+
+    def role_client(self, role: str) -> httpx.AsyncClient | None:
+        role_app = self._apps.get(role)
+        return role_app.client if role_app else None
 
     def engine_version(self) -> str:
         try:
@@ -305,52 +224,37 @@ class VllmBackend(EngineBackend):
             pass
         return {"vendor": "cpu", "device_count": 0, "unified_memory": False}
 
-    # ── OpenAI surface ───────────────────────────────────────────────────
+    # ── OpenAI surface (used by the startup smoke test and probes; live
+    #    traffic is forwarded raw by the API layer via role_client) ────────
+
+    async def _post(self, role: str, path: str, body: dict) -> dict:
+        client = self.role_client(role)
+        if client is None:
+            raise RuntimeError(f"{role} role is not loaded")
+        resp = await client.post(path, json=body)
+        if resp.status_code != 200:
+            raise RuntimeError(f"{path}: {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
 
     async def chat_completion(self, body: dict) -> dict:
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
-
-        request = ChatCompletionRequest(**body)
-        result = await self._serving_chat.create_chat_completion(request, raw_request=None)
-        if isinstance(result, ErrorResponse):
-            raise RuntimeError(result.model_dump_json())
-        return result.model_dump()
+        return await self._post("generation", "/v1/chat/completions", body)
 
     async def chat_completion_stream(self, body: dict) -> AsyncIterator:
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
-
-        request = ChatCompletionRequest(**{**body, "stream": True})
-        result = await self._serving_chat.create_chat_completion(request, raw_request=None)
-        if isinstance(result, ErrorResponse):
-            raise RuntimeError(result.model_dump_json())
-        # vLLM returns an async generator of pre-framed SSE strings.
-        async for chunk in result:
-            yield chunk
+        client = self.role_client("generation")
+        if client is None:
+            raise RuntimeError("generation role is not loaded")
+        async with client.stream(
+            "POST", "/v1/chat/completions", json={**body, "stream": True}
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line:
+                    yield line + "\n\n"
 
     async def completion(self, body: dict) -> dict:
-        from vllm.entrypoints.openai.protocol import CompletionRequest, ErrorResponse
-
-        request = CompletionRequest(**body)
-        result = await self._serving_completion.create_completion(request, raw_request=None)
-        if isinstance(result, ErrorResponse):
-            raise RuntimeError(result.model_dump_json())
-        return result.model_dump()
+        return await self._post("generation", "/v1/completions", body)
 
     async def embeddings(self, body: dict) -> dict:
-        from vllm.entrypoints.openai.protocol import EmbeddingRequest, ErrorResponse
-
-        if self._serving_embedding is None:
-            raise RuntimeError("embedding role is not loaded")
-        request_type = EmbeddingRequest
-        # EmbeddingRequest is a union alias in some releases; resolve to the
-        # completion-style request when so.
-        if hasattr(request_type, "__args__"):
-            request_type = request_type.__args__[0]
-        request = request_type(**body)
-        result = await self._serving_embedding.create_embedding(request, raw_request=None)
-        if isinstance(result, ErrorResponse):
-            raise RuntimeError(result.model_dump_json())
-        return result.model_dump()
+        return await self._post("embedding", "/v1/embeddings", body)
 
 
 def _error_code(exc: Exception) -> str:
