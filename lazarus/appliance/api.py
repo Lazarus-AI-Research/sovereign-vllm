@@ -105,6 +105,29 @@ def _model_not_found(model: object) -> JSONResponse:
     return _error(404, f"model {model!r} is not served by this role", "invalid_request_error", "model_not_found")
 
 
+def _remote_media_error(messages: object) -> JSONResponse | None:
+    """Multimodal embedding sovereignty rule (runtime-contract §embeddings):
+    media arrives as base64 data URIs only; the runtime never fetches remote
+    URLs. Any url-bearing content part that is not a data: URI is rejected."""
+    for message in messages if isinstance(messages, list) else []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            for value in part.values():
+                if isinstance(value, dict) and "url" in value:
+                    url = value["url"]
+                    if not (isinstance(url, str) and url.startswith("data:")):
+                        return _error(
+                            400,
+                            "remote media URLs are not allowed; send base64 data URIs",
+                            "invalid_request_error",
+                        )
+    return None
+
+
 def _not_ready() -> JSONResponse:
     return _error(503, "runtime is not ready", "server_error")
 
@@ -212,11 +235,13 @@ def build_app(
         ]
         return {"object": "list", "data": data}
 
-    def route(body: dict, expected_role: str, required_fields: tuple[str, ...]):
-        """Shared request gate: field presence, readiness, role routing."""
+    def route(body: dict, expected_role: str, required_fields: tuple[str | tuple[str, ...], ...]):
+        """Shared request gate: field presence, readiness, role routing.
+        A tuple entry in required_fields means any-of (e.g. input|messages)."""
         for field_name in required_fields:
-            if field_name not in body:
-                return _error(400, f"{field_name} is required", "invalid_request_error")
+            names = field_name if isinstance(field_name, tuple) else (field_name,)
+            if not any(name in body for name in names):
+                return _error(400, f"{' or '.join(names)} is required", "invalid_request_error")
         model = body.get("model")
         role = alias_map.get(model)
         if role != expected_role or role_status(expected_role) != "healthy":
@@ -260,6 +285,9 @@ def build_app(
             return _error(400, "request body must be JSON", "invalid_request_error")
         if denied := route(body, role, required_fields):
             return denied
+        if request.url.path.endswith("/embeddings") and "messages" in body:
+            if denied := _remote_media_error(body["messages"]):
+                return denied
         alias = body["model"]
         try:
             async with admission.slot(role):
@@ -309,6 +337,8 @@ def build_app(
 
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
-        return await openai_endpoint(request, "embedding", ("model", "input"))
+        # Text uses standard OpenAI `input`; multimodal items arrive as a
+        # chat-style `messages` array (runtime-contract extended schema).
+        return await openai_endpoint(request, "embedding", ("model", ("input", "messages")))
 
     return app

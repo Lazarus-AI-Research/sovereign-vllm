@@ -212,6 +212,34 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 info.error_code = "DIMENSION_MISMATCH"
                 self._roles[name] = info
                 _ = exc
+                return
+            # Modalities are probed, never assumed (§10.1): a modality is
+            # advertised only after a real request round-trips with the
+            # expected vector shape.
+            info.modalities += await self._probe_embedding_modalities(role, info.dimensions)
+
+    async def _probe_embedding_modalities(self, role: RoleConfig, dimensions: int) -> list[str]:
+        found: list[str] = []
+        for modality, make_part in (("image", _image_probe_part), ("audio", _audio_probe_part)):
+            try:
+                part = make_part()
+                result = await self.embeddings(
+                    {
+                        "model": role.served_model_name,
+                        "messages": [{"role": "user", "content": [part]}],
+                    }
+                )
+                vector = result["data"][0]["embedding"]
+                if len(vector) == dimensions:
+                    found.append(modality)
+                else:
+                    logger.warning(
+                        "%s modality probe returned %d dims (text probe said %d); not advertising",
+                        modality, len(vector), dimensions,
+                    )
+            except Exception as exc:
+                logger.info("embedding %s modality probe negative: %s", modality, exc)
+        return found
 
     async def shutdown(self) -> None:
         apps, self._apps = dict(self._apps), {}
@@ -256,6 +284,33 @@ class VllmBackend(RoleClientMixin, EngineBackend):
 
     # OpenAI-surface methods (smoke test + probes) come from RoleClientMixin;
     # live traffic is forwarded raw by the API layer via role_client.
+
+
+def _image_probe_part() -> dict:
+    import base64
+    import io
+
+    from PIL import Image  # ships with vLLM's multimodal stack
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (128, 128, 128)).save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode()
+    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+
+
+def _audio_probe_part() -> dict:
+    import base64
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 8000)  # 0.5s of silence
+    encoded = base64.b64encode(buf.getvalue()).decode()
+    return {"type": "input_audio", "input_audio": {"data": encoded, "format": "wav"}}
 
 
 def _error_code(exc: Exception) -> str:
