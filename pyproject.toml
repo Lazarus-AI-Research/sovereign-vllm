@@ -24,6 +24,21 @@ dev = [
     "pytest",
     "ruff",
 ]
+# Audio embedding inputs (M12). Deliberately NOT vllm[audio]: that extra pulls
+# in torchcodec, whose wheel dlopens system ffmpeg libs and raises OSError on
+# hosts without them (vLLM only guards ImportError, so the engine dies).
+# soundfile bundles libsndfile and covers the WAV decode path; soxr covers
+# resampling. Without these the appliance still runs — the modality probe
+# simply never advertises audio.
+audio = [
+    "soundfile",
+    "soxr",
+]
+
+[project.entry-points."vllm.general_plugins"]
+# Loaded by vLLM in every process (incl. engine workers): registers the
+# thinker-only Qwen2.5-Omni architecture for LCO embedding checkpoints (M12).
+lazarus_lco_omni = "lazarus.models.embedding.lco_omni:register"
 
 [project.scripts]
 run-sovereign-runtime = "lazarus.appliance.launcher:main"

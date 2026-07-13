@@ -116,7 +116,10 @@ class FakeBackend(EngineBackend):
         }
 
     async def embeddings(self, body: dict) -> dict:
-        inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
+        if "messages" in body:  # extended multimodal schema: one item per request
+            inputs = [str(body["messages"])]
+        else:
+            inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
         data = [
             {"object": "embedding", "index": i, "embedding": _embed(str(text))}
             for i, text in enumerate(inputs)

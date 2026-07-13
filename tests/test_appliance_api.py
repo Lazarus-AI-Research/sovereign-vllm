@@ -63,6 +63,40 @@ def test_models_chat_and_embeddings(healthy):
     assert abs(math.sqrt(sum(v * v for v in vector)) - 1.0) < 1e-6
 
 
+def test_multimodal_embeddings_messages_schema(healthy):
+    # Extended schema: `messages` replaces `input` (runtime-contract §embeddings).
+    body = {
+        "model": "embedding-omni-default",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                {"type": "text", "text": "caption"},
+            ]}
+        ],
+    }
+    emb = healthy.post("/v1/embeddings", json=body)
+    assert emb.status_code == 200
+    assert emb.json()["data"][0]["embedding"]
+
+    neither = healthy.post("/v1/embeddings", json={"model": "embedding-omni-default"})
+    assert neither.status_code == 400
+
+
+def test_multimodal_embeddings_reject_remote_urls(healthy):
+    # Sovereignty: the runtime never fetches media; only data: URIs pass.
+    body = {
+        "model": "embedding-omni-default",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ]}
+        ],
+    }
+    emb = healthy.post("/v1/embeddings", json=body)
+    assert emb.status_code == 400
+    assert "data URIs" in emb.json()["error"]["message"]
+
+
 def test_streaming_ends_with_done(healthy):
     with healthy.stream(
         "POST",
