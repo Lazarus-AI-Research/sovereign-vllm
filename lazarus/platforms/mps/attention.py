@@ -14,6 +14,7 @@ decode read with ``tk_torch.paged_attention`` and prefill with
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -35,6 +36,26 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+_TK = None
+# QuixiCore fused attention is on by default; set SOVEREIGN_MPS_NO_QUIXI=1 to
+# force the pure-torch SDPA path (debugging / unsupported kernels).
+_QUIXI_ENABLED = os.environ.get("SOVEREIGN_MPS_NO_QUIXI") != "1"
+
+
+def _tk_torch():
+    """Return QuixiCore's PyTorch-MPS kernels (preloaded at startup by compat)."""
+    global _TK
+    if _TK is None:
+        import tk_torch
+
+        _TK = tk_torch
+    return _TK
+
+
+def _quixi_paged_attention_supported(head_size: int) -> bool:
+    # QuixiCore paged_attention supports head dims {64, 128}.
+    return head_size in (64, 128)
 
 
 class MetalAttentionBackend(AttentionBackend):
@@ -69,11 +90,10 @@ class MetalAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # Flash-style layout: num_blocks MUST be dim 0 (vLLM's block manager
-        # indexes the cache's dim 0 by block id). Dim 1 selects key(0)/value(1).
-        # kv_cache[:, 0] / kv_cache[:, 1] are QuixiCore's (num_blocks, block_size,
-        # H_kv, D) cache tensors.
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # Dim 0 selects key(0)/value(1); kv_cache[0] / kv_cache[1] are then
+        # CONTIGUOUS (num_blocks, block_size, H_kv, D) tensors — exactly the
+        # layout QuixiCore's paged_attention consumes with no per-step copy.
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -96,11 +116,13 @@ class MetalAttentionBackend(AttentionBackend):
 class MetalAttentionMetadata:
     num_actual_tokens: int
     num_reqs: int
-    # CPU int tensors used to slice the batch per request.
+    max_query_len: int
+    # CPU int tensors used to slice the batch per request (SDPA prefill path).
     query_start_loc_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
-    # On-device tensors for the cache write / paged read.
-    block_table: torch.Tensor
+    # On-device tensors for the cache write / QuixiCore paged decode.
+    block_table: torch.Tensor  # int32 (num_reqs, max_blocks)
+    seq_lens_gpu: torch.Tensor  # int32 (num_reqs,)
     slot_mapping: torch.Tensor
     causal: bool = True
 
@@ -129,9 +151,11 @@ class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetad
         return MetalAttentionMetadata(
             num_actual_tokens=m.num_actual_tokens,
             num_reqs=m.num_reqs,
+            max_query_len=m.max_query_len,
             query_start_loc_cpu=qsl_cpu,
             seq_lens_cpu=seq_lens_cpu,
-            block_table=m.block_table_tensor,
+            block_table=m.block_table_tensor.to(torch.int32),
+            seq_lens_gpu=m.seq_lens.to(torch.int32),
             slot_mapping=m.slot_mapping,
             causal=causal,
         )
@@ -190,27 +214,50 @@ class MetalAttentionImpl(AttentionImpl):
         num_tokens = attn_metadata.num_actual_tokens
         H, Hkv, D = self.num_heads, self.num_kv_heads, self.head_size
 
-        # kv_cache: (num_blocks, 2, block_size, Hkv, D)
-        num_blocks, _, block_size, _, _ = kv_cache.shape
-        key_cache = kv_cache[:, 0]
-        value_cache = kv_cache[:, 1]
+        # kv_cache: (2, num_blocks, block_size, Hkv, D) — kv_cache[0]/[1] contiguous
+        _, num_blocks, block_size, _, _ = kv_cache.shape
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
 
         # --- write new K/V into the persistent paged cache (in-place, on MPS) ---
-        # slot = block_id * block_size + offset; write to kv_cache[block, kv, offset]
-        # directly (dim 1 of size 2 sits between blocks and offsets, so the
-        # (num_blocks, block_size) axes are not contiguous to flatten).
+        # Per-token advanced-index scatter (O(num_tokens)). index_copy_ on the
+        # flattened multi-million-row view is O(cache) on MPS and stalls.
         if self.kv_sharing_target_layer_name is None:
             slot = attn_metadata.slot_mapping[:num_tokens].to(torch.long)
             blk = slot // block_size
             off = slot % block_size
-            kv_cache[blk, 0, off] = key[:num_tokens]
-            kv_cache[blk, 1, off] = value[:num_tokens]
+            key_cache[blk, off] = key[:num_tokens]
+            value_cache[blk, off] = value[:num_tokens]
 
-        # --- per-request attention via SDPA over the gathered cache ---
+        out2d = output.view(num_tokens, H, D)
+
+        # --- decode fast path: one fused QuixiCore kernel for the whole batch ---
+        # Pure decode = every request contributes exactly one query token. ~34x
+        # faster than the per-request SDPA loop (37 vs 1.1 tok/s on SmolLM2-135M).
+        if (
+            _QUIXI_ENABLED
+            and attn_metadata.max_query_len == 1
+            and num_tokens == attn_metadata.num_reqs
+            and _quixi_paged_attention_supported(D)
+        ):
+            tk = _tk_torch()
+            q = query[:num_tokens].contiguous()  # (num_reqs, H, D)
+            o = tk.paged_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens_gpu,
+                float(self.scale),
+                0,
+            )  # (num_reqs, H, D)
+            out2d.copy_(o)
+            return output
+
+        # --- prefill / mixed path: per-request SDPA over the gathered cache ---
         qsl = attn_metadata.query_start_loc_cpu
         seq_lens = attn_metadata.seq_lens_cpu
         block_table = attn_metadata.block_table
-        out2d = output.view(num_tokens, H, D)
 
         for r in range(attn_metadata.num_reqs):
             q0 = int(qsl[r])
@@ -220,10 +267,10 @@ class MetalAttentionImpl(AttentionImpl):
                 continue
             seq_len = int(seq_lens[r])
 
-            # gather this request's keys/values from the paged cache.
-            # Clamp block ids to the cache size: vLLM's profile/dummy run uses a
-            # small dummy cache with a block_table that can reference blocks past
-            # it; that run's output is discarded, and real runs never clamp.
+            # gather this request's keys/values from the paged cache. Clamp block
+            # ids to the cache size: vLLM's profile/dummy run uses a small dummy
+            # cache with a block_table that can reference blocks past it; that
+            # run's output is discarded, and real runs never clamp.
             n_blocks = (seq_len + block_size - 1) // block_size
             blocks = block_table[r, :n_blocks].to(torch.long).clamp_(0, num_blocks - 1)
             seq_len = min(seq_len, n_blocks * block_size)
@@ -236,8 +283,6 @@ class MetalAttentionImpl(AttentionImpl):
                 v_r = v_r.repeat_interleave(self.num_queries_per_kv, dim=1)
 
             q_r = query[q0:q1]  # (q_len, H, D)
-
-            # (H, L, D) for SDPA
             q_t = q_r.transpose(0, 1)
             k_t = k_r.transpose(0, 1)
             v_t = v_r.transpose(0, 1)
@@ -246,8 +291,7 @@ class MetalAttentionImpl(AttentionImpl):
             if attn_metadata.causal and q_len > 1:
                 q_pos = torch.arange(seq_len - q_len, seq_len, device=q_t.device)
                 k_pos = torch.arange(seq_len, device=q_t.device)
-                mask = k_pos[None, :] <= q_pos[:, None]  # (q_len, seq_len) True=attend
-                attn_mask = mask[None]
+                attn_mask = (k_pos[None, :] <= q_pos[:, None])[None]
             else:
                 attn_mask = None
 

@@ -77,11 +77,33 @@ def apply_compat_patches() -> None:
     BlockTable.compute_slot_mapping = _mps_compute_slot_mapping
 
     _patch_cpu_gpu_buffer_blocking()
+    _preload_quixicore()
 
     _APPLIED = True
     logger.info(
         "Applied MPS compat patches (dynamo-disable, slot-mapping, blocking-copies)"
     )
+
+
+def _preload_quixicore() -> None:
+    """Import QuixiCore's tk_torch eagerly at startup.
+
+    tk_torch's first import runs build_metallib() + cpp_extension.load() (a file
+    lock + JIT link). Doing that lazily inside the attention forward — mid-decode,
+    against in-flight MPS work — can deadlock. Warming it once here, before any
+    generation, makes the fast attention path reliable. Absence is non-fatal:
+    the backend falls back to the torch SDPA path.
+    """
+    import os
+
+    if os.environ.get("SOVEREIGN_MPS_NO_QUIXI") == "1":
+        return
+    try:
+        import tk_torch  # noqa: F401
+
+        logger.info("Preloaded QuixiCore tk_torch (Metal attention fast path)")
+    except Exception as e:
+        logger.warning("tk_torch unavailable (%s); using SDPA attention", e)
 
 
 def _patch_cpu_gpu_buffer_blocking() -> None:

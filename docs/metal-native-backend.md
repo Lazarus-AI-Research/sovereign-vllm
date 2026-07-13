@@ -122,7 +122,15 @@ QuixiCore glue). The plugin's MPS ops branch is an overlay patch against
   A local `.gguf` needs an HF config/tokenizer source (`tokenizer=`/
   `hf_config_path=` a same-arch HF model) — standard vLLM GGUF requirement, to be
   wired into the appliance config. Fused `tk_torch.qgemm/qgemv` fast path → M-N3.
-- **M-N3** — perf pass (`register_oot` Metal norm/rope/act; QuixiCore
-  paged_attention replacing the SDPA loop; drop `enforce_eager`); benchmark vs
-  the 122 tok/s MLX quantize-on-load reference.
+- **M-N3 — DONE (attention).** QuixiCore `paged_attention` replaces the
+  per-request SDPA loop for the decode batch (default on; `SOVEREIGN_MPS_NO_QUIXI=1`
+  forces SDPA). SmolLM2-135M: **60.9 tok/s** batch-of-4 / **37.8 tok/s** single
+  (was 0.8–1.1). Two root-causes fixed along the way: (1) the KV layout is now
+  `(2, num_blocks, ...)` so `kv_cache[0]`/`[1]` are contiguous (no per-step copy
+  for QuixiCore); (2) the cache write uses per-token advanced indexing
+  (`key_cache[blk, off] = key`) — the earlier `index_copy_` on the flattened
+  multi-million-row view was O(cache) on MPS and stalled. tk_torch is preloaded
+  at startup (compat) so its JIT/metallib build never happens mid-decode.
+  Remaining headroom toward the ~71 tok/s raw-torch ceiling: `register_oot`
+  Metal RMSNorm/RoPE/SiLU and `tk_torch.qgemm/qgemv` for the GGUF matmul.
 - **M-N4** — target models: gemma-4 (head_dim 256) + LCO-Omni embeddings (mrope).
