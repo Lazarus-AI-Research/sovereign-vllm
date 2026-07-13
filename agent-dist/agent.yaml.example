@@ -19,7 +19,7 @@ roles:
     mmproj_path: /opt/sovereign/models/gemma-4-E2B-it-mmproj.gguf
     port: 9101
     context_length: 8192
-    args: ["--jinja", "--reasoning-budget", "0"]
+    args: ["--jinja", "--reasoning-format", "deepseek", "--reasoning", "on"]
 
   # Default omni embedding via GGUF + multimodal projector
   # (source: marksverdhei/LCO-Embedding-Omni-3B-2605-GGUF).

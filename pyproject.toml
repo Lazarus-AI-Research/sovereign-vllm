@@ -40,6 +40,11 @@ audio = [
 # thinker-only Qwen2.5-Omni architecture for LCO embedding checkpoints (M12).
 lazarus_lco_omni = "lazarus.models.embedding.lco_omni:register"
 
+[project.entry-points."vllm.platform_plugins"]
+# Native Metal (PyTorch-MPS) platform: runs vLLM's native torch models on the
+# Apple GPU with QuixiCore-backed attention. See docs/metal-native-backend.md.
+mps_native = "lazarus.platforms.mps:register"
+
 [project.scripts]
 run-sovereign-runtime = "lazarus.appliance.launcher:main"
 sovereign-runtime-healthcheck = "lazarus.appliance.healthcheck:main"
