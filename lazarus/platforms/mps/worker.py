@@ -71,6 +71,19 @@ class MpsWorker(Worker):
         # unified-memory pool.
         return nullcontext()
 
+    def compile_or_warm_up_model(self):
+        # kernel_warmup() eagerly imports CUDA-only JIT kernels (minimax MSA,
+        # deep_gemm, flashinfer) that don't exist on macOS. Nothing to warm on
+        # MPS — no-op it for the duration of the base warmup.
+        import vllm.v1.worker.gpu_worker as gw
+
+        orig = gw.kernel_warmup
+        gw.kernel_warmup = lambda worker: None
+        try:
+            return super().compile_or_warm_up_model()
+        finally:
+            gw.kernel_warmup = orig
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """KV-cache budget from unified memory.

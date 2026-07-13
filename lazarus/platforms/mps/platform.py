@@ -153,6 +153,12 @@ class MpsPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config import CompilationMode
 
+        # Safe point (vLLM fully imported) to install the Triton→torch compat
+        # shims and disable dynamo/inductor (no MPS/CPU compile backend here).
+        from lazarus.platforms.mps.compat import apply_compat_patches
+
+        apply_compat_patches()
+
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "lazarus.platforms.mps.worker.MpsWorker"

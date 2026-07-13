@@ -29,6 +29,10 @@ def register() -> str | None:
     ):
         return None
 
+    # NOTE: keep register() lightweight. It runs during vLLM's platform
+    # resolution (mid-import), and any exception here is silently swallowed
+    # (platforms/__init__.py), which would drop us to the CPU platform. Heavy
+    # imports / monkeypatches happen later, in MpsPlatform.check_and_update_config.
     return "lazarus.platforms.mps.platform.MpsPlatform"
 
 
