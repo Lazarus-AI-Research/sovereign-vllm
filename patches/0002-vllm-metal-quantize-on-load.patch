@@ -1,0 +1,52 @@
+--- a/vllm_metal/v1/model_lifecycle.py	2026-07-12 23:38:05
++++ b/vllm_metal/v1/model_lifecycle.py	2026-07-12 23:38:32
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+@@ -38,6 +39,33 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _maybe_quantize_on_load(model: Any) -> None:
++    """Lazarus Sovereign Stack: optional in-place 4-bit quantization of an
++    already-built mlx-lm model.
++
++    MLX's stock converter (`mlx_lm convert -q`) and `mlx_lm.load` on a bare HF
++    path both reject gemma-3n / gemma-4 MatFormer checkpoints (KV-sharing:
++    later layers share k/v projections, so the checkpoint carries params the
++    fresh model skeleton lacks). vllm-metal's compatible-path loader is the
++    only thing that builds this model correctly; quantizing its linears in
++    place here gives 4-bit inference (~2x decode over bf16 via
++    mx.quantized_matmul) without the GGUF adapter or the broken converter.
++
++    Enabled with VLLM_METAL_QUANTIZE_BITS (e.g. "4"); group size defaults to
++    32 (VLLM_METAL_QUANTIZE_GROUP_SIZE). No-op when unset.
++    """
++    bits = os.environ.get("VLLM_METAL_QUANTIZE_BITS")
++    if not bits:
++        return
++    import mlx.core as _mx
++    import mlx.nn as _nn
++    from mlx.utils import tree_flatten
++
++    group_size = int(os.environ.get("VLLM_METAL_QUANTIZE_GROUP_SIZE", "32"))
++    _nn.quantize(model, group_size=group_size, bits=int(bits))
++    _mx.eval(*[p for _, p in tree_flatten(model.parameters())])
++
++
+ def load_stt_model(model_name: str) -> Any:
+     """Load an STT model.
+ 
+@@ -279,6 +307,7 @@
+                 tokenizer_config=tokenizer_config,
+                 lazy=lazy,
+             )
++        _maybe_quantize_on_load(model)
+         return model, tokenizer
+ 
+     def _install_generation_model(
