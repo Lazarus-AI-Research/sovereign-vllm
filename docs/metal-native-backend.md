@@ -99,8 +99,24 @@ QuixiCore glue). The plugin's MPS ops branch is an overlay patch against
 
 ## Milestones
 
-- **M-N0** — MpsPlatform skeleton; boot a tiny GQA model; record the first CUDA wall.
-- **M-N1** — Metal attention backend (QuixiCore); tiny model end-to-end, coherent tokens.
-- **M-N2** — GGUF on MPS (plugin `ggml_dequantize` + `qgemm` fast path).
-- **M-N3** — perf pass (`register_oot` Metal norm/rope/act; fused matmul); benchmark vs 122 tok/s MLX reference.
+- **M-N0 — DONE.** MpsPlatform skeleton; native model construction boots on MPS.
+  De-CUDA-fication turned out to be 4 small overrides (init_device, dtype check,
+  compute-units, memory-pool context) because `check_and_update_config` disables
+  CUDA graphs, gating out most of the runner's CUDA sites.
+- **M-N1 — DONE.** vLLM's native LlamaForCausalLM (SmolLM2-135M) generates
+  coherent tokens end-to-end on the Apple GPU. MetalAttentionBackend (flash-style
+  KV layout, in-place cache write + per-request SDPA read on MPS), registered in
+  vLLM's CUSTOM attention slot. Key fixes in `compat.py`: dynamo-disable (no
+  compile backend on-host), Triton slot-mapping kernel → torch, and forcing
+  `CpuGpuBuffer` H2D/D2H copies **blocking** on MPS (non-blocking copies from
+  non-pinned host memory race the dependent gather → stale-index OOB). Perf is a
+  correctness baseline (~0.8 tok/s); QuixiCore + eager-kill land in M-N3.
+- **M-N2 — in progress.** GGUF on MPS via vllm-gguf-plugin. Blockers found: the
+  plugin's editable install builds a CUDAExtension (needs nvcc) and `ops.py`
+  hard-imports `triton` at load. Plan: install pure-Python parts only, make the
+  triton/CUDA imports lazy, add an MPS branch to `ops.py::ggml_dequantize`
+  (→ later `tk_torch.qgemv/qgemm` fast path). Loader is already device-agnostic.
+- **M-N3** — perf pass (`register_oot` Metal norm/rope/act; QuixiCore
+  paged_attention replacing the SDPA loop; drop `enforce_eager`); benchmark vs
+  the 122 tok/s MLX quantize-on-load reference.
 - **M-N4** — target models: gemma-4 (head_dim 256) + LCO-Omni embeddings (mrope).
