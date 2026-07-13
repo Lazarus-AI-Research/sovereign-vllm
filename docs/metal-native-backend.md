@@ -111,11 +111,17 @@ QuixiCore glue). The plugin's MPS ops branch is an overlay patch against
   `CpuGpuBuffer` H2D/D2H copies **blocking** on MPS (non-blocking copies from
   non-pinned host memory race the dependent gather → stale-index OOB). Perf is a
   correctness baseline (~0.8 tok/s); QuixiCore + eager-kill land in M-N3.
-- **M-N2 — in progress.** GGUF on MPS via vllm-gguf-plugin. Blockers found: the
-  plugin's editable install builds a CUDAExtension (needs nvcc) and `ops.py`
-  hard-imports `triton` at load. Plan: install pure-Python parts only, make the
-  triton/CUDA imports lazy, add an MPS branch to `ops.py::ggml_dequantize`
-  (→ later `tk_torch.qgemv/qgemm` fast path). Loader is already device-agnostic.
+- **M-N2 — DONE (correctness path).** A Q8_0 GGUF (SmolLM2-135M-Instruct) loads
+  via vllm-gguf-plugin + MpsPlatform and answers "Paris." correctly — GGUF
+  running natively on the Apple GPU in vLLM. Plugin changes (local commits in
+  `~/vllm-gguf-plugin`, not pushed to upstream): `setup.py` skips the
+  CUDAExtension build when there's no CUDA/ROCm toolchain; `ops.py` sources GGML
+  type ids from the `gguf` package + lazy-imports triton, and adds an MPS branch
+  to `ggml_dequantize`/`ggml_mul_mat_vec_a8`/`ggml_mul_mat_a8` (dequant GGUF
+  blocks via gguf's pure-Python unpacker → torch-MPS matmul; all quant types).
+  A local `.gguf` needs an HF config/tokenizer source (`tokenizer=`/
+  `hf_config_path=` a same-arch HF model) — standard vLLM GGUF requirement, to be
+  wired into the appliance config. Fused `tk_torch.qgemm/qgemv` fast path → M-N3.
 - **M-N3** — perf pass (`register_oot` Metal norm/rope/act; QuixiCore
   paged_attention replacing the SDPA loop; drop `enforce_eager`); benchmark vs
   the 122 tok/s MLX quantize-on-load reference.
