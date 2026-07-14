@@ -10,11 +10,11 @@ FROM vllm/vllm-openai:v0.25.0
 
 COPY pyproject.toml constraints.txt /opt/sovereign/
 COPY lazarus /opt/sovereign/lazarus
-RUN pip install --no-cache-dir /opt/sovereign
+RUN pip install --no-cache-dir "/opt/sovereign[audio]"
 
 # §24: required binaries (provided as console scripts by the package)
-RUN ln -sf $(which run-sovereign-runtime) /usr/local/bin/run-sovereign-runtime && \
-    ln -sf $(which sovereign-runtime-healthcheck) /usr/local/bin/sovereign-runtime-healthcheck
+RUN test -x /usr/local/bin/run-sovereign-runtime && \
+    test -x /usr/local/bin/sovereign-runtime-healthcheck
 
 ENV SOVEREIGN_PROFILE=cuda-x86_64 \
     VLLM_BACKEND=cuda
