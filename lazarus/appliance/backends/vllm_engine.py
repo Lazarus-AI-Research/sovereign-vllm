@@ -50,6 +50,12 @@ class _RoleApp:
 
 class VllmBackend(RoleClientMixin, EngineBackend):
     def __init__(self) -> None:
+        # `vllm serve` forces spawn before constructing an AsyncLLM, but this
+        # in-process adapter bypasses that entrypoint. Forking the second role
+        # after the first engine has started can deadlock during NCCL model-
+        # parallel initialization. Preserve an explicit operator override,
+        # otherwise use the CUDA-safe start method for every role engine.
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         self.backend_id = os.environ.get("VLLM_BACKEND", "cpu")
         self._roles: dict[str, RoleInfo] = {}
         self._apps: dict[str, _RoleApp] = {}

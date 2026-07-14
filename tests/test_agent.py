@@ -1,6 +1,8 @@
 """Host agent unit tests: config parsing, auth fail-closed, manifest shape.
 No llama-server processes are spawned (empty role set)."""
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -76,6 +78,18 @@ def test_tool_parser_inference():
     assert infer("Qwen/Qwen3-32B") == "hermes"
     assert infer("Qwen/Qwen3-Coder-30B") == "qwen3_coder"
     assert infer("some/unknown-model") is None
+
+
+def test_vllm_backend_defaults_to_spawn_without_overriding_operator(monkeypatch):
+    from lazarus.appliance.backends.vllm_engine import VllmBackend
+
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    VllmBackend()
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+    VllmBackend()
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
 
 
 def test_generation_argv_defaults():
