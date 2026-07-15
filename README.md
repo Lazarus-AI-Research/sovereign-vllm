@@ -175,5 +175,6 @@ ruff check lazarus tests && pytest tests
 
 ## License
 
-Upstream vLLM is Apache-2.0; its license and notices are retained for all
-upstream code. Lazarus additions: see `LICENSE`.
+Sovereign Runtime is licensed under Apache-2.0. Upstream vLLM remains
+Apache-2.0, and all bundled components retain their own licenses. See
+`LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md`.

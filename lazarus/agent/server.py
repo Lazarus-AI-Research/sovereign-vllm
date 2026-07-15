@@ -19,10 +19,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lazarus.agent.config import AgentConfig, load_agent_config
+from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
 
-AGENT_VERSION = "0.1.0-dev"
+AGENT_VERSION = RUNTIME_VERSION
 
 
 class RoleProcess:
@@ -124,6 +125,7 @@ def build_app(agent: Agent) -> FastAPI:
                 "status": "healthy" if healthy else ("loading" if role.running() else "unhealthy"),
                 "model": Path(role.model_path).name,
                 "context_length": agent.config.roles[name].context_length,
+                "revision": agent.config.roles[name].revision,
             }
         return {
             "agent_version": AGENT_VERSION,

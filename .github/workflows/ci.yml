@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.12"
       # Engine extra deliberately excluded: CI tests the appliance layer only.
-      # Full engine tests run in the image-build pipeline (TODO: GPU runner).
+      # Certified GPU and Metal gates run on the release-candidate hosts.
       - run: pip install -e '.[dev]'
       - run: ruff check lazarus tests
       - run: python -c "import lazarus.appliance"

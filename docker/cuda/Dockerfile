@@ -6,11 +6,11 @@
 # and layers the Sovereign appliance on top. The appliance launcher is the
 # entrypoint; it owns port 8000 and the §24 image contract.
 
-FROM vllm/vllm-openai:v0.25.0
+FROM vllm/vllm-openai@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb
 
-COPY pyproject.toml constraints.txt /opt/sovereign/
+COPY pyproject.toml constraints.txt README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md /opt/sovereign/
 COPY lazarus /opt/sovereign/lazarus
-RUN pip install --no-cache-dir "/opt/sovereign[audio]"
+RUN pip install --no-cache-dir --constraint /opt/sovereign/constraints.txt "/opt/sovereign[audio]"
 
 # §24: required binaries (provided as console scripts by the package)
 RUN test -x /usr/local/bin/run-sovereign-runtime && \

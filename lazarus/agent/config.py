@@ -14,6 +14,8 @@ class AgentRole(BaseModel):
     model_path: str
     port: int = Field(ge=1, le=65535)
     context_length: int | None = None
+    # Immutable upstream revision for runtime-manifest traceability.
+    revision: str | None = None
     # multimodal projector (GGUF) for omni models, passed as --mmproj
     mmproj_path: str | None = None
     # extra llama-server flags, e.g. ["--embedding", "--pooling", "last"]

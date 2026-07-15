@@ -197,39 +197,7 @@ class VllmBackend(RoleClientMixin, EngineBackend):
 
     async def _start_role(self, name: str, role: RoleConfig) -> None:
         try:
-            from vllm.engine.arg_utils import AsyncEngineArgs
-            from vllm.entrypoints.openai.api_server import build_app, init_app_state
-            from vllm.entrypoints.openai.cli_args import make_arg_parser
-            from vllm.utils.argparse_utils import FlexibleArgumentParser
-            from vllm.v1.engine.async_llm import AsyncLLM
-
-            parser = make_arg_parser(FlexibleArgumentParser())
-            argv = self._role_argv(name, role)
-            # Drop flags this vLLM version doesn't know (overlay-mode drift).
-            known = parser._option_string_actions
-            filtered: list[str] = []
-            skip = False
-            for i, token in enumerate(argv):
-                if skip:
-                    skip = False
-                    continue
-                if token.startswith("--") and token not in known:
-                    logger.warning("dropping unsupported engine flag %s", token)
-                    skip = i + 1 < len(argv) and not argv[i + 1].startswith("--")
-                    continue
-                filtered.append(token)
-            args = parser.parse_args(filtered)
-
-            engine_args = AsyncEngineArgs.from_cli_args(args)
-            if name == "embedding" and not getattr(engine_args, "hf_overrides", None):
-                # Thinker-only omni checkpoints (LCO) need their config wrapped
-                # into the full-omni shape vLLM's native model expects (M12).
-                # hf_overrides accepts a callable only through the Python API,
-                # never through CLI argv, so it is injected here.
-                from lazarus.models.embedding.lco_omni import normalize_thinker_config
-
-                engine_args.hf_overrides = normalize_thinker_config
-            engine = AsyncLLM.from_engine_args(engine_args)
+            engine, args, build_app, init_app_state = await self._construct_role_engine(name, role)
             # supported_tasks gates which routers (generate vs pooling) mount.
             supported_tasks = None
             getter = getattr(engine, "get_supported_tasks", None)
@@ -283,6 +251,55 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             # advertised only after a real request round-trips with the
             # expected vector shape.
             info.modalities += await self._probe_embedding_modalities(role, info.dimensions)
+
+    async def _construct_role_engine(self, name: str, role: RoleConfig):
+        """Construct vLLM off the API event loop.
+
+        Model configuration, tokenizer setup, multiprocessing startup, and
+        weight loading are synchronous inside ``AsyncLLM.from_engine_args``.
+        Keeping that work on the Uvicorn loop makes even ``/health/live``
+        unresponsive for minutes, defeating the appliance state contract.
+        AsyncLLM starts its output handler lazily on the first request when it
+        is constructed outside a running loop, so the returned engine safely
+        attaches to the main loop during the probes below.
+        """
+        return await asyncio.to_thread(self._construct_role_engine_sync, name, role)
+
+    def _construct_role_engine_sync(self, name: str, role: RoleConfig):
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.entrypoints.openai.api_server import build_app, init_app_state
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+        from vllm.v1.engine.async_llm import AsyncLLM
+
+        parser = make_arg_parser(FlexibleArgumentParser())
+        argv = self._role_argv(name, role)
+        # Drop flags this vLLM version doesn't know (overlay-mode drift).
+        known = parser._option_string_actions
+        filtered: list[str] = []
+        skip = False
+        for i, token in enumerate(argv):
+            if skip:
+                skip = False
+                continue
+            if token.startswith("--") and token not in known:
+                logger.warning("dropping unsupported engine flag %s", token)
+                skip = i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                continue
+            filtered.append(token)
+        args = parser.parse_args(filtered)
+
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        if name == "embedding" and not getattr(engine_args, "hf_overrides", None):
+            # Thinker-only omni checkpoints (LCO) need their config wrapped
+            # into the full-omni shape vLLM's native model expects (M12).
+            # hf_overrides accepts a callable only through the Python API,
+            # never through CLI argv, so it is injected here.
+            from lazarus.models.embedding.lco_omni import normalize_thinker_config
+
+            engine_args.hf_overrides = normalize_thinker_config
+        engine = AsyncLLM.from_engine_args(engine_args)
+        return engine, args, build_app, init_app_state
 
     async def _probe_embedding_modalities(self, role: RoleConfig, dimensions: int) -> list[str]:
         found: list[str] = []

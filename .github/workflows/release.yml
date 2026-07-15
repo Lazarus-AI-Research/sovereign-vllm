@@ -1,0 +1,157 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io/lazarus-ai-research
+  LLAMA_VERSION: b9960
+  LLAMA_SHA256: 7a8c6b6ae3395e15b5cc330ed2938cc0aa4510905db1189658fd022035734b48
+  UV_VERSION: 0.11.28
+  PYTHON_VERSION: 3.12.11
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Require exact release version
+        run: |
+          test "$(cat VERSION)" = "${GITHUB_REF_NAME#v}"
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v").replace("-rc.", "rc")
+          with open("pyproject.toml", "rb") as handle:
+              package = tomllib.load(handle)["project"]["version"]
+          assert package == tag, (package, tag)
+          PY
+      - name: Locked package and tests
+        run: |
+          bash -n agent-dist/*.sh
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project --format requirements.txt --no-annotate --no-header --output-file exported-requirements.lock
+          cmp requirements-agent.lock exported-requirements.lock
+          uv run --extra dev ruff check lazarus tests
+          uv run --extra dev pytest -q
+          uv build --wheel
+
+  images:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - profile: cuda-x86_64
+            platform: linux/amd64
+            dockerfile: docker/cuda/Dockerfile
+          - profile: metal-arm64
+            platform: linux/arm64
+            dockerfile: docker/metal/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.REGISTRY }}/sovereign-runtime:${{ matrix.profile }}-${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: true
+      - name: Sign runtime image
+        run: cosign sign --yes "${REGISTRY}/sovereign-runtime:${{ matrix.profile }}-${VERSION}@${{ steps.build.outputs.digest }}"
+
+  metal-agent:
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Require Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Build self-contained distribution
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project --format requirements.txt --no-annotate --no-header --output-file exported-requirements.lock
+          cmp requirements-agent.lock exported-requirements.lock
+          uv build --wheel
+          mkdir -p stage/bin stage/python stage/wheels stage/agent-dist
+          cp "$(command -v uv)" stage/bin/uv
+          uv python install "$PYTHON_VERSION" --install-dir stage/python-install
+          PYTHON="$(find stage/python-install -type f -path '*/bin/python3.12' -print -quit)"
+          test -x "$PYTHON"
+          cp -R "$(cd "$(dirname "$PYTHON")/.." && pwd)"/. stage/python/
+          "$PYTHON" -m pip download --require-hashes --only-binary=:all: --dest stage/wheels --requirement requirements-agent.lock
+          cp dist/*.whl stage/wheels/
+          cp -R agent-dist/. stage/agent-dist/
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md stage/
+          curl -fL -o llama.tar.gz "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_VERSION/llama-$LLAMA_VERSION-bin-macos-arm64.tar.gz"
+          echo "$LLAMA_SHA256  llama.tar.gz" | shasum -a 256 -c -
+          tar -xzf llama.tar.gz
+          LLAMA="$(find . -type f -name llama-server -perm -111 -print -quit)"
+          LLAMA_DIR="$(dirname "$LLAMA")"
+          cp "$LLAMA" stage/bin/llama-server
+          cp -pPR "$LLAMA_DIR"/*.dylib stage/bin/
+          test -n "$(find stage/bin -maxdepth 1 -name '*.dylib' -print -quit)"
+          TEST_HOME="$(mktemp -d)"
+          HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
+            stage/agent-dist/install-agent.sh
+          "$TEST_HOME/.sovereign/runtime/venv/bin/python" -c \
+            'import fastapi, lazarus.agent.server, yaml'
+          "$TEST_HOME/.sovereign/runtime/bin/llama-server" --version
+          rm -rf "$TEST_HOME"
+          tar -C stage -czf "sovereign-metal-agent-$VERSION-arm64.tar.gz" .
+          shasum -a 256 "sovereign-metal-agent-$VERSION-arm64.tar.gz" > "sovereign-metal-agent-$VERSION-arm64.tar.gz.sha256"
+      - name: Generate Metal distribution SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: stage
+          output-file: sovereign-metal-agent.spdx.json
+          format: spdx-json
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign Metal distribution
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="sovereign-metal-agent-$VERSION-arm64.tar.gz"
+          mv sovereign-metal-agent.spdx.json "sovereign-metal-agent-$VERSION-arm64.spdx.json"
+          cosign sign-blob --yes --bundle "$ARCHIVE.sigstore.json" "$ARCHIVE"
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
+          generate_release_notes: true
+          files: |
+            sovereign-metal-agent-*.tar.gz
+            sovereign-metal-agent-*.sha256
+            sovereign-metal-agent-*.sigstore.json
+            sovereign-metal-agent-*.spdx.json

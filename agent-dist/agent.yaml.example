@@ -9,23 +9,23 @@
 listen: 127.0.0.1
 port: 9100
 token_env: SOVEREIGN_AGENT_TOKEN
-llama_server: llama-server
+llama_server: __AGENT_HOME__/runtime/bin/llama-server
 
 roles:
   # Default generation via Google's official QAT release
   # (source: google/gemma-4-E2B-it-qat-q4_0-gguf).
   generation:
-    model_path: /opt/sovereign/models/gemma-4-E2B_q4_0-it.gguf
-    mmproj_path: /opt/sovereign/models/gemma-4-E2B-it-mmproj.gguf
+    model_path: __AGENT_HOME__/models/metal/gemma-4-E2B_q4_0-it.gguf
+    mmproj_path: __AGENT_HOME__/models/metal/gemma-4-E2B-it-mmproj.gguf
+    revision: 69536a21d70340464240401ba38223d805f6a709
     port: 9101
     context_length: 8192
-    args: ["--jinja", "--reasoning-format", "deepseek", "--reasoning", "on"]
+    args: ["--jinja"]
 
-  # Default omni embedding via GGUF + multimodal projector
-  # (source: marksverdhei/LCO-Embedding-Omni-3B-2605-GGUF).
+  # Compact text embedding default for the supported 32GB Mac profile.
   embedding:
-    model_path: /opt/sovereign/models/LCO-Embedding-Omni-3B-2605-Q4_K_M.gguf
-    mmproj_path: /opt/sovereign/models/mmproj-LCO-Embedding-Omni-3B-2605-F16.gguf
+    model_path: __AGENT_HOME__/models/metal/nomic-embed-text-v1.5.Q8_0.gguf
+    revision: 0188c9bf409793f810680a5a431e7b899c46104c
     port: 9102
-    context_length: 4096
-    args: ["--embedding", "--pooling", "last"]
+    context_length: 2048
+    args: ["--embedding", "--pooling", "mean"]

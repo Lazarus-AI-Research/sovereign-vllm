@@ -1,16 +1,22 @@
 [project]
 name = "sovereign-runtime"
-version = "0.1.0.dev0"
+version = "0.1.0rc1"
 description = "Lazarus Sovereign Runtime appliance layer over vLLM"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+    { name = "Eric Hartford", email = "eric.hartford@lazarusai.com" },
+]
 requires-python = ">=3.11"
 dependencies = [
-    "pyyaml",
-    "jsonschema",
-    "pydantic>=2",
-    "fastapi",
-    "uvicorn",
-    "httpx",
-    "prometheus-client",
+    "pyyaml==6.0.3",
+    "jsonschema==4.26.0",
+    "pydantic==2.13.4",
+    "fastapi==0.136.3",
+    "uvicorn==0.51.0",
+    "httpx==0.28.1",
+    "prometheus-client==0.24.1",
 ]
 
 [project.optional-dependencies]
@@ -21,8 +27,8 @@ engine = [
     "vllm==0.25.0",
 ]
 dev = [
-    "pytest",
-    "ruff",
+    "pytest==9.1.1",
+    "ruff==0.15.21",
 ]
 # Audio embedding inputs (M12). Deliberately NOT vllm[audio]: that extra pulls
 # in torchcodec, whose wheel dlopens system ffmpeg libs and raises OSError on
@@ -31,8 +37,8 @@ dev = [
 # resampling. Without these the appliance still runs — the modality probe
 # simply never advertises audio.
 audio = [
-    "soundfile",
-    "soxr",
+    "soundfile==0.14.0",
+    "soxr==1.1.0",
 ]
 
 [project.entry-points."vllm.general_plugins"]
@@ -51,7 +57,7 @@ sovereign-runtime-healthcheck = "lazarus.appliance.healthcheck:main"
 sovereign-runtime-agent = "lazarus.agent.server:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

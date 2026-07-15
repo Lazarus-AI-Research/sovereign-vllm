@@ -9,13 +9,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from lazarus.appliance.backends.base import EngineBackend
 from lazarus.appliance.config import RuntimeConfig
 from lazarus.appliance.state import StateMachine
 
-RUNTIME_VERSION = "0.1.0-dev"
+
+def _runtime_version() -> str:
+    if configured := os.environ.get("SOVEREIGN_VERSION"):
+        return configured
+    try:
+        package_version = version("sovereign-runtime")
+    except PackageNotFoundError:
+        return "0.1.0-dev"
+    # Python normalizes 0.1.0-rc.1 to the PEP 440 form 0.1.0rc1. The product
+    # contract and container tags use the former consistently.
+    return re.sub(r"(?<=\d)rc(?=\d)", "-rc.", package_version)
+
+
+RUNTIME_VERSION = _runtime_version()
 
 
 class ManifestBuilder:

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from lazarus.agent.config import AgentConfig, load_agent_config
-from lazarus.agent.server import Agent, build_app
+from lazarus.agent.server import AGENT_VERSION, Agent, build_app
 
 
 def test_config_parses(tmp_path):
@@ -19,6 +19,7 @@ port: 9100
 roles:
   generation:
     model_path: /models/gen.gguf
+    revision: 69536a21d70340464240401ba38223d805f6a709
     port: 9101
     context_length: 8192
   embedding:
@@ -31,6 +32,7 @@ roles:
     config = load_agent_config(path)
     assert config.roles["embedding"].mmproj_path == "/models/mmproj.gguf"
     assert config.roles["generation"].port == 9101
+    assert config.roles["generation"].revision == "69536a21d70340464240401ba38223d805f6a709"
 
 
 def test_config_rejects_unknown_keys(tmp_path):
@@ -56,6 +58,7 @@ def test_manifest_shape(client):
     resp = client.get("/agent/manifest", headers={"Authorization": "Bearer agent-secret"})
     assert resp.status_code == 200
     body = resp.json()
+    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.1"
     assert body["engine"] == "llama.cpp"
     assert body["backend"] == "metal"
     assert body["roles"] == {}
