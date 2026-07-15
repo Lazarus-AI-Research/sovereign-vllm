@@ -1,6 +1,6 @@
 [project]
 name = "sovereign-runtime"
-version = "0.1.0rc2"
+version = "0.1.0rc3"
 description = "Lazarus Sovereign Runtime appliance layer over vLLM"
 readme = "README.md"
 license = "Apache-2.0"

@@ -12,4 +12,4 @@ def test_appliance_imports_without_vllm():
 
 
 def test_runtime_reports_release_version():
-    assert RUNTIME_VERSION == "0.1.0-rc.2"
+    assert RUNTIME_VERSION == "0.1.0-rc.3"

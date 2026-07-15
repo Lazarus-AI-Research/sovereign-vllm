@@ -58,7 +58,7 @@ def test_manifest_shape(client):
     resp = client.get("/agent/manifest", headers={"Authorization": "Bearer agent-secret"})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.2"
+    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.3"
     assert body["engine"] == "llama.cpp"
     assert body["backend"] == "metal"
     assert body["roles"] == {}
