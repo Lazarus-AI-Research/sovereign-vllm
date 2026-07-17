@@ -186,6 +186,10 @@ def main() -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stdout,
     )
+    # Attribution up front, before any config can fail (§ branding policy).
+    from lazarus.attribution import banner
+
+    logger.info(banner())
     appliance = Appliance()
     if appliance.config_error:
         logger.error("configuration error (staying alive for diagnosis): %s", appliance.config_error)
