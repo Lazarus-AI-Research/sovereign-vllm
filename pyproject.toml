@@ -41,11 +41,6 @@ audio = [
     "soxr==1.1.0",
 ]
 
-[project.entry-points."vllm.general_plugins"]
-# Loaded by vLLM in every process (incl. engine workers): registers the
-# thinker-only Qwen2.5-Omni architecture for LCO embedding checkpoints (M12).
-lazarus_lco_omni = "lazarus.models.embedding.lco_omni:register"
-
 [project.entry-points."vllm.platform_plugins"]
 # Native Metal (PyTorch-MPS) platform: runs vLLM's native torch models on the
 # Apple GPU with QuixiCore-backed attention. See docs/metal-native-backend.md.

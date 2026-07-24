@@ -48,7 +48,7 @@ def test_manifest_reports_discovered_dimensions(healthy):
 
 def test_models_chat_and_embeddings(healthy):
     ids = {m["id"] for m in healthy.get("/v1/models").json()["data"]}
-    assert ids == {"assistant-dev", "embedding-omni-default"}
+    assert ids == {"assistant-dev", "embedding-custom"}
 
     chat = healthy.post(
         "/v1/chat/completions",
@@ -57,7 +57,7 @@ def test_models_chat_and_embeddings(healthy):
     assert chat.status_code == 200
     assert chat.json()["choices"][0]["message"]["content"]
 
-    emb = healthy.post("/v1/embeddings", json={"model": "embedding-omni-default", "input": "hello"})
+    emb = healthy.post("/v1/embeddings", json={"model": "embedding-custom", "input": "hello"})
     vector = emb.json()["data"][0]["embedding"]
     assert len(vector) == 384
     assert abs(math.sqrt(sum(v * v for v in vector)) - 1.0) < 1e-6
@@ -66,7 +66,7 @@ def test_models_chat_and_embeddings(healthy):
 def test_multimodal_embeddings_messages_schema(healthy):
     # Extended schema: `messages` replaces `input` (runtime-contract §embeddings).
     body = {
-        "model": "embedding-omni-default",
+            "model": "embedding-custom",
         "messages": [
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
@@ -78,14 +78,14 @@ def test_multimodal_embeddings_messages_schema(healthy):
     assert emb.status_code == 200
     assert emb.json()["data"][0]["embedding"]
 
-    neither = healthy.post("/v1/embeddings", json={"model": "embedding-omni-default"})
+    neither = healthy.post("/v1/embeddings", json={"model": "embedding-custom"})
     assert neither.status_code == 400
 
 
 def test_multimodal_embeddings_reject_remote_urls(healthy):
     # Sovereignty: the runtime never fetches media; only data: URIs pass.
     body = {
-        "model": "embedding-omni-default",
+        "model": "embedding-custom",
         "messages": [
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
@@ -110,7 +110,7 @@ def test_streaming_ends_with_done(healthy):
 def test_role_mismatch_404(healthy):
     resp = healthy.post(
         "/v1/chat/completions",
-        json={"model": "embedding-omni-default", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "embedding-custom", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 404
 
@@ -164,6 +164,28 @@ def test_degraded_embedding(config_file, monkeypatch):
         json={"model": "assistant-dev", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 503
+
+
+def test_generation_only_runtime_is_ready(config_file, tmp_path, monkeypatch):
+    import yaml
+
+    data = yaml.safe_load(config_file.read_text())
+    del data["roles"]["embedding"]
+    path = tmp_path / "generation-only.yaml"
+    path.write_text(yaml.safe_dump(data))
+    client = TestClient(make_appliance(path, monkeypatch).app)
+
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json()["required_roles"] == {"generation": True}
+    assert "embedding" not in client.get("/runtime/manifest").json()["roles"]
+    assert client.post(
+        "/v1/chat/completions",
+        json={"model": "assistant-dev", "messages": [{"role": "user", "content": "hi"}]},
+    ).status_code == 200
+    assert client.post(
+        "/v1/embeddings", json={"model": "embedding-custom", "input": "hello"}
+    ).status_code == 404
 
 
 def test_manifest_written_to_file(config_file, tmp_path, monkeypatch):

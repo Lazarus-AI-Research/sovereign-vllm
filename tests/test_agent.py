@@ -2,6 +2,7 @@
 No llama-server processes are spawned (empty role set)."""
 
 import os
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -71,6 +72,66 @@ def test_proxy_requires_known_role(client):
         json={},
     )
     assert resp.status_code == 404
+
+
+def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypatch):
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    artifact = model_root / "custom.gguf"
+    artifact.write_bytes(b"verified gguf")
+    checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text("roles: {}\n")
+    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "agent-secret")
+    monkeypatch.setenv("SOVEREIGN_AGENT_MODEL_ROOT", str(model_root))
+    agent = Agent(AgentConfig(roles={}), config_path)
+
+    class FakeProcess:
+        port = 9102
+        model_path = str(artifact)
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(agent, "start_role", lambda name: FakeProcess())
+
+    async def ready(role, timeout=120):
+        return None
+
+    monkeypatch.setattr(agent, "wait_role_ready", ready)
+    with TestClient(build_app(agent)) as admin:
+        denied = admin.put(
+            "/agent/admin/roles/embedding",
+            headers={"Authorization": "Bearer agent-secret"},
+            json={
+                "artifact": "../custom.gguf",
+                "revision": "a" * 40,
+                "sha256": checksum,
+            },
+        )
+        assert denied.status_code == 422
+
+        accepted = admin.put(
+            "/agent/admin/roles/embedding",
+            headers={"Authorization": "Bearer agent-secret"},
+            json={
+                "artifact": "custom.gguf",
+                "revision": "a" * 40,
+                "sha256": checksum,
+                "pooling": "mean",
+                "normalization": "l2",
+            },
+        )
+        assert accepted.status_code == 200
+        assert agent.config.roles["embedding"].model_path == str(artifact)
+        assert "--embd-normalize" in agent.config.roles["embedding"].args
+
+        removed = admin.delete(
+            "/agent/admin/roles/embedding",
+            headers={"Authorization": "Bearer agent-secret"},
+        )
+        assert removed.status_code == 200
+        assert "embedding" not in agent.config.roles
 
 
 def test_tool_parser_inference():

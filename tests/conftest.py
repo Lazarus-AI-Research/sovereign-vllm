@@ -33,8 +33,8 @@ VALID_CONFIG = textwrap.dedent(
         enabled: true
         task: embed
         source: huggingface
-        model: LCO-Embedding/LCO-Embedding-Omni-3B-2605
-        served_model_name: embedding-omni-default
+        model: intfloat/e5-small-v2
+        served_model_name: embedding-custom
         priority: low
         memory_weight: 18
         max_concurrent_requests: 2

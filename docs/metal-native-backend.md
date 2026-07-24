@@ -8,16 +8,13 @@ Run vLLM's **native** torch models on the Apple GPU via PyTorch-MPS, with
 QuixiCore-Metal supplying the kernels torch-MPS lacks (attention, quantized
 matmul) and `vllm-gguf-plugin` supplying GGUF load + the quantized linear
 method. This replaces the MLX detour (`vllm-metal`), whose model coverage is
-gated by mlx-lm/mlx-vlm and therefore cannot load our two target checkpoints:
+gated by mlx-lm/mlx-vlm and therefore cannot load the certified generation checkpoint:
 
 - **google/gemma-4-E2B-it** — gemma-3n MatFormer (KV-sharing, per-layer
   embeddings). Breaks mlx-lm convert/load and vllm-metal's GGUF adapter.
-- **LCO-Embedding-Omni-3B** — Qwen2.5-Omni *thinker* (dense). mlx-vlm only has
-  the MoE `qwen3_omni_moe`, a structural mismatch.
-
-Both have **native vLLM implementations** (`vllm/model_executor/models/gemma3n.py`,
-`qwen2_5_omni_thinker.py`), so running them on Metal needs **no model porting** —
-only a platform + an attention backend.
+It has a **native vLLM implementation**
+(`vllm/model_executor/models/gemma3n.py`), so running it on Metal needs **no
+model porting** — only a platform + an attention backend.
 
 ## Why this is tractable (three seam maps)
 
@@ -89,7 +86,7 @@ QuixiCore glue). The plugin's MPS ops branch is an overlay patch against
 
 | Gap | Blocks | Plan |
 |---|---|---|
-| mrope / 3-D multimodal RoPE absent | Qwen2.5-Omni/VL | text-only embedding uses degenerate 1-D rope (all sections equal); add mrope kernel for full multimodal |
+| mrope / 3-D multimodal RoPE absent | future multimodal models | add an mrope kernel when a certified model requires it |
 | attention head_dim only {64,128} | gemma-3n (256) | grow paged/flash attn head-dim coverage to 256 |
 | dense GQA prefill limited (paged varlen exists) | simple runner | use paged path, or `repeat_interleave` KV in torch |
 | bf16 (norms/attn/rope) vs fp16 (qgemm) dtype split | mixed | standardize on one; cast around qgemm |
@@ -133,4 +130,4 @@ QuixiCore glue). The plugin's MPS ops branch is an overlay patch against
   at startup (compat) so its JIT/metallib build never happens mid-decode.
   Remaining headroom toward the ~71 tok/s raw-torch ceiling: `register_oot`
   Metal RMSNorm/RoPE/SiLU and `tk_torch.qgemm/qgemv` for the GGUF matmul.
-- **M-N4** — target models: gemma-4 (head_dim 256) + LCO-Omni embeddings (mrope).
+- **M-N4** — target model: gemma-4 (head_dim 256); certify optional embedding models independently through Control.

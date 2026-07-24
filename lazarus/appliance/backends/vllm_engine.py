@@ -290,14 +290,6 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         args = parser.parse_args(filtered)
 
         engine_args = AsyncEngineArgs.from_cli_args(args)
-        if name == "embedding" and not getattr(engine_args, "hf_overrides", None):
-            # Thinker-only omni checkpoints (LCO) need their config wrapped
-            # into the full-omni shape vLLM's native model expects (M12).
-            # hf_overrides accepts a callable only through the Python API,
-            # never through CLI argv, so it is injected here.
-            from lazarus.models.embedding.lco_omni import normalize_thinker_config
-
-            engine_args.hf_overrides = normalize_thinker_config
         engine = AsyncLLM.from_engine_args(engine_args)
         return engine, args, build_app, init_app_state
 

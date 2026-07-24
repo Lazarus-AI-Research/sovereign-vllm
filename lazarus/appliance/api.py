@@ -56,7 +56,8 @@ class Admission:
             for name, role in config.enabled_roles().items():
                 self._semaphores[name] = asyncio.Semaphore(role.max_concurrent_requests)
             embedding = config.roles.embedding
-            self._embed_threshold = embedding.throttle_when_generation_queue_above
+            if embedding is not None and embedding.enabled:
+                self._embed_threshold = embedding.throttle_when_generation_queue_above
 
     @property
     def generation_waiting(self) -> int:
@@ -160,7 +161,9 @@ def build_app(
         return backend.role_info(name).status
 
     def is_ready() -> bool:
-        return state.state == "healthy"
+        if config is None or state.state != "healthy":
+            return False
+        return all(role_status(name) == "healthy" for name in config.enabled_roles())
 
     @app.middleware("http")
     async def enforce_api_key(request: Request, call_next):
@@ -178,20 +181,25 @@ def build_app(
     @app.get("/health/ready")
     def health_ready() -> JSONResponse:
         ready = is_ready()
+        required_roles = {
+            name: role_status(name) == "healthy"
+            for name in (config.enabled_roles() if config else {})
+        }
         body = {
             "ready": ready,
             "state": state.state,
-            "required_roles": {
-                "generation": role_status("generation") == "healthy",
-                "embedding": role_status("embedding") == "healthy",
-            },
+            "required_roles": required_roles,
         }
         return JSONResponse(status_code=200 if ready else 503, content=body)
 
     @app.get("/health")
     def health() -> dict:
         roles = {}
-        for name in ("generation", "embedding"):
+        configured_roles = [
+            name for name in ("generation", "embedding")
+            if config is None or config.role(name) is not None
+        ]
+        for name in configured_roles:
             info = backend.role_info(name)
             role_config = config.role(name) if config else None
             entry: dict = {
