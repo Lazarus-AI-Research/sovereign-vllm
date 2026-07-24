@@ -94,7 +94,9 @@ class RolesSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     generation: RoleConfig
-    embedding: RoleConfig
+    # Embeddings are optional. SovereignStack uses its dedicated
+    # EmbeddingGemma service unless an operator selects a custom model.
+    embedding: RoleConfig | None = None
     vision: RoleConfig | None = None
     audio: RoleConfig | None = None
     rerank: RoleConfig | None = None

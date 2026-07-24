@@ -29,9 +29,9 @@ by default.
    │    one OpenAI-compatible   │
    │    API                     │
    │                            │
-   generation role         embedding role
-   (assistant-large =      (embedding-omni-default =
-    google/gemma-4-E2B-it)  LCO-Embedding/LCO-Embedding-Omni-3B-2605)
+   generation role         optional embedding role
+   (assistant-large =      (configured by Control only
+    google/gemma-4-E2B-it)  when a custom model is needed)
                 │
         CUDA / ROCm / XPU / Metal / DGX Spark / Strix Halo
 ```
@@ -49,10 +49,10 @@ vLLM is an excellent engine, and this fork changes as little of it as
 possible. But an appliance runtime has obligations a serving library does
 not:
 
-1. **One process, multiple model roles.** The stack requires generation and
-   embeddings served by a single supervised process behind a single port —
-   not one `vllm serve` per model behind a reverse proxy. Upstream serves
-   one model per server.
+1. **One process, optional multiple model roles.** The normal stack uses this
+   runtime for generation and a dedicated EmbeddingGemma service. Customers
+   can add a custom embedding role behind the same supervised port instead of
+   deploying another `vllm serve` process. Upstream serves one model per server.
 2. **An operational contract instead of a CLI.** Appliances are administered
    by software, not operators at a terminal. The runtime must expose an
    explicit state machine (`initializing → downloading → loading →
@@ -65,10 +65,6 @@ not:
    (where Docker containers cannot reach Metal), NVIDIA and AMD
    workstations, unified-memory systems, and Intel XPU. Making one contract
    hold across all of them is Lazarus scope, not upstream's.
-4. **The omni embedding model.** The stack's default embedding model
-   (`LCO-Embedding-Omni-3B-2605`, a Qwen2.5-Omni-based multimodal embedder)
-   needs pooling and multimodal-input paths that upstream does not provide
-   out of the box.
 
 ## What we changed
 
@@ -76,8 +72,8 @@ The fork operates in **overlay mode**: upstream vLLM stays a pinned
 dependency (`constraints.txt`), and every Lazarus customization lives in
 clearly separated, Lazarus-owned code. The `vllm/` tree gets vendored only
 when an in-tree patch becomes unavoidable — the known triggers are
-scheduler-level cross-role fairness, engine-internal metrics changes, the
-omni multimodal pooling path, and the Metal backend.
+scheduler-level cross-role fairness, engine-internal metrics changes, and the
+Metal backend.
 
 ### `lazarus/appliance/` — the appliance layer
 
@@ -99,8 +95,9 @@ omni multimodal pooling path, and the Metal backend.
   and normalized `sovereign_*` Prometheus metrics labeled by role and
   served model.
 - **`manifest.py`** — the `/runtime/manifest` document. Reports observed
-  reality: embedding dimensions are probed from the loaded checkpoint
-  (LCO-Omni probes at 2048), backends report what actually executes.
+  reality: embedding dimensions are probed from the loaded checkpoint, and
+  backends report what actually executes. A generation-only runtime is fully
+  healthy and simply omits the embedding role.
 - **`healthcheck.py` (`sovereign-runtime-healthcheck`)** — Docker
   healthchecks probe liveness only, so model loads and downloads never
   cause restart loops.
@@ -130,10 +127,10 @@ container contract while inference runs host-side:
   the agent manifest, forwards role traffic, and degrades to
   `configuration_error` (alive, diagnosable, no crash loop) when the agent
   is unreachable.
-- **`agent-dist/`** — launchd plist template plus install/uninstall
-  scripts. Default models are the canonical GGUF releases:
-  `google/gemma-4-E2B-it-qat-q4_0-gguf` (+mmproj, reasoning budget 0) and
-  `marksverdhei/LCO-Embedding-Omni-3B-2605-GGUF` (+mmproj).
+- **`agent-dist/`** — launchd plist template plus install/uninstall scripts.
+  The default is the canonical `google/gemma-4-E2B-it-qat-q4_0-gguf`
+  generation model (+mmproj, reasoning budget 0). Control can add or remove a
+  checksum-verified GGUF embedding role through the constrained agent API.
 
 ### Backends behind one seam (`lazarus/appliance/backends/`)
 

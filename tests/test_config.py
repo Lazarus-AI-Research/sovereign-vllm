@@ -7,7 +7,7 @@ from lazarus.appliance.config import ConfigError, load_config
 def test_valid_config_parses(config_file):
     config = load_config(config_file)
     assert config.roles.generation.served_model_name == "assistant-dev"
-    assert config.alias_to_role() == {"assistant-dev": "generation", "embedding-omni-default": "embedding"}
+    assert config.alias_to_role() == {"assistant-dev": "generation", "embedding-custom": "embedding"}
     assert config.roles.embedding.throttle_when_generation_queue_above == 2
 
 
@@ -53,6 +53,16 @@ def test_disabled_role_needs_no_model(tmp_path, config_file):
     path.write_text(yaml.safe_dump(data))
     config = load_config(path)
     assert "embedding" not in config.enabled_roles()
+
+
+def test_embedding_role_can_be_omitted(tmp_path, config_file):
+    data = yaml.safe_load(config_file.read_text())
+    del data["roles"]["embedding"]
+    path = tmp_path / "generation-only.yaml"
+    path.write_text(yaml.safe_dump(data))
+    config = load_config(path)
+    assert config.roles.embedding is None
+    assert list(config.enabled_roles()) == ["generation"]
 
 
 def test_tool_parser_field(tmp_path, config_file):

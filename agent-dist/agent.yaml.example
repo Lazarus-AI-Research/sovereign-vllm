@@ -2,9 +2,8 @@
 # Models are GGUF files on the host; weights live in the deploy ./models
 # mount so container and host share one copy.
 #
-# §10.3 note: the agent serves what llama.cpp supports. Platforms may run
-# generation-only (or a text fallback) while omni embedding conformance is
-# pending; the runtime manifest reports exactly what is loaded.
+# The default agent is generation-only. The runtime manifest reports exactly
+# what is loaded; Control adds a constrained embedding role only when selected.
 
 listen: 127.0.0.1
 port: 9100
@@ -22,10 +21,6 @@ roles:
     context_length: 8192
     args: ["--jinja"]
 
-  # Compact text embedding default for the supported 32GB Mac profile.
-  embedding:
-    model_path: __AGENT_HOME__/models/metal/nomic-embed-text-v1.5.Q8_0.gguf
-    revision: 0188c9bf409793f810680a5a431e7b899c46104c
-    port: 9102
-    context_length: 2048
-    args: ["--embedding", "--pooling", "mean"]
+  # Embeddings are served by embeddinggemma.c by default. Sovereign Control
+  # adds this optional role through the authenticated agent admin API when an
+  # operator selects a custom Metal GGUF embedding model.

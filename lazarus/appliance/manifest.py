@@ -25,7 +25,7 @@ def _runtime_version() -> str:
         package_version = version("sovereign-runtime")
     except PackageNotFoundError:
         return "0.1.0-dev"
-    # Python normalizes 0.1.0-rc.3 to the PEP 440 form 0.1.0rc3. The product
+    # Python normalizes 0.1.0-rc.4 to the PEP 440 form 0.1.0rc4. The product
     # contract and container tags use the former consistently.
     return re.sub(r"(?<=\d)rc(?=\d)", "-rc.", package_version)
 
@@ -59,7 +59,7 @@ class ManifestBuilder:
         info = self.backend.role_info(name)
         role_config = self.config.role(name) if self.config else None
         entry: dict = {
-            "enabled": bool(role_config.enabled) if role_config else name in ("generation", "embedding"),
+            "enabled": bool(role_config.enabled) if role_config else self.config is None and name == "generation",
             "status": info.status,
         }
         if role_config and role_config.task:
@@ -101,10 +101,7 @@ class ManifestBuilder:
             "topology": "single_process_multi_role",
             "state": self.state.state,
             "api": {"openai_compatible": True, "port": self.port, "base_path": "/v1"},
-            "roles": {
-                "generation": self._role_entry("generation"),
-                "embedding": self._role_entry("embedding"),
-            },
+            "roles": {"generation": self._role_entry("generation")},
             "accelerator": accelerator,
             "health": {
                 "status": "healthy" if self.state.state == "healthy" else self.state.state,
@@ -117,8 +114,12 @@ class ManifestBuilder:
             manifest["resource_policy"] = {
                 "enforcement": "best_effort",
                 "generation_memory_weight": self.config.roles.generation.memory_weight,
-                "embedding_memory_weight": self.config.roles.embedding.memory_weight,
             }
+            if self.config.roles.embedding is not None:
+                manifest["roles"]["embedding"] = self._role_entry("embedding")
+                manifest["resource_policy"]["embedding_memory_weight"] = self.config.roles.embedding.memory_weight
+        else:
+            manifest["roles"]["embedding"] = self._role_entry("embedding")
         for name in ("vision", "audio", "rerank"):
             if self.config and self.config.role(name):
                 manifest["roles"][name] = self._role_entry(name)
