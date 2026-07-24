@@ -1,8 +1,8 @@
 """Host agent unit tests: config parsing, auth fail-closed, manifest shape.
 No llama-server processes are spawned (empty role set)."""
 
-import os
 import hashlib
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -59,7 +59,7 @@ def test_manifest_shape(client):
     resp = client.get("/agent/manifest", headers={"Authorization": "Bearer agent-secret"})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.3"
+    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.4"
     assert body["engine"] == "llama.cpp"
     assert body["backend"] == "metal"
     assert body["roles"] == {}
