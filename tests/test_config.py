@@ -25,7 +25,7 @@ def test_invalid_yaml_raises(tmp_path):
 
 def test_missing_roles_raises(tmp_path):
     path = tmp_path / "runtime.yaml"
-    path.write_text('schema_version: "1.1"\nruntime:\n  port: 8000\n')
+    path.write_text('schema_version: "1.2"\nruntime:\n  port: 8000\n')
     with pytest.raises(ConfigError, match="roles"):
         load_config(path)
 

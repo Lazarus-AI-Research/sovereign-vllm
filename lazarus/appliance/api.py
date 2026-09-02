@@ -129,6 +129,20 @@ def _remote_media_error(messages: object) -> JSONResponse | None:
     return None
 
 
+def _unsupported_generation_content_error(messages: object) -> JSONResponse | None:
+    """Text generation rejects multimodal message parts before engine dispatch."""
+    for message in messages if isinstance(messages, list) else []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            return _error(
+                400,
+                "the configured generation role accepts text content only",
+                "invalid_request_error",
+                "unsupported_modality",
+            )
+    return None
+
+
 def _not_ready() -> JSONResponse:
     return _error(503, "runtime is not ready", "server_error")
 
@@ -293,6 +307,9 @@ def build_app(
             return _error(400, "request body must be JSON", "invalid_request_error")
         if denied := route(body, role, required_fields):
             return denied
+        if role == "generation" and request.url.path.endswith("/chat/completions"):
+            if denied := _unsupported_generation_content_error(body.get("messages")):
+                return denied
         if request.url.path.endswith("/embeddings") and "messages" in body:
             if denied := _remote_media_error(body["messages"]):
                 return denied

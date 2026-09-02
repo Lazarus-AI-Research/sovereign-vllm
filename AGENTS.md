@@ -1,3 +1,5 @@
 # Repository Instructions
 
-<!-- Never add a Co-Authored-By trailer or otherwise designate a co-author. Commits must list only Eric Hartford <eric.hartford@lazarusai.com> as the author. -->
+- Every commit must use the actual human contributor's own Git identity as author.
+- Never attribute a contributor's work to anyone else, and never configure a hardcoded repository-wide identity.
+- Never add `Co-Authored-By` trailers or designate AI systems as authors, co-authors, or co-contributors.

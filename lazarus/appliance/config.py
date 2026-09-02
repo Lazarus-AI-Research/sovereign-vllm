@@ -113,7 +113,7 @@ class RolesSection(BaseModel):
 class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.1"]
+    schema_version: Literal["1.2"]
     runtime: RuntimeSection = RuntimeSection()
     startup: StartupSection = StartupSection()
     roles: RolesSection
