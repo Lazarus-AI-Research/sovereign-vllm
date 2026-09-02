@@ -25,7 +25,7 @@ def _runtime_version() -> str:
         package_version = version("sovereign-runtime")
     except PackageNotFoundError:
         return "0.1.0-dev"
-    # Python normalizes 0.1.0-rc.4 to the PEP 440 form 0.1.0rc4. The product
+    # Python normalizes 0.1.0-rc.5 to the PEP 440 form 0.1.0rc5. The product
     # contract and container tags use the former consistently.
     return re.sub(r"(?<=\d)rc(?=\d)", "-rc.", package_version)
 
@@ -92,7 +92,7 @@ class ManifestBuilder:
             accelerator = probe()
 
         manifest: dict = {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "runtime_id": f"sovereign-runtime-{self.profile}-{RUNTIME_VERSION}",
             "runtime_version": RUNTIME_VERSION,
             "vllm_version": self.backend.engine_version(),

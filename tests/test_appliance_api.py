@@ -39,6 +39,7 @@ def test_healthy_lifecycle(healthy):
 
 def test_manifest_reports_discovered_dimensions(healthy):
     manifest = healthy.get("/runtime/manifest").json()
+    assert manifest["schema_version"] == "1.2"
     assert manifest["topology"] == "single_process_multi_role"
     assert manifest["state"] == "healthy"
     assert manifest["roles"]["embedding"]["dimensions"] == 384
@@ -61,6 +62,29 @@ def test_models_chat_and_embeddings(healthy):
     vector = emb.json()["data"][0]["embedding"]
     assert len(vector) == 384
     assert abs(math.sqrt(sum(v * v for v in vector)) - 1.0) < 1e-6
+
+
+def test_text_generation_rejects_multimodal_content_and_recovers(healthy):
+    rejected = healthy.post(
+        "/v1/chat/completions",
+        json={
+            "model": "assistant-dev",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                ],
+            }],
+        },
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "unsupported_modality"
+    recovered = healthy.post(
+        "/v1/chat/completions",
+        json={"model": "assistant-dev", "messages": [{"role": "user", "content": "Reply with OK."}]},
+    )
+    assert recovered.status_code == 200
 
 
 def test_multimodal_embeddings_messages_schema(healthy):

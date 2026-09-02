@@ -5,7 +5,7 @@ import pytest
 
 VALID_CONFIG = textwrap.dedent(
     """
-    schema_version: "1.1"
+    schema_version: "1.2"
 
     runtime:
       listen_address: 0.0.0.0
