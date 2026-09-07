@@ -52,7 +52,9 @@ def client(monkeypatch):
 
 def test_auth_fails_closed(client):
     assert client.get("/agent/manifest").status_code == 401
-    assert client.get("/agent/manifest", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert (
+        client.get("/agent/manifest", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    )
 
 
 def test_manifest_shape(client):
@@ -163,8 +165,11 @@ def test_generation_argv_defaults():
     backend = VllmBackend.__new__(VllmBackend)
     backend.backend_id = "cuda"
     role = RoleConfig(
-        enabled=True, task="generate", source="huggingface",
-        model="google/gemma-4-E2B-it", served_model_name="assistant-large",
+        enabled=True,
+        task="generate",
+        source="huggingface",
+        model="google/gemma-4-E2B-it",
+        served_model_name="assistant-large",
     )
     argv = backend._role_argv("generation", role)
     joined = " ".join(argv)
@@ -179,3 +184,71 @@ def test_generation_argv_defaults():
     joined = " ".join(backend._role_argv("generation", role))
     assert "--enable-auto-tool-choice" not in joined
     assert "--reasoning-parser" not in joined
+
+
+def test_metal_manifest_preserves_roles_without_mislabeling_agent_version(config_file, monkeypatch):
+    import asyncio
+
+    import yaml
+
+    from lazarus.appliance.backends.agent import AgentBackend
+    from lazarus.appliance.config import load_config
+    from lazarus.appliance.manifest import ManifestBuilder
+    from lazarus.appliance.state import StateMachine
+
+    data = yaml.safe_load(config_file.read_text())
+    data["runtime"]["profile"] = "metal-arm64"
+    config_file.write_text(yaml.safe_dump(data))
+    config = load_config(config_file)
+    monkeypatch.delenv("SOVEREIGN_PROFILE", raising=False)
+    monkeypatch.setenv("SOVEREIGN_AGENT_BACKEND_ID", "metal")
+    backend = AgentBackend()
+    state = StateMachine()
+
+    async def agent_manifest(enabled_roles):
+        assert enabled_roles == ["generation", "embedding"]
+        return {
+            "agent_version": AGENT_VERSION,
+            "engine": "llama.cpp",
+            "backend": "metal",
+            "roles": {
+                name: {
+                    "status": "healthy",
+                    "model": role.model,
+                    "revision": "a" * 40,
+                    "context_length": 8192,
+                }
+                for name, role in config.roles.items()
+            },
+        }
+
+    async def embedding_probe(_body):
+        return {"data": [{"embedding": [0.0] * 384}]}
+
+    monkeypatch.setattr(backend, "_wait_for_agent", agent_manifest)
+    monkeypatch.setattr(backend, "embeddings", embedding_probe)
+
+    async def exercise():
+        try:
+            await backend.start(config, state.transition)
+            state.transition("healthy")
+            return ManifestBuilder(state=state, backend=backend, config=config, port=8000).build()
+        finally:
+            await backend.shutdown()
+
+    manifest = asyncio.run(exercise())
+    assert backend._agent_manifest["agent_version"] == AGENT_VERSION
+    assert backend.engine_version() is None
+    assert "engine" not in manifest
+    assert "vllm_version" not in manifest
+    assert manifest["state"] == "healthy"
+    assert manifest["backend"] == "metal"
+    assert manifest["profile"] == "metal-arm64"
+    assert manifest["roles"]["generation"]["status"] == "healthy"
+    assert manifest["roles"]["generation"]["revision"] == "a" * 40
+    assert manifest["roles"]["embedding"]["dimensions"] == 384
+    assert manifest["accelerator"] == {
+        "vendor": "apple",
+        "device_count": 1,
+        "unified_memory": True,
+    }

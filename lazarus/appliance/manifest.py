@@ -59,7 +59,9 @@ class ManifestBuilder:
         info = self.backend.role_info(name)
         role_config = self.config.role(name) if self.config else None
         entry: dict = {
-            "enabled": bool(role_config.enabled) if role_config else self.config is None and name == "generation",
+            "enabled": bool(role_config.enabled)
+            if role_config
+            else self.config is None and name == "generation",
             "status": info.status,
         }
         if role_config and role_config.task:
@@ -74,6 +76,11 @@ class ManifestBuilder:
             entry["context_length"] = info.context_length
         if info.error_code:
             entry["error_code"] = info.error_code
+        if name == "generation":
+            if info.device_count is not None:
+                entry["device_count"] = info.device_count
+            if info.tensor_parallel_size is not None:
+                entry["tensor_parallel_size"] = info.tensor_parallel_size
         if name == "embedding":
             if info.dimensions:
                 entry["dimensions"] = info.dimensions
@@ -95,7 +102,6 @@ class ManifestBuilder:
             "schema_version": "1.2",
             "runtime_id": f"sovereign-runtime-{self.profile}-{RUNTIME_VERSION}",
             "runtime_version": RUNTIME_VERSION,
-            "vllm_version": self.backend.engine_version(),
             "backend": self.backend.backend_id,
             "profile": self.profile,
             "topology": "single_process_multi_role",
@@ -110,6 +116,14 @@ class ManifestBuilder:
                 "metrics": "ok",
             },
         }
+        engine_version = self.backend.engine_version()
+        if engine_version is not None:
+            manifest["vllm_version"] = engine_version
+            manifest["engine"] = {
+                "name": self.backend.engine_name,
+                "version": engine_version,
+                "adapter": self.backend.adapter_id,
+            }
         if self.config is not None:
             manifest["resource_policy"] = {
                 "enforcement": "best_effort",
@@ -117,7 +131,9 @@ class ManifestBuilder:
             }
             if self.config.roles.embedding is not None:
                 manifest["roles"]["embedding"] = self._role_entry("embedding")
-                manifest["resource_policy"]["embedding_memory_weight"] = self.config.roles.embedding.memory_weight
+                manifest["resource_policy"]["embedding_memory_weight"] = (
+                    self.config.roles.embedding.memory_weight
+                )
         else:
             manifest["roles"]["embedding"] = self._role_entry("embedding")
         for name in ("vision", "audio", "rerank"):

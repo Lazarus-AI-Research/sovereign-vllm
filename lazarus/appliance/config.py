@@ -10,11 +10,12 @@ control API still serving (§3.2), never a crash loop.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 
 class ConfigError(Exception):
@@ -37,14 +38,23 @@ class RoleConfig(BaseModel):
     pooling: Literal["last", "mean", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     throttle_when_generation_queue_above: int | None = Field(default=None, ge=0)
-    # Escape hatch (§2.9 warn-don't-block): extra engine CLI flags appended
-    # to the role's engine argv. Unknown flags are dropped with a warning.
-    engine_args: list[str] = []
+    enforce_eager: bool = Field(default=False, strict=True)
+    accelerator_device_ids: list[str] = Field(default_factory=list, min_length=1, max_length=4)
+    tensor_parallel_size: int = Field(default=1, ge=1, le=4)
     # Tool calling is on by default for generation: unset = infer the parser
     # from the model; "off" disables; any other value = explicit parser name.
     tool_call_parser: str | None = None
     # Same contract for reasoning separation (thinking → reasoning_content).
     reasoning_parser: str | None = None
+
+    @field_validator("tensor_parallel_size", mode="before")
+    @classmethod
+    def tensor_size_is_numeric(cls, value):
+        # JSON Schema integers include integral numbers such as 2.0, but
+        # neither boolean values nor numeric strings are integers.
+        if type(value) not in (int, float):
+            raise ValueError("tensor_parallel_size must be an integer")
+        return value
 
     def missing_load_fields(self) -> list[str]:
         if not self.enabled:
@@ -166,9 +176,40 @@ def load_config(path: str | Path) -> RuntimeConfig:
         raise ConfigError(f"runtime config invalid: {_format_validation_error(exc)}") from exc
 
     problems = []
-    for name, role in config.enabled_roles().items():
-        for field in role.missing_load_fields():
-            problems.append(f"roles.{name}.{field} is required when the role is enabled")
+    gpu_uuid = re.compile(r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    for name, role in config.roles.items():
+        if role.enabled:
+            for field in role.missing_load_fields():
+                problems.append(f"roles.{name}.{field} is required when the role is enabled")
+        if name != "generation" and role.model_fields_set.intersection(
+            {"accelerator_device_ids", "tensor_parallel_size"}
+        ):
+            problems.append(f"roles.{name} cannot define generation accelerator placement")
+    generation = config.roles.generation
+    has_devices = "accelerator_device_ids" in generation.model_fields_set
+    has_tensor_size = "tensor_parallel_size" in generation.model_fields_set
+    if has_devices != has_tensor_size:
+        problems.append(
+            "roles.generation accelerator_device_ids and tensor_parallel_size must be defined together"
+        )
+    if (has_devices or has_tensor_size) and config.runtime.profile not in (
+        "cuda-x86_64",
+        "cuda-arm64-dgx-spark",
+    ):
+        problems.append("roles.generation accelerator placement requires a CUDA runtime profile")
+    if generation.tensor_parallel_size not in (1, 2, 4):
+        problems.append("roles.generation tensor_parallel_size must be one of 1, 2, or 4")
+    if generation.accelerator_device_ids:
+        if len(generation.accelerator_device_ids) != generation.tensor_parallel_size:
+            problems.append(
+                "roles.generation accelerator_device_ids must match tensor_parallel_size"
+            )
+        if len(set(generation.accelerator_device_ids)) != len(generation.accelerator_device_ids):
+            problems.append("roles.generation accelerator_device_ids must be unique")
+        if any(not gpu_uuid.fullmatch(value) for value in generation.accelerator_device_ids):
+            problems.append(
+                "roles.generation accelerator_device_ids must contain canonical NVIDIA GPU UUIDs"
+            )
     if problems:
         raise ConfigError("runtime config invalid: " + "; ".join(problems))
     return config

@@ -85,9 +85,10 @@ Metal backend.
 - **`state.py`** — the contract state machine with deduplicated, structured
   error records (`MODEL_LOAD_FAILED`, `MODEL_REVISION_NOT_FOUND`,
   `HOST_AGENT_UNREACHABLE`, …) served at `/runtime/errors`.
-- **`config.py`** — the `runtime.yaml` parser (validated against the
+- **`config.py`** — the strict `runtime.yaml` parser (validated against the
   monorepo's JSON Schema), including per-role priorities, best-effort memory
-  weights, throttling policy, and an `engine_args` escape hatch.
+  weights, throttling policy, and Control-derived ordered NVIDIA GPU UUIDs
+  with an exact tensor-parallel cardinality. Raw engine arguments are rejected.
 - **`api.py`** — one FastAPI server on port 8000: health endpoints with
   liveness/readiness split, manifest and errors, role-routed OpenAI surface
   (`model` alias → role; wrong-role requests 404), bearer auth, per-role
@@ -98,6 +99,9 @@ Metal backend.
   reality: embedding dimensions are probed from the loaded checkpoint, and
   backends report what actually executes. A generation-only runtime is fully
   healthy and simply omits the embedding role.
+  Managed CUDA generation also reports the exact observed device UUIDs in
+  local-rank order, device count, and applied tensor-parallel size; omission or
+  disagreement keeps Control from treating a multi-GPU candidate as ready.
 - **`healthcheck.py` (`sovereign-runtime-healthcheck`)** — Docker
   healthchecks probe liveness only, so model loads and downloads never
   cause restart loops.
@@ -110,8 +114,38 @@ running as a second engine inside the same supervised process. The appliance
 dispatches role traffic to the right app over an in-process ASGI transport,
 streaming included. Memory weights map to per-engine
 `gpu_memory_utilization` with fixed headroom; roles load strictly serially
-so memory profiling never races. Weight downloads happen in the appliance's
-`downloading` state — engine child processes never touch the network.
+so memory profiling never races. Hugging Face sources download in the
+appliance's `downloading` state. Managed CUDA generation uses `source: local`
+and consumes a complete directory prepared by Control, not a checkpoint file
+or a repository fallback.
+
+The managed local directory contains one approved primary checkpoint under
+its original `*.safetensors` basename, matching `config.json`, `tokenizer.json`
+and `tokenizer_config.json`, and the pinned runtime metadata selected by its
+immutable engine profile. Gemma4 requires `processor_config.json`; Qwen3.5
+also requires `preprocessor_config.json` and `video_preprocessor_config.json`.
+Control includes matching generation defaults and chat templates. An optional
+`model.safetensors.index.json` must reference only the staged primary filename;
+an unsharded bundle does not require an index. The curated Fast bundle omits
+its upstream stale index rather than rewriting metadata or aliasing weights.
+
+Runtime checks this local CUDA generation shape before engine construction:
+nonempty regular files only, no symlinks, nested directories, extra checkpoints
+or unsupported metadata names; at most 16 fixed-name support files, each at
+most 64 MiB and at most 256 MiB combined. Missing or ambiguous inputs produce
+a bounded `CONFIG_INVALID` error while the control API remains alive. The
+consumer check does not establish authenticity: Control owns the immutable
+support-file manifest, SHA-256 verification, exact bundle contents and atomic
+staging. Legacy Metal GGUF local-file inputs are unchanged.
+
+The directory is passed unchanged as structured `--model`, alongside the pinned
+revision, served alias, tensor-parallel size and eager setting. Runtime does
+not repair local metadata with a Hub snapshot, switch to the source repository,
+or add `hf_config_path`, tokenizer, remote-code or arbitrary engine overrides.
+The private runtime manifest's `engine_model` is observed from the engine;
+`served_model_name` and the public OpenAI model identity remain the public
+alias, never the local directory. This input contract does not constitute
+physical CUDA qualification.
 
 ### Metal support (`lazarus/agent/` + `agent-dist/`)
 
