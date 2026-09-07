@@ -31,12 +31,16 @@ def _embed(text: str) -> list[float]:
 
 class FakeBackend(EngineBackend):
     backend_id = "mock"
+    engine_name = "mock"
+    adapter_id = "mock"
 
     def __init__(self) -> None:
         self._roles: dict[str, RoleInfo] = {}
+        self._accelerator_device_ids: list[str] = []
         self._aliases: dict[str, str] = {}
 
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
+        self._accelerator_device_ids = list(config.roles.generation.accelerator_device_ids)
         delay = float(os.environ.get("SOVEREIGN_FAKE_DELAY", "0.05"))
         fail_role = os.environ.get("SOVEREIGN_FAKE_FAIL_ROLE")
         on_state("downloading")
@@ -57,6 +61,10 @@ class FakeBackend(EngineBackend):
                 engine_model=role.model,
                 revision=role.revision or "fake",
                 context_length=role.max_model_len or 32768,
+                device_count=len(role.accelerator_device_ids) or None,
+                tensor_parallel_size=role.tensor_parallel_size
+                if name == "generation" and role.accelerator_device_ids
+                else None,
             )
             if name == "embedding":
                 info.dimensions = _DIM
@@ -70,6 +78,24 @@ class FakeBackend(EngineBackend):
 
     def role_info(self, role: str) -> RoleInfo:
         return self._roles.get(role, RoleInfo(status="disabled"))
+
+    def accelerator(self) -> dict:
+        if not self._accelerator_device_ids:
+            return {"vendor": "none", "device_count": 0, "unified_memory": False}
+        return {
+            "vendor": "nvidia",
+            "device_count": len(self._accelerator_device_ids),
+            "unified_memory": False,
+            "devices": [
+                {
+                    "identity_kind": "nvidia_gpu_uuid",
+                    "stable_identifier": device_id,
+                    "gpu_uuid": device_id,
+                    "local_rank": rank,
+                }
+                for rank, device_id in enumerate(self._accelerator_device_ids)
+            ],
+        }
 
     def engine_version(self) -> str:
         return "fake"
@@ -111,7 +137,9 @@ class FakeBackend(EngineBackend):
             "object": "text_completion",
             "created": int(time.time()),
             "model": body["model"],
-            "choices": [{"index": 0, "text": " a local-first AI appliance.", "finish_reason": "stop"}],
+            "choices": [
+                {"index": 0, "text": " a local-first AI appliance.", "finish_reason": "stop"}
+            ],
             "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
         }
 

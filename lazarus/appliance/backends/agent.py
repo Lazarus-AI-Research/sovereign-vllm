@@ -35,6 +35,9 @@ logger = logging.getLogger("sovereign.agent")
 
 
 class AgentBackend(RoleClientMixin, EngineBackend):
+    engine_name = "llama.cpp"
+    adapter_id = "metal-host-agent"
+
     def __init__(self) -> None:
         self.backend_id = os.environ.get("SOVEREIGN_AGENT_BACKEND_ID", "metal")
         self.url = os.environ.get("SOVEREIGN_AGENT_URL", "http://host.docker.internal:9100")
@@ -64,8 +67,11 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                 continue
             agent_role = agent_roles.get(name)
             if not agent_role or agent_role.get("status") != "healthy":
-                logger.warning("agent does not serve role %s (agent status: %s)",
-                               name, (agent_role or {}).get("status"))
+                logger.warning(
+                    "agent does not serve role %s (agent status: %s)",
+                    name,
+                    (agent_role or {}).get("status"),
+                )
                 self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_NOT_FOUND")
                 continue
             self._clients[name] = httpx.AsyncClient(
@@ -101,14 +107,13 @@ class AgentBackend(RoleClientMixin, EngineBackend):
         async with httpx.AsyncClient(timeout=5.0) as client:
             while asyncio.get_running_loop().time() < deadline:
                 try:
-                    resp = await client.get(
-                        f"{self.url}/agent/manifest", headers=self._headers()
-                    )
+                    resp = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
                     if resp.status_code == 200:
                         manifest = resp.json()
                         roles = manifest.get("roles") or {}
                         pending = [
-                            name for name in enabled_roles
+                            name
+                            for name in enabled_roles
                             if (roles.get(name) or {}).get("status") == "loading"
                         ]
                         if not pending:
@@ -138,8 +143,10 @@ class AgentBackend(RoleClientMixin, EngineBackend):
     def role_client(self, role: str) -> httpx.AsyncClient | None:
         return self._clients.get(role)
 
-    def engine_version(self) -> str:
-        return f"host-agent/{self._agent_manifest.get('agent_version', 'unknown')} ({self._agent_manifest.get('engine', 'unknown')})"
+    def engine_version(self) -> str | None:
+        # The host-agent manifest reports its package version, not the
+        # llama.cpp build. Do not present it as engine-version evidence.
+        return None
 
     def accelerator(self) -> dict:
         return {

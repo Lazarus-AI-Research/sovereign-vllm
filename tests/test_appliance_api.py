@@ -12,7 +12,11 @@ from lazarus.appliance.launcher import Appliance
 
 
 def make_appliance(config_path, monkeypatch, **env) -> Appliance:
-    for key in ("SOVEREIGN_RUNTIME_API_KEY", "SOVEREIGN_FAKE_FAIL_ROLE", "SOVEREIGN_RUNTIME_MANIFEST"):
+    for key in (
+        "SOVEREIGN_RUNTIME_API_KEY",
+        "SOVEREIGN_FAKE_FAIL_ROLE",
+        "SOVEREIGN_RUNTIME_MANIFEST",
+    ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -47,6 +51,30 @@ def test_manifest_reports_discovered_dimensions(healthy):
     assert manifest["profile"] == "mock"
 
 
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_manifest_reports_exact_managed_multi_gpu_execution(
+    managed_cuda_config_file, monkeypatch, count
+):
+    import yaml
+
+    data = yaml.safe_load(managed_cuda_config_file.read_text())
+    devices = [f"GPU-00000000-0000-0000-0000-{rank:012x}" for rank in range(count, 0, -1)]
+    data["roles"]["generation"]["accelerator_device_ids"] = devices
+    data["roles"]["generation"]["tensor_parallel_size"] = count
+    managed_cuda_config_file.write_text(yaml.safe_dump(data))
+    manifest = (
+        TestClient(make_appliance(managed_cuda_config_file, monkeypatch).app)
+        .get("/runtime/manifest")
+        .json()
+    )
+    assert manifest["state"] == "healthy"
+    generation = manifest["roles"]["generation"]
+    assert generation["device_count"] == count
+    assert generation["tensor_parallel_size"] == count
+    assert [item["gpu_uuid"] for item in manifest["accelerator"]["devices"]] == devices
+    assert [item["local_rank"] for item in manifest["accelerator"]["devices"]] == list(range(count))
+
+
 def test_models_chat_and_embeddings(healthy):
     ids = {m["id"] for m in healthy.get("/v1/models").json()["data"]}
     assert ids == {"assistant-dev", "embedding-custom"}
@@ -69,20 +97,25 @@ def test_text_generation_rejects_multimodal_content_and_recovers(healthy):
         "/v1/chat/completions",
         json={
             "model": "assistant-dev",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe this image."},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-                ],
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                    ],
+                }
+            ],
         },
     )
     assert rejected.status_code == 400
     assert rejected.json()["error"]["code"] == "unsupported_modality"
     recovered = healthy.post(
         "/v1/chat/completions",
-        json={"model": "assistant-dev", "messages": [{"role": "user", "content": "Reply with OK."}]},
+        json={
+            "model": "assistant-dev",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+        },
     )
     assert recovered.status_code == 200
 
@@ -90,12 +123,15 @@ def test_text_generation_rejects_multimodal_content_and_recovers(healthy):
 def test_multimodal_embeddings_messages_schema(healthy):
     # Extended schema: `messages` replaces `input` (runtime-contract §embeddings).
     body = {
-            "model": "embedding-custom",
+        "model": "embedding-custom",
         "messages": [
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-                {"type": "text", "text": "caption"},
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                    {"type": "text", "text": "caption"},
+                ],
+            }
         ],
     }
     emb = healthy.post("/v1/embeddings", json=body)
@@ -111,9 +147,12 @@ def test_multimodal_embeddings_reject_remote_urls(healthy):
     body = {
         "model": "embedding-custom",
         "messages": [
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
-            ]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            }
         ],
     }
     emb = healthy.post("/v1/embeddings", json=body)
@@ -125,7 +164,11 @@ def test_streaming_ends_with_done(healthy):
     with healthy.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": "assistant-dev", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        json={
+            "model": "assistant-dev",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
     ) as resp:
         text = "".join(resp.iter_text())
     assert "data: " in text and text.rstrip().endswith("data: [DONE]")
@@ -203,13 +246,19 @@ def test_generation_only_runtime_is_ready(config_file, tmp_path, monkeypatch):
     assert ready.status_code == 200
     assert ready.json()["required_roles"] == {"generation": True}
     assert "embedding" not in client.get("/runtime/manifest").json()["roles"]
-    assert client.post(
-        "/v1/chat/completions",
-        json={"model": "assistant-dev", "messages": [{"role": "user", "content": "hi"}]},
-    ).status_code == 200
-    assert client.post(
-        "/v1/embeddings", json={"model": "embedding-custom", "input": "hello"}
-    ).status_code == 404
+    assert (
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "assistant-dev", "messages": [{"role": "user", "content": "hi"}]},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/v1/embeddings", json={"model": "embedding-custom", "input": "hello"}
+        ).status_code
+        == 404
+    )
 
 
 def test_manifest_written_to_file(config_file, tmp_path, monkeypatch):

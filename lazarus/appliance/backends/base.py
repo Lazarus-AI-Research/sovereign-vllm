@@ -13,7 +13,9 @@ class BackendStartError(Exception):
     """Raised by start() for load-time failures. Carries the error code for
     /runtime/errors; the launcher decides degraded vs configuration_error."""
 
-    def __init__(self, code: str, message: str, *, role: str | None = None, recoverable: bool = True):
+    def __init__(
+        self, code: str, message: str, *, role: str | None = None, recoverable: bool = True
+    ):
         super().__init__(message)
         self.code = code
         self.role = role
@@ -31,6 +33,8 @@ class RoleInfo:
     context_length: int | None = None
     dimensions: int | None = None  # embedding: probed, never assumed (§10.1)
     modalities: list[str] | None = None
+    device_count: int | None = None
+    tensor_parallel_size: int | None = None
 
 
 class EngineBackend(ABC):
@@ -38,6 +42,8 @@ class EngineBackend(ABC):
     strictly serially (generation before embedding, §24 steps 8–9)."""
 
     backend_id: str = "unknown"  # manifest "backend" field: cuda|rocm|xpu|metal|cpu|mock
+    engine_name: str = "mock"
+    adapter_id: str = "mock"
 
     @abstractmethod
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
@@ -52,7 +58,8 @@ class EngineBackend(ABC):
     def role_info(self, role: str) -> RoleInfo: ...
 
     @abstractmethod
-    def engine_version(self) -> str: ...
+    def engine_version(self) -> str | None:
+        """Return the observed engine version, or None when it is unavailable."""
 
     # OpenAI surface. Bodies are already validated for role routing by the
     # appliance; backends may raise for engine errors — the API layer maps

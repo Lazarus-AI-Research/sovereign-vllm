@@ -11,8 +11,9 @@ serving constructors, which reorganize between releases.
 Multi-role invariants:
 - Roles load strictly serially, generation first (§24 steps 8–9), so memory
   profiling never races between engines.
-- The appliance downloads weights itself in the downloading state (§24 step
-  6); engine child processes never touch the network.
+- Hugging Face sources download in the downloading state (§24 step 6).
+  Managed local CUDA generation consumes Control's prepared directory without
+  downloading, repairing metadata, or switching to a repository source.
 - memory_weight maps to per-engine gpu_memory_utilization with fixed headroom
   on accelerator backends (§3.5 best-effort); CPU sizes KV cache via
   VLLM_CPU_KVCACHE_SPACE.
@@ -26,7 +27,9 @@ import functools
 import json
 import logging
 import os
+import stat
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
@@ -40,6 +43,117 @@ logger = logging.getLogger("sovereign.vllm")
 # remainder absorbs per-engine CUDA context and cudagraph overhead.
 MEMORY_HEADROOM = 0.92
 
+# This is a consumer shape check, not another artifact manifest. Control owns
+# the immutable filenames, revisions, byte lengths, SHA-256s and staging lock.
+LOCAL_SUPPORT_FILES = frozenset(
+    {
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "vocab.txt",
+        "model.safetensors.index.json",
+    }
+)
+LOCAL_SUPPORT_FILE_LIMIT = 64 * 1024 * 1024
+LOCAL_SUPPORT_TOTAL_LIMIT = 256 * 1024 * 1024
+
+
+def _local_cuda_error(detail: str) -> BackendStartError:
+    return BackendStartError(
+        "CONFIG_INVALID",
+        f"local CUDA generation bundle {detail}",
+        role="generation",
+        recoverable=True,
+    )
+
+
+def _local_bundle_json(path: Path) -> dict:
+    with path.open("rb") as source:
+        contents = source.read(LOCAL_SUPPORT_FILE_LIMIT + 1)
+    if len(contents) > LOCAL_SUPPORT_FILE_LIMIT:
+        raise _local_cuda_error("metadata exceeds the supported size limit")
+    try:
+        value = json.loads(contents)
+    except (ValueError, UnicodeError, RecursionError):
+        raise _local_cuda_error("contains invalid configuration or weight-index JSON") from None
+    if not isinstance(value, dict):
+        raise _local_cuda_error("configuration and weight index must be JSON objects")
+    return value
+
+
+def _validate_local_cuda_bundle(model: str | None) -> None:
+    """Reject incomplete/ambiguous local inputs before importing the engine.
+
+    Do not hash weights or duplicate Control's sealed support-file manifest.
+    Directory enumeration and metadata reads are bounded; errors never echo
+    the private path, unapproved filenames, or file contents.
+    """
+    if not model:
+        raise _local_cuda_error("requires a prepared model directory")
+    root = Path(model)
+    try:
+        if not stat.S_ISDIR(root.lstat().st_mode):
+            raise _local_cuda_error("requires a prepared directory, not a file or symlink")
+        support: set[str] = set()
+        weights: list[str] = []
+        total = 0
+        with os.scandir(root) as entries:
+            for count, entry in enumerate(entries, start=1):
+                if count > 17:  # One primary artifact and at most 16 support files.
+                    raise _local_cuda_error("contains too many files")
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+                    raise _local_cuda_error("must contain only nonempty regular files")
+                if entry.name in LOCAL_SUPPORT_FILES:
+                    support.add(entry.name)
+                    total += metadata.st_size
+                    if (
+                        metadata.st_size > LOCAL_SUPPORT_FILE_LIMIT
+                        or total > LOCAL_SUPPORT_TOTAL_LIMIT
+                    ):
+                        raise _local_cuda_error("metadata exceeds the supported size limit")
+                elif entry.name.endswith(".safetensors") and not entry.name.startswith("."):
+                    weights.append(entry.name)
+                    if len(weights) > 1:
+                        raise _local_cuda_error("requires exactly one primary safetensors file")
+                else:
+                    raise _local_cuda_error("contains an unsupported file")
+        if len(weights) != 1:
+            raise _local_cuda_error("requires exactly one primary safetensors file")
+        if not {"config.json", "tokenizer.json", "tokenizer_config.json"} <= support:
+            raise _local_cuda_error("is missing required configuration or tokenizer files")
+        config = _local_bundle_json(root / "config.json")
+        # These shipped multimodal architectures consume processor metadata
+        # even when the appliance exposes only text generation.
+        model_type = config.get("model_type")
+        if model_type in ("gemma4", "qwen3_5") and "processor_config.json" not in support:
+            raise _local_cuda_error("is missing required processor metadata")
+        if (
+            model_type == "qwen3_5"
+            and not {"preprocessor_config.json", "video_preprocessor_config.json"} <= support
+        ):
+            raise _local_cuda_error("is missing required processor metadata")
+        if "model.safetensors.index.json" in support:
+            index = _local_bundle_json(root / "model.safetensors.index.json")
+            weight_map = index.get("weight_map")
+            if (
+                not isinstance(weight_map, dict)
+                or not weight_map
+                or any(filename != weights[0] for filename in weight_map.values())
+            ):
+                raise _local_cuda_error("weight index does not match the primary safetensors file")
+    except (OSError, ValueError):
+        raise _local_cuda_error("is unavailable or unreadable") from None
+
 
 class _RoleApp:
     def __init__(self, engine, app, client: httpx.AsyncClient):
@@ -49,6 +163,9 @@ class _RoleApp:
 
 
 class VllmBackend(RoleClientMixin, EngineBackend):
+    engine_name = "vllm"
+    adapter_id = "sovereign-runtime"
+
     def __init__(self) -> None:
         # `vllm serve` forces spawn before constructing an AsyncLLM, but this
         # in-process adapter bypasses that entrypoint. Forking the second role
@@ -59,10 +176,18 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         self.backend_id = os.environ.get("VLLM_BACKEND", "cpu")
         self._roles: dict[str, RoleInfo] = {}
         self._apps: dict[str, _RoleApp] = {}
+        self._local_cuda_generation = self.backend_id == "cuda"
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
+        self._local_cuda_generation = self.backend_id == "cuda" or config.runtime.profile in (
+            "cuda-x86_64",
+            "cuda-arm64-dgx-spark",
+        )
+        generation = config.roles.generation
+        if self._local_cuda_generation and generation.enabled and generation.source == "local":
+            _validate_local_cuda_bundle(generation.model)
         try:
             import vllm  # noqa: F401
         except ImportError as exc:
@@ -71,6 +196,16 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 f"vLLM is not installed in this image: {exc}",
                 recoverable=False,
             ) from exc
+        configured_devices = config.roles.generation.accelerator_device_ids
+        if configured_devices:
+            observed = self.accelerator()
+            observed_devices = [item["gpu_uuid"] for item in observed.get("devices", [])]
+            if observed_devices != configured_devices:
+                raise BackendStartError(
+                    "ACCELERATOR_UNAVAILABLE",
+                    "visible CUDA devices do not match the managed generation placement",
+                    recoverable=True,
+                )
 
         on_state("downloading")
         for name, role in config.roles.items():
@@ -79,7 +214,9 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                     await self._download(role)
                 except Exception as exc:
                     logger.exception("download failed for role %s", name)
-                    self._roles[name] = RoleInfo(status="unhealthy", error_code=_download_error_code(exc))
+                    self._roles[name] = RoleInfo(
+                        status="unhealthy", error_code=_download_error_code(exc)
+                    )
 
         for name, role in config.roles.items():
             if not role.enabled:
@@ -96,6 +233,8 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             await self._start_role(name, role)
 
     async def _download(self, role: RoleConfig) -> None:
+        if role.source == "local":
+            return  # Local means prepared by Control, never repaired with a Hub snapshot.
         from huggingface_hub import snapshot_download
 
         kwargs: dict = {"repo_id": role.model}
@@ -152,8 +291,10 @@ class VllmBackend(RoleClientMixin, EngineBackend):
 
     def _role_argv(self, name: str, role: RoleConfig) -> list[str]:
         argv = [
-            "--model", role.model,
-            "--served-model-name", role.served_model_name,
+            "--model",
+            role.model,
+            "--served-model-name",
+            role.served_model_name,
         ]
         if role.revision and role.revision not in ("<immutable-revision>", "main"):
             argv += ["--revision", role.revision]
@@ -162,6 +303,10 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         if self.backend_id not in ("cpu", "mock"):
             fraction = round(MEMORY_HEADROOM * role.memory_weight / 100.0, 3)
             argv += ["--gpu-memory-utilization", str(fraction)]
+        if name == "generation":
+            argv += ["--tensor-parallel-size", str(role.tensor_parallel_size)]
+        if role.enforce_eager:
+            argv.append("--enforce-eager")
         argv += self.APPLIANCE_DEFAULT_FLAGS
         if name == "generation" and role.tool_call_parser != "off":
             parser = role.tool_call_parser or self._infer_tool_parser(role.model or "")
@@ -177,8 +322,6 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             parser = role.reasoning_parser or self._infer_reasoning_parser(role.model or "")
             if parser:
                 argv += ["--reasoning-parser", parser]
-        if role.engine_args:
-            argv += role.engine_args
         if name == "embedding":
             argv += ["--runner", "pooling"]
             # vLLM 0.25 renamed --override-pooler-config to --pooler-config and
@@ -213,12 +356,19 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 await init_app_state(engine, app.state, args, supported_tasks)
             except TypeError:
                 await init_app_state(engine, app.state, args)
+            if (
+                name == "generation"
+                and getattr(args, "tensor_parallel_size", None) != role.tensor_parallel_size
+            ):
+                raise RuntimeError("vLLM did not apply the managed tensor-parallel size")
             client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://sovereign-role",
                 timeout=600.0,
             )
             self._apps[name] = _RoleApp(engine, app, client)
+        except BackendStartError:
+            raise
         except Exception as exc:  # load failure → role unhealthy, process alive (§3.2)
             logger.exception("%s role failed to load", name)
             self._roles[name] = RoleInfo(status="unhealthy", error_code=_error_code(exc))
@@ -226,10 +376,14 @@ class VllmBackend(RoleClientMixin, EngineBackend):
 
         info = RoleInfo(
             status="healthy",
-            engine_model=role.model,
+            engine_model=getattr(model_config, "model", None),
             revision=role.revision or "main",
             context_length=getattr(getattr(engine, "model_config", None), "max_model_len", None)
             or role.max_model_len,
+            device_count=len(role.accelerator_device_ids) or None,
+            tensor_parallel_size=role.tensor_parallel_size
+            if name == "generation" and role.accelerator_device_ids
+            else None,
         )
         self._roles[name] = info
 
@@ -266,6 +420,8 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         return await asyncio.to_thread(self._construct_role_engine_sync, name, role)
 
     def _construct_role_engine_sync(self, name: str, role: RoleConfig):
+        if name == "generation" and role.source == "local" and self._local_cuda_generation:
+            _validate_local_cuda_bundle(role.model)
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.entrypoints.openai.api_server import build_app, init_app_state
         from vllm.entrypoints.openai.cli_args import make_arg_parser
@@ -274,7 +430,8 @@ class VllmBackend(RoleClientMixin, EngineBackend):
 
         parser = make_arg_parser(FlexibleArgumentParser())
         argv = self._role_argv(name, role)
-        # Drop flags this vLLM version doesn't know (overlay-mode drift).
+        # Optional overlay defaults may drift; never drop the model source,
+        # public alias, immutable revision or managed execution placement.
         known = parser._option_string_actions
         filtered: list[str] = []
         skip = False
@@ -283,6 +440,19 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 skip = False
                 continue
             if token.startswith("--") and token not in known:
+                if token in (
+                    "--model",
+                    "--served-model-name",
+                    "--revision",
+                    "--tensor-parallel-size",
+                    "--enforce-eager",
+                ):
+                    raise BackendStartError(
+                        "CONFIG_INVALID",
+                        "vLLM does not support the required structured launch arguments",
+                        role=name,
+                        recoverable=True,
+                    )
                 logger.warning("dropping unsupported engine flag %s", token)
                 skip = i + 1 < len(argv) and not argv[i + 1].startswith("--")
                 continue
@@ -310,7 +480,9 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 else:
                     logger.warning(
                         "%s modality probe returned %d dims (text probe said %d); not advertising",
-                        modality, len(vector), dimensions,
+                        modality,
+                        len(vector),
+                        dimensions,
                     )
             except Exception as exc:
                 logger.info("embedding %s modality probe negative: %s", modality, exc)
@@ -348,14 +520,41 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             import torch
 
             if torch.cuda.is_available():
-                return {
+                devices = []
+                for index in range(torch.cuda.device_count()):
+                    raw_uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
+                    gpu_uuid = _canonical_torch_uuid(raw_uuid)
+                    if gpu_uuid is not None:
+                        devices.append(
+                            {
+                                "identity_kind": "nvidia_gpu_uuid",
+                                "stable_identifier": gpu_uuid,
+                                "local_rank": index,
+                                "gpu_uuid": gpu_uuid,
+                            }
+                        )
+                result = {
                     "vendor": "nvidia" if torch.version.hip is None else "amd",
                     "device_count": torch.cuda.device_count(),
                     "unified_memory": False,
                 }
-        except Exception:  # torch missing or device probing failed
+                if len(devices) == result["device_count"]:
+                    result["devices"] = devices
+                return result
+        except Exception:
             pass
         return {"vendor": "cpu", "device_count": 0, "unified_memory": False}
+
+
+def _canonical_torch_uuid(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes) and len(value) == 16:
+        value = value.hex()
+    value = str(value).lower().removeprefix("gpu-").replace("-", "")
+    if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+        return None
+    return f"GPU-{value[:8]}-{value[8:12]}-{value[12:16]}-{value[16:20]}-{value[20:]}"
 
     # OpenAI-surface methods (smoke test + probes) come from RoleClientMixin;
     # live traffic is forwarded raw by the API layer via role_client.
