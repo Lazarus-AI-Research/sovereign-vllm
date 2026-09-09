@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import json
 import logging
 import os
@@ -176,11 +177,35 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         self.backend_id = os.environ.get("VLLM_BACKEND", "cpu")
         self._roles: dict[str, RoleInfo] = {}
         self._apps: dict[str, _RoleApp] = {}
+        self._engines: dict[str, object] = {}
+        self._starting = False
+        self._startup_attempted = False
+        self._start_task: asyncio.Task | None = None
+        self._loading_roles: set[str] = set()
+        self._construction_tasks: set[asyncio.Task] = set()
+        # Pinned AsyncLLM shutdown does not wait for every worker descendant.
+        # Once its constructor is entered, missing apps can never establish
+        # full withdrawal; recovery needs actual idle or process supervision.
+        self._native_lifetime_started = False
+        self._cleanup_pending = False
         self._local_cuda_generation = self.backend_id == "cuda"
+        self.generation_paused = False
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
+        if self._starting or self._native_lifetime_started or self._apps:
+            raise BackendStartError("CONFIG_INVALID", "vLLM engine lifetime is already managed or unresolved")
+        self._starting = True
+        self._startup_attempted = True
+        self._start_task = asyncio.current_task()
+        try:
+            await self._start_inner(config, on_state)
+        finally:
+            self._starting = False
+            self._start_task = None
+
+    async def _start_inner(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
         self._local_cuda_generation = self.backend_id == "cuda" or config.runtime.profile in (
             "cuda-x86_64",
             "cuda-arm64-dgx-spark",
@@ -231,6 +256,48 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 continue
             on_state("loading")
             await self._start_role(name, role)
+
+    async def quiesce(self) -> None:
+        self.generation_paused = True
+        if self._cleanup_pending:
+            raise BackendStartError("ENGINE_QUIESCE_UNAVAILABLE", "engine cleanup is unconfirmed")
+        if self._starting or self._loading_roles or self._construction_tasks:
+            raise BackendStartError("ENGINE_QUIESCE_UNAVAILABLE", "engine construction has not settled")
+        role_app = self._apps.get("generation")
+        if role_app is None:
+            if self._startup_attempted and not self._native_lifetime_started and not self._engines and not self._apps:
+                return  # Positively no constructor was entered; ingress stays closed.
+            raise BackendStartError("ENGINE_QUIESCE_UNAVAILABLE", "generation engine is unavailable")
+        try:
+            # Pinned vLLM 0.25 awaits CoreProc's idle callback Future here.
+            # The API has already drained admitted responses: wait mode freezes
+            # queued work, so it cannot replace that outer drain. Never abort.
+            await role_app.engine.pause_generation(mode="wait", clear_cache=False)
+            if await role_app.engine.is_paused() is not True:
+                raise RuntimeError("generation pause was not acknowledged")
+        except Exception:
+            raise BackendStartError(
+                "ENGINE_QUIESCE_FAILED", "generation pause was not acknowledged"
+            ) from None
+
+    async def resume(self) -> None:
+        self.generation_paused = True
+        if self._cleanup_pending:
+            raise BackendStartError("ENGINE_RESUME_UNAVAILABLE", "engine cleanup is unconfirmed")
+        if self._starting or self._loading_roles or self._construction_tasks:
+            raise BackendStartError("ENGINE_RESUME_UNAVAILABLE", "engine construction has not settled")
+        role_app = self._apps.get("generation")
+        if role_app is None:
+            raise BackendStartError("ENGINE_RESUME_UNAVAILABLE", "generation engine is unavailable")
+        try:
+            await role_app.engine.resume_generation()
+            if await role_app.engine.is_paused() is not False:
+                raise RuntimeError("generation resume was not acknowledged")
+        except Exception:
+            raise BackendStartError(
+                "ENGINE_RESUME_FAILED", "generation resume was not acknowledged"
+            ) from None
+        self.generation_paused = False
 
     async def _download(self, role: RoleConfig) -> None:
         if role.source == "local":
@@ -305,6 +372,8 @@ class VllmBackend(RoleClientMixin, EngineBackend):
             argv += ["--gpu-memory-utilization", str(fraction)]
         if name == "generation":
             argv += ["--tensor-parallel-size", str(role.tensor_parallel_size)]
+            if role.engine_profile_id is not None:
+                argv += ["--max-num-seqs", str(role.max_concurrent_requests)]
         if role.enforce_eager:
             argv.append("--enforce-eager")
         argv += self.APPLIANCE_DEFAULT_FLAGS
@@ -338,9 +407,73 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 argv += ["--pooler-config", json.dumps(pooler)]
         return argv
 
+    @staticmethod
+    def _applied_generation_info(engine, app, role: RoleConfig, supported_tasks) -> RoleInfo:
+        """Publish a selected identity only after matching the loaded engine."""
+        config = getattr(engine, "vllm_config", None)
+        model = getattr(engine, "model_config", None)
+        scheduler = getattr(config, "scheduler_config", None)
+        parallel = getattr(config, "parallel_config", None)
+        context = getattr(model, "max_model_len", None)
+        concurrency = getattr(scheduler, "max_num_seqs", None)
+        tensor_parallel = getattr(parallel, "tensor_parallel_size", None)
+        alias = getattr(model, "served_model_name", None)
+        if (
+            not role.model
+            or getattr(model, "model", None) != role.model
+            or not role.served_model_name
+            or alias not in (role.served_model_name, [role.served_model_name])
+            or type(context) is not int
+            or context != role.max_model_len
+            or type(concurrency) is not int
+            or concurrency != role.max_concurrent_requests
+            or type(tensor_parallel) is not int
+            or tensor_parallel != role.tensor_parallel_size
+        ):
+            raise RuntimeError("vLLM loaded execution does not match the selected profile")
+        quant = getattr(model, "quantization", None)
+        if quant is None:
+            dtype = getattr(model, "dtype", None)
+            quant = str(dtype).removeprefix("torch.") if dtype is not None else None
+            if quant not in ("bfloat16", "float16", "float32"):
+                raise RuntimeError("vLLM loaded model dtype is unavailable")
+        if not isinstance(quant, str) or not quant.strip():
+            raise RuntimeError("vLLM loaded model quantization is unavailable")
+        paths = {
+            route.path for route in app.routes
+            if "POST" in (getattr(route, "methods", None) or ())
+        }
+        if (
+            not isinstance(supported_tasks, (tuple, list))
+            or "generate" not in supported_tasks
+            or not {"/v1/chat/completions", "/v1/completions"}.issubset(paths)
+        ):
+            raise RuntimeError("vLLM selected profile generation APIs are unavailable")
+        return RoleInfo(
+            status="healthy",
+            engine_model=model.model,
+            revision=role.revision or "main",
+            context_length=context,
+            device_count=len(role.accelerator_device_ids) or None,
+            tensor_parallel_size=tensor_parallel,
+            engine_profile_id=role.engine_profile_id,
+            quant=quant,
+            max_concurrent_requests=concurrency,
+            capabilities=["chat_completions", "completions", "streaming", "text"],
+        )
+
     async def _start_role(self, name: str, role: RoleConfig) -> None:
+        selected_generation = name == "generation" and role.engine_profile_id is not None
+        self._startup_attempted = True
+        if name in self._engines or name in self._loading_roles:
+            raise BackendStartError("CONFIG_INVALID", "role engine lifetime is already managed", role=name)
+        self._loading_roles.add(name)
+        engine = None
+        applied_info = None
         try:
             engine, args, build_app, init_app_state = await self._construct_role_engine(name, role)
+            self._engines[name] = engine
+            self._native_lifetime_started = True
             # supported_tasks gates which routers (generate vs pooling) mount.
             supported_tasks = None
             getter = getattr(engine, "get_supported_tasks", None)
@@ -361,20 +494,37 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 and getattr(args, "tensor_parallel_size", None) != role.tensor_parallel_size
             ):
                 raise RuntimeError("vLLM did not apply the managed tensor-parallel size")
+            if selected_generation:
+                applied_info = self._applied_generation_info(engine, app, role, supported_tasks)
             client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://sovereign-role",
                 timeout=600.0,
             )
             self._apps[name] = _RoleApp(engine, app, client)
-        except BackendStartError:
-            raise
-        except Exception as exc:  # load failure → role unhealthy, process alive (§3.2)
-            logger.exception("%s role failed to load", name)
+        except BaseException as exc:
+            self.generation_paused = True
             self._roles[name] = RoleInfo(status="unhealthy", error_code=_error_code(exc))
+            # Keep every returned engine, including unselected generation and
+            # embedding failures. The app may never have been registered.
+            engine = self._engines.get(name)
+            if engine is not None:
+                self._cleanup_pending = True
+                try:
+                    await self._shutdown_engine(engine)
+                except Exception:
+                    logger.exception("failed %s engine cleanup is unconfirmed", name)
+                    raise BackendStartError(
+                        "ENGINE_DEAD", "failed engine cleanup is unconfirmed", role=name, recoverable=False,
+                    ) from None
+            if isinstance(exc, (BackendStartError, asyncio.CancelledError)) or not isinstance(exc, Exception):
+                raise
+            logger.exception("%s role failed to load", name)
             return
+        finally:
+            self._loading_roles.discard(name)
 
-        info = RoleInfo(
+        info = applied_info or RoleInfo(
             status="healthy",
             engine_model=getattr(model_config, "model", None),
             revision=role.revision or "main",
@@ -417,7 +567,19 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         is constructed outside a running loop, so the returned engine safely
         attaches to the main loop during the probes below.
         """
-        return await asyncio.to_thread(self._construct_role_engine_sync, name, role)
+        task = asyncio.create_task(asyncio.to_thread(self._construct_role_engine_sync, name, role))
+        self._construction_tasks.add(task)
+        task.add_done_callback(self._construction_tasks.discard)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # to_thread cancellation cannot stop a running constructor. Collect
+            # its result before cancellation unwinds startup and cleanup.
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                pass
+            raise
 
     def _construct_role_engine_sync(self, name: str, role: RoleConfig):
         if name == "generation" and role.source == "local" and self._local_cuda_generation:
@@ -445,6 +607,7 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                     "--served-model-name",
                     "--revision",
                     "--tensor-parallel-size",
+                    "--max-num-seqs",
                     "--enforce-eager",
                 ):
                     raise BackendStartError(
@@ -460,7 +623,9 @@ class VllmBackend(RoleClientMixin, EngineBackend):
         args = parser.parse_args(filtered)
 
         engine_args = AsyncEngineArgs.from_cli_args(args)
+        self._native_lifetime_started = True
         engine = AsyncLLM.from_engine_args(engine_args)
+        self._engines[name] = engine
         return engine, args, build_app, init_app_state
 
     async def _probe_embedding_modalities(self, role: RoleConfig, dimensions: int) -> list[str]:
@@ -488,15 +653,43 @@ class VllmBackend(RoleClientMixin, EngineBackend):
                 logger.info("embedding %s modality probe negative: %s", modality, exc)
         return found
 
+    @staticmethod
+    async def _shutdown_engine(engine) -> None:
+        shutdown = getattr(engine, "shutdown", None)
+        if shutdown is None:
+            raise BackendStartError("ENGINE_DEAD", "engine cleanup is unavailable", recoverable=False)
+        result = shutdown()
+        if inspect.isawaitable(result):
+            await result
+
     async def shutdown(self) -> None:
-        apps, self._apps = dict(self._apps), {}
-        for role_app in apps.values():
-            await role_app.client.aclose()
-            shutdown = getattr(role_app.engine, "shutdown", None)
-            if shutdown is not None:
-                result = shutdown()
-                if asyncio.iscoroutine(result):
-                    await result
+        self.generation_paused = True
+        start_task = self._start_task
+        if start_task is not None and start_task is not asyncio.current_task():
+            if not start_task.cancelling():
+                start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+        if self._starting or self._loading_roles or self._construction_tasks:
+            raise BackendStartError("ENGINE_DEAD", "engine construction has not settled", recoverable=False)
+        self._cleanup_pending = True
+        failed = False
+        for name, role_app in list(self._apps.items()):
+            try:
+                await role_app.client.aclose()
+            except Exception:
+                failed = True
+                logger.exception("%s client cleanup failed", name)
+            else:
+                del self._apps[name]
+        for name, engine in self._engines.items():
+            try:
+                await self._shutdown_engine(engine)
+            except Exception:
+                failed = True
+                logger.exception("%s engine cleanup is unconfirmed", name)
+        self._cleanup_pending = self._native_lifetime_started or failed
+        if failed:
+            raise BackendStartError("ENGINE_DEAD", "engine cleanup is unconfirmed", recoverable=False)
 
     # ── introspection ────────────────────────────────────────────────────
 

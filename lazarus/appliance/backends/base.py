@@ -35,6 +35,11 @@ class RoleInfo:
     modalities: list[str] | None = None
     device_count: int | None = None
     tensor_parallel_size: int | None = None
+    engine_profile_id: str | None = None
+    upstream_profile_id: str | None = None
+    quant: str | None = None
+    max_concurrent_requests: int | None = None
+    capabilities: list[str] | None = None
 
 
 class EngineBackend(ABC):
@@ -44,6 +49,35 @@ class EngineBackend(ABC):
     backend_id: str = "unknown"  # manifest "backend" field: cuda|rocm|xpu|metal|cpu|mock
     engine_name: str = "mock"
     adapter_id: str = "mock"
+    generation_paused: bool = False
+
+    async def quiesce(self) -> None:
+        raise BackendStartError("ENGINE_QUIESCE_UNAVAILABLE", "engine idle acknowledgement is unavailable")
+
+    async def resume(self) -> None:
+        raise BackendStartError("ENGINE_RESUME_UNAVAILABLE", "engine resume acknowledgement is unavailable")
+
+    def observation(self) -> dict:
+        """Additional observed facts; absence means unknown, not a request echo."""
+        return {}
+
+    async def available_engines(self) -> list[dict]:
+        """Installed capability is distinct from evidence of loaded execution."""
+        from lazarus.appliance.backends.slimserve import SlimServeBackend
+
+        available = await SlimServeBackend.probe_available_engines()
+        import os
+        from importlib.metadata import PackageNotFoundError, version
+        from importlib.util import find_spec
+
+        if self.backend_id == "cuda" or os.environ.get("SOVEREIGN_PROFILE") == "cuda-x86_64":
+            try:
+                if find_spec("vllm") is not None:
+                    available.append({"name": "vllm", "version": version("vllm"),
+                                      "adapter": "sovereign-runtime", "variants": ["cuda-x86_64"]})
+            except (ImportError, ValueError, PackageNotFoundError):
+                pass
+        return available
 
     @abstractmethod
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:

@@ -7,6 +7,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from lazarus.appliance.config import RuntimeConfig
+
 
 class AgentRole(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -30,6 +32,9 @@ class AgentConfig(BaseModel):
     token_env: str = "SOVEREIGN_AGENT_TOKEN"
     llama_server: str = "llama-server"
     roles: dict[str, AgentRole]
+    # Installer-owned llama roles remain available for an explicit engine cutback.
+    # Persist the private Runtime path, never a caller-selected host path.
+    slimserve_generation: RuntimeConfig | None = None
 
 
 def load_agent_config(path: str | Path) -> AgentConfig:

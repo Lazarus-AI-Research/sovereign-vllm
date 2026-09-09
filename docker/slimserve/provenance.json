@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "kind": "source-lock-not-build-attestation",
+  "interpreter": "/opt/sovereign-slimserve/bin/python",
+  "slimserve": {
+    "source_repository": "https://github.com/QuixiAI/SlimServe",
+    "source_commit": "44a7d1a21851c7164c098c93fbc1baa12ab99847",
+    "license": "Apache-2.0"
+  },
+  "kernels": {
+    "cuda": {
+      "library": "quixicore-cuda",
+      "source_repository": "https://github.com/QuixiAI/QuixiCore-CUDA",
+      "source_commit": "08780aaa22cdc2d144b6beacb24df953134b34be",
+      "license": "MIT",
+      "source_mappings": {
+        "tm_cuda": "kernels/tm_cuda",
+        "quant": "kernels/quant",
+        "serving": "kernels/serving"
+      }
+    },
+    "metal": {
+      "library": "quixicore-metal",
+      "source_repository": "https://github.com/QuixiAI/QuixiCore-Metal",
+      "source_commit": "71a08cd4cbcdc622ce31b3fc91e1f505e144b516",
+      "license": "MIT",
+      "source_mappings": {
+        "metal/include": "include",
+        "metal/kernels": "kernels",
+        "tm_metal": null
+      }
+    }
+  },
+  "cuda_sources": {
+    "cutlass": {
+      "source_repository": "https://github.com/NVIDIA/cutlass",
+      "source_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+      "upstream_ref": "v4.4.2",
+      "environment": "VLLM_CUTLASS_SRC_DIR"
+    },
+    "triton": {
+      "source_repository": "https://github.com/triton-lang/triton",
+      "source_commit": "0add68262ab0a2e33b84524346cb27cbb2787356",
+      "upstream_ref": "v3.5.1",
+      "environment": "TRITON_KERNELS_SRC_DIR",
+      "environment_subdirectory": "python/triton_kernels/triton_kernels"
+    },
+    "deepgemm": {
+      "source_repository": "https://github.com/deepseek-ai/DeepGEMM",
+      "source_commit": "a6b593d2826719dcf4892609af7b84ee23aaf32a",
+      "environment": "DEEPGEMM_SRC_DIR"
+    },
+    "deepgemm/third-party/cutlass": {
+      "source_repository": "https://github.com/NVIDIA/cutlass",
+      "source_commit": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+    },
+    "deepgemm/third-party/fmt": {
+      "source_repository": "https://github.com/fmtlib/fmt",
+      "source_commit": "553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28"
+    },
+    "fmha-sm100": {
+      "source_repository": "https://github.com/vllm-project/MSA",
+      "source_commit": "890aaa1a37a598ad17ccff0827fea21540d381fa",
+      "environment": "FMHA_SM100_SRC_DIR"
+    },
+    "fmha-sm100/python/fmha_sm100/cutlass": {
+      "source_repository": "https://github.com/NVIDIA/cutlass",
+      "source_commit": "eb61c911471867a5fd2466bfd8f29306cea6ebf8"
+    },
+    "flashmla": {
+      "source_repository": "https://github.com/vllm-project/FlashMLA",
+      "source_commit": "a8f794d1251cbfd88a5011445dd5582289c727e4",
+      "environment": "FLASH_MLA_SRC_DIR"
+    },
+    "flashmla/csrc/cutlass": {
+      "source_repository": "https://github.com/NVIDIA/cutlass",
+      "source_commit": "147f5673d0c1c3dcf66f78d677fd647e4a020219"
+    },
+    "qutlass": {
+      "source_repository": "https://github.com/IST-DASLab/qutlass",
+      "source_commit": "e74319e3405ce6d71965732880f5dc1f52371f64",
+      "environment": "QUTLASS_SRC_DIR"
+    },
+    "tml-fa4": {
+      "source_repository": "https://github.com/vllm-project/tml-fa4",
+      "source_commit": "b206834606ed5b5f21f8eed6b0683f528ea9cf7d",
+      "environment": "TML_FA4_SRC_DIR"
+    },
+    "flash-attention": {
+      "source_repository": "https://github.com/vllm-project/flash-attention",
+      "source_commit": "ed4b7342bc8f0489dd9b649d5288867e35fc6a32"
+    },
+    "flash-attention/csrc/cutlass": {
+      "source_repository": "https://github.com/NVIDIA/cutlass",
+      "source_commit": "62750a2b75c802660e4894434dc55e839f322277"
+    }
+  }
+}

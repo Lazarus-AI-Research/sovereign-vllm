@@ -48,7 +48,7 @@ class Appliance:
         except ConfigError as exc:
             self.config_error = str(exc)
 
-        self.backend = backend if backend is not None else select_backend()
+        self.backend = backend if backend is not None else select_backend(self.config)
         self.port = self.config.runtime.port if self.config else int(
             os.environ.get("SOVEREIGN_RUNTIME_PORT", "8000")
         )
@@ -81,8 +81,10 @@ class Appliance:
             self.manifest.write()
             return
 
+        self.manifest.available_engines = await self.backend.available_engines()
+
         try:
-            await self.backend.start(self.config, on_state=self.state.transition)
+            await self.backend.start(self.config, on_state=self._backend_state)
         except BackendStartError as exc:
             self.state.record_error(exc.code, str(exc), recoverable=exc.recoverable, role=exc.role)
             self.state.transition("configuration_error" if exc.recoverable else "runtime_error")
@@ -112,6 +114,14 @@ class Appliance:
             self.state.transition("configuration_error")
         self.manifest.write()
         self._maybe_fail_process(enabled)
+
+    def _backend_state(self, state: str) -> None:
+        self.state.transition(state)
+        if state == "runtime_error":
+            self.state.record_error("ENGINE_DEAD", "managed generation observation or process failed", recoverable=False, role="generation")
+            self.manifest.write()
+            self._maybe_fail_process(self.config.enabled_roles())
+
 
     async def _smoke_test(self, healthy_roles: list[str]) -> None:
         """Startup self-test (design.md §20): exercise each healthy role once."""
