@@ -4,8 +4,10 @@ import json
 import socket
 import sys
 import time
+import threading
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 import yaml
 from fastapi import FastAPI
@@ -106,7 +108,7 @@ def local_cuda_config_file(managed_cuda_config_file, prepared_bundle):
 @pytest.fixture()
 def stub_vllm(monkeypatch):
     """Stub only the external engine seams; exercise the real runtime adapter."""
-    observed = SimpleNamespace(engine_args=[], downloads=[], network=[], model=None)
+    observed = SimpleNamespace(engine_args=[], downloads=[], network=[], model=None, shutdowns=0)
     monkeypatch.setenv("VLLM_BACKEND", "cuda")
     monkeypatch.setenv("SOVEREIGN_PROFILE", "cuda-x86_64")
     monkeypatch.delenv("SOVEREIGN_RUNTIME_API_KEY", raising=False)
@@ -131,6 +133,7 @@ def stub_vllm(monkeypatch):
             parser.add_argument(flag)
         parser.add_argument("--max-model-len", type=int)
         parser.add_argument("--tensor-parallel-size", type=int, default=1)
+        parser.add_argument("--max-num-seqs", type=int)
         for flag in [
             *VllmBackend.APPLIANCE_DEFAULT_FLAGS,
             "--enforce-eager",
@@ -139,12 +142,16 @@ def stub_vllm(monkeypatch):
             parser.add_argument(flag, action="store_true")
         return parser
 
+    def shutdown():
+        observed.shutdowns += 1
+
     def from_engine_args(args):
         observed.engine_args.append(args)
         return SimpleNamespace(
             model_config=SimpleNamespace(
                 model=observed.model or args.model, max_model_len=args.max_model_len
-            )
+            ),
+            shutdown=shutdown,
         )
 
     async def init_app_state(engine, state, args, supported_tasks):
@@ -451,3 +458,546 @@ def test_missing_local_directory_is_recoverable_before_engine_import(
     assert stub_vllm.engine_args == []
     assert stub_vllm.downloads == []
     assert stub_vllm.network == []
+
+
+def test_quiesce_awaits_engine_idle_future_before_checking_paused():
+    backend = VllmBackend()
+
+    async def exercise():
+        pause_called, idle_ack = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def pause_generation(*, mode, clear_cache):
+            calls.append(("pause", mode, clear_cache))
+            pause_called.set()
+            await idle_ack.wait()
+
+        async def is_paused():
+            calls.append("is_paused")
+            return True
+
+        backend._apps["generation"] = SimpleNamespace(engine=SimpleNamespace(
+            pause_generation=pause_generation, is_paused=is_paused,
+        ))
+        pending = asyncio.create_task(backend.quiesce())
+        await asyncio.wait_for(pause_called.wait(), 2)
+        assert backend.generation_paused is True
+        assert not pending.done()
+        assert calls == [("pause", "wait", False)], "paused state alone is not the idle ACK"
+        idle_ack.set()
+        await asyncio.wait_for(pending, 2)
+        assert calls == [("pause", "wait", False), "is_paused"]
+        assert backend.generation_paused is True
+
+    asyncio.run(exercise())
+
+
+def test_resume_reopens_only_after_engine_future_and_unpaused_ack():
+    backend = VllmBackend()
+    backend.generation_paused = True
+
+    async def exercise():
+        resume_called, resume_ack = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def resume_generation():
+            calls.append("resume")
+            resume_called.set()
+            await resume_ack.wait()
+
+        async def is_paused():
+            calls.append("is_paused")
+            return False
+
+        backend._apps["generation"] = SimpleNamespace(engine=SimpleNamespace(
+            resume_generation=resume_generation, is_paused=is_paused,
+        ))
+        pending = asyncio.create_task(backend.resume())
+        await asyncio.wait_for(resume_called.wait(), 2)
+        assert backend.generation_paused is True
+        assert not pending.done()
+        assert calls == ["resume"]
+        resume_ack.set()
+        await asyncio.wait_for(pending, 2)
+        assert calls == ["resume", "is_paused"]
+        assert backend.generation_paused is False
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["quiesce", "resume"])
+@pytest.mark.parametrize("ack", [None, "true", 0, 1, "opposite"])
+def test_managed_engine_rejects_unknown_or_wrong_paused_ack(operation, ack):
+    backend = VllmBackend()
+
+    async def completed(**kwargs):
+        return None
+
+    async def is_paused():
+        return operation == "resume" if ack == "opposite" else ack
+
+    backend._apps["generation"] = SimpleNamespace(engine=SimpleNamespace(
+        pause_generation=completed, resume_generation=completed, is_paused=is_paused,
+    ))
+    with pytest.raises(BackendStartError) as error:
+        asyncio.run(getattr(backend, operation)())
+    assert error.value.code == f"ENGINE_{operation.upper()}_FAILED"
+    assert backend.generation_paused is True
+
+
+@pytest.mark.parametrize("operation", ["quiesce", "resume"])
+@pytest.mark.parametrize("engine_state", ["missing", "legacy", "failed", "ack_failed"])
+def test_managed_engine_fails_closed_without_usable_ack(operation, engine_state):
+    backend = VllmBackend()
+
+    async def fail(**kwargs):
+        raise RuntimeError("private engine exception /weights/secret")
+
+    async def completed(**kwargs):
+        return None
+
+    if engine_state == "missing":
+        backend._native_lifetime_started = True
+    if engine_state != "missing":
+        engine = SimpleNamespace()
+        if engine_state != "legacy":
+            engine.pause_generation = fail if engine_state == "failed" else completed
+            engine.resume_generation = fail if engine_state == "failed" else completed
+            engine.is_paused = fail
+        backend._apps["generation"] = SimpleNamespace(engine=engine)
+    with pytest.raises(BackendStartError) as error:
+        asyncio.run(getattr(backend, operation)())
+    suffix = "UNAVAILABLE" if engine_state == "missing" else "FAILED"
+    assert error.value.code == f"ENGINE_{operation.upper()}_{suffix}"
+    assert "private" not in str(error.value)
+    assert backend.generation_paused is True
+
+
+@pytest.mark.parametrize("operation", ["quiesce", "resume"])
+def test_cancelling_engine_control_never_invents_idle_or_resumed_state(operation):
+    backend = VllmBackend()
+
+    async def exercise():
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def pending_ack(**kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        backend._apps["generation"] = SimpleNamespace(engine=SimpleNamespace(
+            pause_generation=pending_ack, resume_generation=pending_ack,
+        ))
+        pending = asyncio.create_task(getattr(backend, operation)())
+        await asyncio.wait_for(entered.wait(), 2)
+        assert backend.generation_paused is True
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert cancelled.is_set()
+        assert backend.generation_paused is True
+
+    asyncio.run(exercise())
+
+
+def test_selected_vllm_profile_applies_actual_scheduler_limit(local_cuda_config_file, stub_vllm):
+    role = load_config(local_cuda_config_file).roles.generation.model_copy(update={
+        "engine_profile_id": "selected-vllm-profile", "max_concurrent_requests": 7,
+    })
+    backend = VllmBackend()
+    backend._construct_role_engine_sync("generation", role)
+    assert stub_vllm.engine_args[0].max_num_seqs == 7
+    assert "--max-num-seqs" not in backend._role_argv(
+        "generation", role.model_copy(update={"engine_profile_id": None})
+    )
+
+
+def test_selected_vllm_profile_cannot_drop_scheduler_limit(local_cuda_config_file, stub_vllm, monkeypatch):
+    module = sys.modules["vllm.entrypoints.openai.cli_args"]
+    original = module.make_arg_parser
+
+    def without_scheduler_limit(parser):
+        result = original(parser)
+        del result._option_string_actions["--max-num-seqs"]
+        return result
+
+    monkeypatch.setattr(module, "make_arg_parser", without_scheduler_limit)
+    role = load_config(local_cuda_config_file).roles.generation.model_copy(update={
+        "engine_profile_id": "selected-vllm-profile",
+    })
+    with pytest.raises(BackendStartError, match="required structured launch arguments"):
+        VllmBackend()._construct_role_engine_sync("generation", role)
+    assert stub_vllm.engine_args == []
+
+
+@pytest.fixture()
+def selected_generation(local_cuda_config_file, monkeypatch):
+    role = load_config(local_cuda_config_file).roles.generation.model_copy(update={
+        "engine_profile_id": "selected-vllm-profile",
+    })
+    model = SimpleNamespace(
+        model=role.model, max_model_len=role.max_model_len,
+        served_model_name=[role.served_model_name], quantization=None, dtype="torch.bfloat16",
+    )
+    config = SimpleNamespace(
+        model_config=model,
+        scheduler_config=SimpleNamespace(max_num_seqs=role.max_concurrent_requests),
+        parallel_config=SimpleNamespace(tensor_parallel_size=role.tensor_parallel_size),
+    )
+    observed = SimpleNamespace(tasks=("generate",), shutdowns=0)
+
+    async def get_supported_tasks():
+        return observed.tasks
+
+    async def shutdown():
+        observed.shutdowns += 1
+
+    engine = SimpleNamespace(
+        model_config=model, vllm_config=config, get_supported_tasks=get_supported_tasks,
+        shutdown=shutdown,
+    )
+    app = FastAPI()
+
+    async def completion():
+        return {}
+
+    app.add_api_route("/v1/chat/completions", completion, methods=["POST"])
+    app.add_api_route("/v1/completions", completion, methods=["POST"])
+
+    async def init_app_state(*args):
+        return None
+
+    async def construct(name, requested_role):
+        return (
+            engine, SimpleNamespace(tensor_parallel_size=requested_role.tensor_parallel_size),
+            lambda *args: app, init_app_state,
+        )
+
+    backend = VllmBackend()
+    monkeypatch.setattr(backend, "_construct_role_engine", construct)
+    return SimpleNamespace(
+        backend=backend, role=role, engine=engine, config=config, model=model,
+        app=app, observed=observed,
+    )
+
+
+@pytest.mark.parametrize("quantization,dtype,expected", [
+    (None, "torch.bfloat16", "bfloat16"),
+    (None, "torch.float16", "float16"),
+    (None, "float32", "float32"),
+    ("awq", "torch.float16", "awq"),
+])
+@pytest.mark.parametrize("alias_list", [False, True])
+def test_selected_vllm_profile_publishes_only_loaded_execution(
+    selected_generation, quantization, dtype, expected, alias_list
+):
+    selected = selected_generation
+    selected.model.quantization = quantization
+    selected.model.dtype = dtype
+    selected.model.served_model_name = (
+        [selected.role.served_model_name] if alias_list else selected.role.served_model_name
+    )
+
+    async def exercise():
+        try:
+            await selected.backend._start_role("generation", selected.role)
+            info = selected.backend.role_info("generation")
+            assert info.status == "healthy"
+            assert info.engine_profile_id == selected.role.engine_profile_id
+            assert info.engine_model == selected.model.model
+            assert info.context_length == selected.model.max_model_len
+            assert info.tensor_parallel_size == selected.config.parallel_config.tensor_parallel_size
+            assert info.max_concurrent_requests == selected.config.scheduler_config.max_num_seqs
+            assert info.quant == expected
+            assert info.capabilities == ["chat_completions", "completions", "streaming", "text"]
+            assert info.upstream_profile_id is None
+            assert selected.backend.role_client("generation") is not None
+        finally:
+            await selected.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("owner,field,value", [
+    ("model", "model", None),
+    ("model", "model", "/different-loaded-model"),
+    ("model", "max_model_len", None),
+    ("model", "max_model_len", 999),
+    ("model", "max_model_len", True),
+    ("model", "served_model_name", None),
+    ("model", "served_model_name", ["wrong-alias"]),
+    ("model", "dtype", None),
+    ("model", "dtype", "auto"),
+    ("model", "quantization", ""),
+    ("model", "quantization", 4),
+    ("scheduler", "max_num_seqs", None),
+    ("scheduler", "max_num_seqs", 999),
+    ("scheduler", "max_num_seqs", True),
+    ("parallel", "tensor_parallel_size", None),
+    ("parallel", "tensor_parallel_size", 999),
+    ("parallel", "tensor_parallel_size", True),
+    ("config", "scheduler_config", None),
+    ("config", "parallel_config", None),
+    ("engine", "vllm_config", None),
+    ("engine", "model_config", None),
+])
+def test_selected_vllm_profile_rejects_wrong_or_missing_loaded_facts(selected_generation, owner, field, value):
+    selected = selected_generation
+    owners = {
+        "model": selected.model, "scheduler": selected.config.scheduler_config,
+        "parallel": selected.config.parallel_config, "config": selected.config,
+        "engine": selected.engine,
+    }
+    setattr(owners[owner], field, value)
+    asyncio.run(selected.backend._start_role("generation", selected.role))
+    info = selected.backend.role_info("generation")
+    assert info.status == "unhealthy"
+    assert info.error_code == "MODEL_LOAD_FAILED"
+    assert info.engine_profile_id is None
+    assert info.quant is None
+    assert info.max_concurrent_requests is None
+    assert info.capabilities is None
+    assert selected.backend.role_client("generation") is None
+    assert selected.observed.shutdowns == 1
+
+
+@pytest.mark.parametrize("missing", ["tasks", "generate", "chat", "completion", "post"])
+def test_selected_vllm_profile_requires_observed_generation_apis(selected_generation, missing):
+    selected = selected_generation
+    if missing == "tasks":
+        selected.observed.tasks = None
+    elif missing == "generate":
+        selected.observed.tasks = ("embed",)
+    elif missing == "post":
+        for route in selected.app.routes:
+            if route.path == "/v1/chat/completions":
+                route.methods = {"GET"}
+    else:
+        path = "/v1/chat/completions" if missing == "chat" else "/v1/completions"
+        selected.app.router.routes[:] = [route for route in selected.app.routes if route.path != path]
+    asyncio.run(selected.backend._start_role("generation", selected.role))
+    info = selected.backend.role_info("generation")
+    assert info.status == "unhealthy"
+    assert info.engine_profile_id is None
+    assert info.capabilities is None
+    assert selected.observed.shutdowns == 1
+
+
+def test_unselected_vllm_retains_legacy_observation_behavior(selected_generation):
+    selected = selected_generation
+    selected.role = selected.role.model_copy(update={"engine_profile_id": None})
+    selected.engine.vllm_config = None
+    selected.observed.tasks = None
+    selected.model.quantization = None
+    selected.model.dtype = None
+
+    async def exercise():
+        try:
+            await selected.backend._start_role("generation", selected.role)
+            info = selected.backend.role_info("generation")
+            assert info.status == "healthy"
+            assert info.engine_profile_id is None
+            assert info.max_concurrent_requests is None
+            assert info.capabilities is None
+            assert info.quant is None
+        finally:
+            await selected.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["local-input", "required-flag", "constructor", "app", "cleanup"])
+def test_failed_candidate_api_quiesces_only_before_native_ownership(
+    local_cuda_config_file, prepared_bundle, stub_vllm, monkeypatch, failure,
+):
+    monkeypatch.setenv("SOVEREIGN_RUNTIME_API_KEY", "secret")
+    if failure == "local-input":
+        (prepared_bundle / "tokenizer.json").unlink()
+    elif failure == "required-flag":
+        module = sys.modules["vllm.entrypoints.openai.cli_args"]
+        original_parser = module.make_arg_parser
+
+        def without_placement(parser):
+            parser = original_parser(parser)
+            del parser._option_string_actions["--tensor-parallel-size"]
+            return parser
+
+        monkeypatch.setattr(module, "make_arg_parser", without_placement)
+    elif failure == "constructor":
+        def failed_constructor(args):
+            raise RuntimeError("core may have spawned before constructor failed")
+
+        monkeypatch.setattr(sys.modules["vllm.v1.engine.async_llm"].AsyncLLM, "from_engine_args", failed_constructor)
+    else:
+        async def failed_app(*args):
+            raise RuntimeError("app initialization failed after owned engine construction")
+
+        monkeypatch.setattr(sys.modules["vllm.entrypoints.openai.api_server"], "init_app_state", failed_app)
+        if failure == "cleanup":
+            factory = sys.modules["vllm.v1.engine.async_llm"].AsyncLLM
+            original_constructor = factory.from_engine_args
+
+            def failed_cleanup():
+                stub_vllm.shutdowns += 1
+                raise RuntimeError("owned worker shutdown failed")
+
+            def construct(args):
+                engine = original_constructor(args)
+                engine.shutdown = failed_cleanup
+                return engine
+
+            monkeypatch.setattr(factory, "from_engine_args", construct)
+    appliance = _cuda_appliance(local_cuda_config_file, monkeypatch)
+
+    async def exercise():
+        await appliance.run_lifecycle()
+        assert appliance.backend.role_client("generation") is None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=appliance.app), base_url="http://runtime",
+            headers={"Authorization": "Bearer secret"},
+        ) as client:
+            before = (await client.get("/runtime/manifest")).json()
+            assert before["state"] == ("runtime_error" if failure == "cleanup" else "configuration_error")
+            response = await client.post("/runtime/admin/generation/quiesce")
+            no_owned_engine = failure in ("local-input", "required-flag")
+            assert response.status_code == (200 if no_owned_engine else 503)
+            if no_owned_engine:
+                assert response.json() == {"quiesced": True}
+            else:
+                assert response.json()["error"]["code"] == "ENGINE_QUIESCE_FAILED"
+            assert (await client.get("/runtime/manifest")).json()["generation_paused"] is True
+            assert (await client.get("/health/live")).status_code == 200
+            assert (await client.get("/health/ready")).status_code == 503
+            assert (await client.post("/runtime/admin/generation/resume")).status_code == 503
+            assert (await client.post("/v1/chat/completions", json={
+                "model": appliance.config.roles.generation.served_model_name, "messages": [],
+            })).status_code == 503
+        if failure in ("app", "cleanup"):
+            assert stub_vllm.shutdowns == 1
+            assert "generation" in appliance.backend._engines
+        else:
+            assert stub_vllm.shutdowns == 0
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("role_name", ["generation", "embedding"])
+def test_partial_app_failure_cleans_every_returned_engine(selected_generation, monkeypatch, selected, role_name):
+    sample = selected_generation
+    role = sample.role.model_copy(update={"engine_profile_id": sample.role.engine_profile_id if selected else None})
+
+    async def failed_app(*args):
+        raise BackendStartError("MODEL_LOAD_FAILED", "post-constructor app failure")
+
+    async def construct(name, requested_role):
+        return sample.engine, SimpleNamespace(tensor_parallel_size=role.tensor_parallel_size), lambda *args: sample.app, failed_app
+
+    monkeypatch.setattr(sample.backend, "_construct_role_engine", construct)
+
+    async def exercise():
+        with pytest.raises(BackendStartError, match="post-constructor app failure"):
+            await sample.backend._start_role(role_name, role)
+        assert sample.observed.shutdowns == 1
+        assert sample.backend.role_client(role_name) is None
+        assert sample.backend._engines[role_name] is sample.engine
+        # Successful pinned cleanup is still not a worker-descendant receipt.
+        with pytest.raises(BackendStartError):
+            await sample.backend.quiesce()
+        assert sample.backend.generation_paused is True
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_offloop_constructor_is_collected_and_cleaned(local_cuda_config_file, stub_vllm, monkeypatch):
+    backend = VllmBackend()
+    role = load_config(local_cuda_config_file).roles.generation
+    entered, release = threading.Event(), threading.Event()
+    factory = sys.modules["vllm.v1.engine.async_llm"].AsyncLLM
+    original_constructor = factory.from_engine_args
+
+    def blocked_constructor(args):
+        entered.set()
+        assert release.wait(5)
+        return original_constructor(args)
+
+    monkeypatch.setattr(factory, "from_engine_args", blocked_constructor)
+
+    async def exercise():
+        pending = asyncio.create_task(backend._start_role("generation", role))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+            with pytest.raises(BackendStartError, match="construction has not settled"):
+                await backend.quiesce()
+            assert backend.generation_paused is True
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 2)
+        assert stub_vllm.shutdowns == 1
+        assert backend.role_client("generation") is None
+        assert "generation" in backend._engines
+        with pytest.raises(BackendStartError):
+            await backend.quiesce()
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_failure_retains_every_engine_and_attempts_other_roles():
+    backend = VllmBackend()
+    calls = []
+
+    def broken():
+        calls.append("generation")
+        raise RuntimeError("generation worker cleanup failed")
+
+    def completed():
+        calls.append("embedding")
+
+    backend._engines = {"generation": SimpleNamespace(shutdown=broken), "embedding": SimpleNamespace(shutdown=completed)}
+    backend._native_lifetime_started = True
+
+    async def exercise():
+        with pytest.raises(BackendStartError, match="cleanup is unconfirmed"):
+            await backend.shutdown()
+        assert calls == ["generation", "embedding"]
+        assert set(backend._engines) == {"generation", "embedding"}
+        with pytest.raises(BackendStartError, match="cleanup is unconfirmed"):
+            await backend.quiesce()
+        assert backend.generation_paused is True
+
+    asyncio.run(exercise())
+
+
+def test_failed_start_waits_for_shutdown_future_without_claiming_descendant_exit(selected_generation, monkeypatch):
+    sample = selected_generation
+    sample.model.max_model_len += 1
+
+    async def exercise():
+        cleanup = asyncio.get_running_loop().create_future()
+        entered = asyncio.Event()
+
+        def shutdown():
+            entered.set()
+            return cleanup
+
+        monkeypatch.setattr(sample.engine, "shutdown", shutdown)
+        pending = asyncio.create_task(sample.backend._start_role("generation", sample.role))
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not pending.done()
+        with pytest.raises(BackendStartError, match="cleanup is unconfirmed"):
+            await sample.backend.quiesce()
+        cleanup.set_result(None)
+        await asyncio.wait_for(pending, 2)
+        assert sample.backend.role_client("generation") is None
+        with pytest.raises(BackendStartError, match="cleanup is unconfirmed"):
+            await sample.backend.quiesce()
+        assert sample.backend.generation_paused is True
+
+    asyncio.run(exercise())

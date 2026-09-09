@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
+from anyio import CancelScope
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
@@ -45,12 +46,30 @@ class Throttled(Exception):
     pass
 
 
+class AdmittedStreamingResponse(StreamingResponse):
+    """Keep admission until the response finishes, including disconnects."""
+
+    def __init__(self, *args, admission: AsyncExitStack, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._admission = admission
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                await self._admission.aclose()
+
+
 class Admission:
     """Best-effort per-role admission control (§9.4)."""
 
     def __init__(self, config: RuntimeConfig | None) -> None:
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._generation_waiting = 0
+        self._generation_active = 0
+        self._generation_idle = asyncio.Event()
+        self._generation_idle.set()
         self._embed_threshold: int | None = None
         if config is not None:
             for name, role in config.enabled_roles().items():
@@ -63,6 +82,9 @@ class Admission:
     def generation_waiting(self) -> int:
         return self._generation_waiting
 
+    async def wait_generation_idle(self) -> None:
+        await self._generation_idle.wait()
+
     @asynccontextmanager
     async def slot(self, role: str):
         if (
@@ -72,24 +94,29 @@ class Admission:
         ):
             raise Throttled()
         semaphore = self._semaphores.get(role)
-        if semaphore is None:
-            yield
-            return
-        if role == "generation":
+        if role == "generation" and semaphore is not None:
             self._generation_waiting += 1
         acquired = False
         try:
-            await semaphore.acquire()
-            acquired = True
+            if semaphore is not None:
+                await semaphore.acquire()
+                acquired = True
+                if role == "generation":
+                    self._generation_waiting -= 1
             if role == "generation":
-                self._generation_waiting -= 1
+                self._generation_active += 1
+                self._generation_idle.clear()
             IN_FLIGHT.labels(role=role).inc()
             try:
                 yield
             finally:
                 IN_FLIGHT.labels(role=role).dec()
+                if role == "generation":
+                    self._generation_active -= 1
+                    if self._generation_active == 0:
+                        self._generation_idle.set()
         finally:
-            if role == "generation" and not acquired:
+            if role == "generation" and semaphore is not None and not acquired:
                 self._generation_waiting -= 1
             if acquired:
                 semaphore.release()
@@ -158,6 +185,7 @@ def build_app(
     from lazarus.appliance.manifest import RUNTIME_VERSION
 
     admission = Admission(config)
+    generation_control = asyncio.Lock()
     api_key = config.api_key if config else None
     alias_map = config.alias_to_role() if config else {}
     runtime_id = f"sovereign-runtime-{manifest.profile}-{RUNTIME_VERSION}"
@@ -174,10 +202,16 @@ def build_app(
     def role_status(name: str) -> str:
         return backend.role_info(name).status
 
-    def is_ready() -> bool:
-        if config is None or state.state != "healthy":
+    def is_ready(role: str = "generation") -> bool:
+        if config is None or state.state != "healthy" or (role == "generation" and backend.generation_paused):
             return False
         return all(role_status(name) == "healthy" for name in config.enabled_roles())
+
+    async def refresh_generation_admission() -> None:
+        refresh = getattr(backend, "refresh_generation_admission", None)
+        if refresh is not None:
+            await refresh()
+            manifest.write()
 
     @app.middleware("http")
     async def enforce_api_key(request: Request, call_next):
@@ -193,7 +227,8 @@ def build_app(
         return {"status": "alive", "state": state.state}
 
     @app.get("/health/ready")
-    def health_ready() -> JSONResponse:
+    async def health_ready() -> JSONResponse:
+        await refresh_generation_admission()
         ready = is_ready()
         required_roles = {
             name: role_status(name) == "healthy"
@@ -235,7 +270,8 @@ def build_app(
         }
 
     @app.get("/runtime/manifest")
-    def runtime_manifest() -> dict:
+    async def runtime_manifest() -> dict:
+        await refresh_generation_admission()
         return manifest.build()
 
     @app.get("/runtime/errors")
@@ -245,6 +281,52 @@ def build_app(
     @app.get("/metrics")
     def metrics() -> Response:
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    async def managed_generation(request: Request, *, resume: bool) -> JSONResponse:
+        if not api_key or request.headers.get("Authorization") != f"Bearer {api_key}":
+            return _error(401, "invalid API key", "authentication_error")
+        async for chunk in request.stream():
+            if chunk:
+                return _error(400, "request body is not allowed", "invalid_request_error")
+        async with generation_control:
+            backend.generation_paused = True
+            try:
+                manifest.write()
+                if resume:
+                    await backend.resume()
+                    if backend.generation_paused is not False:
+                        raise RuntimeError("engine resume was not acknowledged")
+                else:
+                    # Complete admitted responses before engine-specific idle
+                    # proof. This also preserves native llama streams; HTTP
+                    # drain alone never acknowledges safe disruption.
+                    await asyncio.wait_for(admission.wait_generation_idle(), timeout=600)
+                    await backend.quiesce()
+                    if backend.generation_paused is not True:
+                        raise RuntimeError("engine pause was not acknowledged")
+                manifest.write()
+            except BaseException as exc:
+                backend.generation_paused = True
+                try:
+                    manifest.write()
+                except Exception:
+                    logger.error("failed to publish closed generation admission")
+                if not isinstance(exc, Exception):
+                    raise
+                operation = "resume" if resume else "quiesce"
+                return _error(
+                    503, f"engine {operation} was not acknowledged", "server_error",
+                    "ENGINE_RESUME_FAILED" if resume else "ENGINE_QUIESCE_FAILED",
+                )
+        return JSONResponse(content={"resumed" if resume else "quiesced": True})
+
+    @app.post("/runtime/admin/generation/quiesce")
+    async def quiesce_generation(request: Request) -> JSONResponse:
+        return await managed_generation(request, resume=False)
+
+    @app.post("/runtime/admin/generation/resume")
+    async def resume_generation(request: Request) -> JSONResponse:
+        return await managed_generation(request, resume=True)
 
     # ── OpenAI surface ───────────────────────────────────────────────────
 
@@ -266,35 +348,36 @@ def build_app(
                 return _error(400, f"{' or '.join(names)} is required", "invalid_request_error")
         model = body.get("model")
         role = alias_map.get(model)
-        if role != expected_role or role_status(expected_role) != "healthy":
+        if role != expected_role:
             return _model_not_found(model)
-        if not is_ready():
+        if not is_ready(expected_role):
             return _not_ready()
         return None
 
-    async def forward(role: str, path: str, raw_body: bytes):
+    async def forward(role: str, path: str, raw_body: bytes, admission_stack: AsyncExitStack):
         """Raw in-process forward to the role's vLLM app (streaming intact).
         Returns None when the backend has no per-role app (fake backend)."""
         role_client = getattr(backend, "role_client", None)
         client = role_client(role) if role_client else None
         if client is None:
             return None
+        if role == "generation":
+            admission_stack.push_async_callback(refresh_generation_admission)
         upstream = client.build_request(
             "POST", path, content=raw_body, headers={"Content-Type": "application/json"}
         )
         resp = await client.send(upstream, stream=True)
+        admission_stack.push_async_callback(resp.aclose)
 
         async def relay():
-            try:
-                async for chunk in resp.aiter_raw():
-                    yield chunk
-            finally:
-                await resp.aclose()
+            async for chunk in resp.aiter_raw():
+                yield chunk
 
-        return StreamingResponse(
+        return AdmittedStreamingResponse(
             relay(),
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type"),
+            admission=admission_stack.pop_all(),
         )
 
     async def openai_endpoint(
@@ -305,6 +388,8 @@ def build_app(
             body = json.loads(raw_body)
         except json.JSONDecodeError:
             return _error(400, "request body must be JSON", "invalid_request_error")
+        if role == "generation":
+            await refresh_generation_admission()
         if denied := route(body, role, required_fields):
             return denied
         if role == "generation" and request.url.path.endswith("/chat/completions"):
@@ -315,8 +400,12 @@ def build_app(
                 return denied
         alias = body["model"]
         try:
-            async with admission.slot(role):
-                if (response := await forward(role, request.url.path, raw_body)) is not None:
+            async with AsyncExitStack() as admission_stack:
+                await admission_stack.enter_async_context(admission.slot(role))
+                # A request may have waited for a slot while quiesce closed admission.
+                if not is_ready(role):
+                    return _not_ready()
+                if (response := await forward(role, request.url.path, raw_body, admission_stack)) is not None:
                     REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
                     return response
                 # Fake-backend path (tests/CI): dict-based handlers.
@@ -331,7 +420,9 @@ def build_app(
                         yield "data: [DONE]\n\n"
 
                     REQUESTS.labels(role=role, served_model=alias, outcome="ok").inc()
-                    return StreamingResponse(sse(), media_type="text/event-stream")
+                    return AdmittedStreamingResponse(
+                        sse(), media_type="text/event-stream", admission=admission_stack.pop_all()
+                    )
                 if request.url.path.endswith("chat/completions"):
                     result = await backend.chat_completion(body)
                 elif request.url.path.endswith("/completions"):

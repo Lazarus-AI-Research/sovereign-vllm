@@ -15,17 +15,75 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class ConfigError(Exception):
     """Human-readable configuration failure; message is shown in /runtime/errors."""
 
 
+SLIMSERVE_COMMIT = "44a7d1a21851c7164c098c93fbc1baa12ab99847"
+QUIXICORE_CUDA_COMMIT = "08780aaa22cdc2d144b6beacb24df953134b34be"
+QUIXICORE_METAL_COMMIT = "71a08cd4cbcdc622ce31b3fc91e1f505e144b516"
+
+
+class SlimServeFile(BaseModel):
+    """One Control-verified member; never an arbitrary launch path."""
+
+    model_config = ConfigDict(extra="forbid")
+    file: str = Field(min_length=1, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+    size_bytes: int = Field(strict=True, gt=0, le=1024**4)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("file")
+    @classmethod
+    def bounded_member(cls, value: str) -> str:
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part) for part in value.split("/")):
+            raise ValueError("artifact member must not contain traversal or hidden components")
+        if len(value.split("/")) > 4:
+            raise ValueError("artifact member is too deeply nested")
+        return value
+
+
+class SlimServeArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["model", "drafter", "tokenizer"]
+    repository: str = Field(max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    files: list[SlimServeFile] = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def unique_members(self):
+        if len({entry.file for entry in self.files}) != len(self.files):
+            raise ValueError("artifact members must be unique")
+        return self
+
+
+class SlimServeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_commit: Literal["44a7d1a21851c7164c098c93fbc1baa12ab99847"]
+    profile_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    variant: Literal["a100", "rtx3090", "metal"]
+    quant: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    artifacts: list[SlimServeArtifact] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def unique_roles(self):
+        roles = [artifact.role for artifact in self.artifacts]
+        if len(set(roles)) != len(roles) or "model" not in roles:
+            raise ValueError("SlimServe requires one model closure and unique artifact roles")
+        if sum(entry.size_bytes for artifact in self.artifacts for entry in artifact.files) > 2 * 1024**4:
+            raise ValueError("SlimServe artifact closure exceeds 2 TiB")
+        return self
+
+
 class RoleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+    engine: Literal["vllm", "slimserve"] = "vllm"
+    engine_profile_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    slimserve: SlimServeConfig | None = None
     task: Literal["generate", "embed", "rerank"] | None = None
     source: Literal["huggingface", "modelscope", "local"] | None = None
     model: str | None = None
@@ -55,6 +113,25 @@ class RoleConfig(BaseModel):
         if type(value) not in (int, float):
             raise ValueError("tensor_parallel_size must be an integer")
         return value
+
+    @model_validator(mode="after")
+    def engine_contract(self):
+        if self.engine == "slimserve":
+            if not self.slimserve or not self.engine_profile_id:
+                raise ValueError("SlimServe requires engine_profile_id and its sealed configuration")
+            if self.source != "local" or not self.model or not Path(self.model).is_absolute():
+                raise ValueError("SlimServe requires a prepared local model directory")
+            if not self.revision or not re.fullmatch(r"[0-9a-f]{40}", self.revision):
+                raise ValueError("SlimServe requires an immutable model revision")
+            if self.max_model_len is None or self.max_model_len > 1048576:
+                raise ValueError("SlimServe requires bounded context at most 1048576")
+            if self.max_concurrent_requests > 256:
+                raise ValueError("SlimServe concurrency must not exceed 256")
+            if not self.served_model_name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.served_model_name):
+                raise ValueError("SlimServe requires a bounded serving alias")
+        elif self.slimserve is not None:
+            raise ValueError("SlimServe configuration requires engine slimserve")
+        return self
 
     def missing_load_fields(self) -> list[str]:
         if not self.enabled:
@@ -141,6 +218,34 @@ class RuntimeConfig(BaseModel):
 
     def enabled_roles(self) -> dict[str, RoleConfig]:
         return {name: role for name, role in self.roles.items() if role.enabled}
+
+    @model_validator(mode="after")
+    def slimserve_placement(self):
+        generation = self.roles.generation
+        for name, role in self.roles.items():
+            if name != "generation" and role.model_fields_set.intersection({"engine", "engine_profile_id", "slimserve"}):
+                raise ValueError("engine selection is generation-only")
+        if generation.engine != "slimserve":
+            return self
+        if any(role.enabled for name, role in self.roles.items() if name != "generation"):
+            raise ValueError("SlimServe uses the independent product embedding service")
+        if not generation.enabled:
+            raise ValueError("SlimServe generation must be enabled")
+        if generation.slimserve.variant == "metal":
+            if self.runtime.profile != "metal-arm64" or generation.tensor_parallel_size != 1 or generation.accelerator_device_ids:
+                raise ValueError("Metal SlimServe requires native Metal and exactly one device")
+        elif self.runtime.profile != "cuda-x86_64" or not generation.accelerator_device_ids:
+            raise ValueError("CUDA SlimServe requires explicit managed CUDA placement")
+        elif generation.tensor_parallel_size not in (1, 2, 4) or len(generation.accelerator_device_ids) != generation.tensor_parallel_size:
+            raise ValueError("SlimServe device count must equal managed tensor parallelism")
+        elif not {"accelerator_device_ids", "tensor_parallel_size"} <= generation.model_fields_set:
+            raise ValueError("SlimServe managed placement fields must be explicit together")
+        elif len(set(generation.accelerator_device_ids)) != generation.tensor_parallel_size or any(
+            not re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value)
+            for value in generation.accelerator_device_ids
+        ):
+            raise ValueError("SlimServe requires unique canonical NVIDIA UUIDs")
+        return self
 
     def alias_to_role(self) -> dict[str, str]:
         return {

@@ -3,3 +3,20 @@ Copyright 2026 Lazarus AI Research
 
 This product is licensed under the Apache License, Version 2.0.
 See THIRD_PARTY_NOTICES.md for bundled third-party software.
+
+Optional SlimServe source builds include vLLM-derived SlimServe code under
+Apache-2.0, source revision 44a7d1a21851c7164c098c93fbc1baa12ab99847.
+Copyright contributors to the vLLM project; upstream notices are retained.
+
+QuixiCore-CUDA base revision 08780aaa22cdc2d144b6beacb24df953134b34be:
+Copyright (c) 2024-2026 HazyResearch. MIT License.
+QuixiCore-Metal base revision 71a08cd4cbcdc622ce31b3fc91e1f505e144b516:
+Copyright (c) 2024-2026 HazyResearch.
+Copyright (c) 2024-2026 QuixiAI. MIT License.
+Compiled kernels retain the modifications in the pinned SlimServe source;
+the base revisions alone do not identify the final compiled content.
+
+Complete MIT notices and pinned build-source attributions appear in
+THIRD_PARTY_NOTICES.md. Source-build installations retain original upstream
+license/notice files under /opt/sovereign-slimserve/licenses and record actual
+installed artifact hashes in /opt/sovereign-slimserve/provenance.json.

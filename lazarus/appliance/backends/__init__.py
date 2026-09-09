@@ -16,12 +16,21 @@ import os
 
 from lazarus.appliance.backends.base import BackendStartError, EngineBackend, RoleInfo
 from lazarus.appliance.backends.fake import FakeBackend
+from lazarus.appliance.config import RuntimeConfig
 
 __all__ = ["BackendStartError", "EngineBackend", "FakeBackend", "RoleInfo", "select_backend"]
 
 
-def select_backend() -> EngineBackend:
+def select_backend(config: RuntimeConfig | None = None) -> EngineBackend:
     name = os.environ.get("SOVEREIGN_ENGINE_BACKEND", "vllm").lower()
+    if config is not None and config.roles.generation.engine == "slimserve":
+        if name == "agent":
+            from lazarus.appliance.backends.slimserve_agent import SlimServeAgentBackend
+
+            return SlimServeAgentBackend()
+        from lazarus.appliance.backends.slimserve import SlimServeBackend
+
+        return SlimServeBackend()
     if name == "fake":
         return FakeBackend()
     if name == "vllm":

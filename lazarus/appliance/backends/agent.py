@@ -33,6 +33,9 @@ from lazarus.appliance.config import RuntimeConfig
 
 logger = logging.getLogger("sovereign.agent")
 
+# Fixed artifact-verification and engine-load budget; never a caller option.
+HOST_GENERATION_TIMEOUT = 9000.0
+
 
 class AgentBackend(RoleClientMixin, EngineBackend):
     engine_name = "llama.cpp"
@@ -45,6 +48,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
         self._roles: dict[str, RoleInfo] = {}
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._agent_manifest: dict = {}
+        self.generation_paused = False
 
     def _headers(self, role: str | None = None) -> dict[str, str]:
         headers = {}
@@ -54,11 +58,74 @@ class AgentBackend(RoleClientMixin, EngineBackend):
             headers["X-Sovereign-Role"] = role
         return headers
 
+    def _observe_generation_admission(self, manifest: dict) -> None:
+        # Passive observations may close Runtime ingress, never reopen it. Model
+        # health is independent: embeddings remain usable while generation is fenced.
+        paused = manifest.get("generation_paused")
+        if (
+            type(paused) is not bool or manifest.get("engine") != self.engine_name
+            or manifest.get("backend") != self.backend_id
+        ):
+            self.generation_paused = True
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "invalid host admission observation")
+        self.generation_paused = self.generation_paused or paused
+
+    async def refresh_generation_admission(self) -> None:
+        if self.role_info("generation").status == "disabled":
+            return
+        try:
+            if not self.token:
+                raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                response = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
+                response.raise_for_status()
+                self._observe_generation_admission(response.json())
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, BackendStartError):
+            self.generation_paused = True
+
+    async def available_engines(self) -> list[dict]:
+        if not self.token:
+            return []
+        try:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                response = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
+                response.raise_for_status()
+                manifest = response.json()
+            available = manifest.get("available_engines")
+            if not isinstance(available, list) or len(available) > 8:
+                return []
+            return [entry for entry in available if isinstance(entry, dict)
+                    and isinstance(entry.get("name"), str)
+                    and entry.get("name") in {"slimserve", "llama.cpp"}
+                    and isinstance(entry.get("version"), str)
+                    and 0 < len(entry["version"]) <= 128
+                    and entry.get("variants") == (
+                        ["metal"] if entry["name"] == "slimserve" else ["metal-arm64"]
+                    )]
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return []
+
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
         on_state("loading")
         enabled = [name for name, role in config.roles.items() if role.enabled]
         manifest = await self._wait_for_agent(enabled)
+        if self.engine_name == "llama.cpp" and (
+            manifest.get("engine") == "slimserve" or manifest.get("configured_engine") == "slimserve"
+        ):
+            try:
+                async with httpx.AsyncClient(timeout=HOST_GENERATION_TIMEOUT, trust_env=False) as client:
+                    response = await client.post(
+                        f"{self.url}/agent/admin/roles/generation/llama", headers=self._headers()
+                    )
+                    response.raise_for_status()
+                manifest = await self._wait_for_agent(enabled)
+                if manifest.get("engine") != "llama.cpp" or manifest.get("state") != "healthy":
+                    raise BackendStartError("MODEL_LOAD_FAILED", "host engine cutback is not ready")
+            except httpx.HTTPError as exc:
+                raise BackendStartError("MODEL_LOAD_FAILED", "host llama generation cutback failed") from exc
         self._agent_manifest = manifest
+        if "generation" in enabled:
+            self._observe_generation_admission(manifest)
         agent_roles: dict = manifest.get("roles") or {}
 
         for name, role in config.roles.items():
@@ -95,6 +162,46 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                     logger.exception("agent embedding dimension probe failed")
                     info.status = "unhealthy"
                     info.error_code = "DIMENSION_MISMATCH"
+        if self.engine_name == "llama.cpp" and "generation" in enabled:
+            # A stopped Runtime leaves the independently supervised host ingress
+            # closed. Reopen only after a fresh, authenticated resume exchange.
+            if self.generation_paused and all(self._roles[name].status == "healthy" for name in enabled):
+                try:
+                    await self.resume()
+                except Exception as exc:
+                    raise BackendStartError("ENGINE_RESUME_FAILED", "host generation could not resume") from exc
+
+    async def quiesce(self) -> None:
+        self.generation_paused = True
+        if not self.token:
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
+        async with httpx.AsyncClient(timeout=630.0, trust_env=False) as client:
+            response = await client.post(
+                f"{self.url}/agent/admin/roles/generation/quiesce",
+                headers={**self._headers(), "X-Sovereign-Engine": "llama.cpp"},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if (
+                not isinstance(body, dict) or set(body) != {"paused", "idle"}
+                or body["paused"] is not True or body["idle"] is not True
+            ):
+                raise RuntimeError("host engine did not acknowledge generation idle")
+
+    async def resume(self) -> None:
+        self.generation_paused = True
+        if not self.token:
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
+        async with httpx.AsyncClient(timeout=630.0, trust_env=False) as client:
+            response = await client.post(
+                f"{self.url}/agent/admin/roles/generation/resume",
+                headers={**self._headers(), "X-Sovereign-Engine": "llama.cpp"},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or set(body) != {"paused"} or body["paused"] is not False:
+                raise RuntimeError("host engine did not acknowledge generation resume")
+        self.generation_paused = False
 
     async def _wait_for_agent(self, enabled_roles: list[str]) -> dict:
         """Wait for the agent to be reachable AND its models to finish

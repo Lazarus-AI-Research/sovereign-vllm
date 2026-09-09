@@ -46,6 +46,7 @@ class ManifestBuilder:
         self.backend = backend
         self.config = config
         self.port = port
+        self.available_engines: list[dict] = []
 
     @property
     def profile(self) -> str:
@@ -81,6 +82,10 @@ class ManifestBuilder:
                 entry["device_count"] = info.device_count
             if info.tensor_parallel_size is not None:
                 entry["tensor_parallel_size"] = info.tensor_parallel_size
+            for field in ("engine_profile_id", "upstream_profile_id", "quant", "max_concurrent_requests", "capabilities"):
+                value = getattr(info, field)
+                if value is not None:
+                    entry[field] = value
         if name == "embedding":
             if info.dimensions:
                 entry["dimensions"] = info.dimensions
@@ -99,13 +104,14 @@ class ManifestBuilder:
             accelerator = probe()
 
         manifest: dict = {
-            "schema_version": "1.2",
+            "schema_version": "1.3",
             "runtime_id": f"sovereign-runtime-{self.profile}-{RUNTIME_VERSION}",
             "runtime_version": RUNTIME_VERSION,
             "backend": self.backend.backend_id,
             "profile": self.profile,
             "topology": "single_process_multi_role",
             "state": self.state.state,
+            "generation_paused": self.backend.generation_paused,
             "api": {"openai_compatible": True, "port": self.port, "base_path": "/v1"},
             "roles": {"generation": self._role_entry("generation")},
             "accelerator": accelerator,
@@ -118,12 +124,20 @@ class ManifestBuilder:
         }
         engine_version = self.backend.engine_version()
         if engine_version is not None:
-            manifest["vllm_version"] = engine_version
+            if self.backend.engine_name == "vllm":
+                manifest["vllm_version"] = engine_version
             manifest["engine"] = {
                 "name": self.backend.engine_name,
                 "version": engine_version,
                 "adapter": self.backend.adapter_id,
             }
+        observed = self.backend.observation()
+        if observed.get("kernels") is not None:
+            manifest["kernels"] = observed["kernels"]
+        elif self.backend.engine_name == "slimserve":
+            manifest["health"]["kernels"] = "unknown"
+        if self.available_engines:
+            manifest["available_engines"] = self.available_engines
         if self.config is not None:
             manifest["resource_policy"] = {
                 "enforcement": "best_effort",
