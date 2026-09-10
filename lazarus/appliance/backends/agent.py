@@ -27,6 +27,7 @@ from collections.abc import Callable
 
 import httpx
 
+from lazarus.agent.config import valid_native_model_identity
 from lazarus.appliance.backends.base import BackendStartError, EngineBackend, RoleInfo
 from lazarus.appliance.backends.roleclient import RoleClientMixin
 from lazarus.appliance.config import RuntimeConfig
@@ -70,18 +71,59 @@ class AgentBackend(RoleClientMixin, EngineBackend):
             raise BackendStartError("HOST_AGENT_UNREACHABLE", "invalid host admission observation")
         self.generation_paused = self.generation_paused or paused
 
-    async def refresh_generation_admission(self) -> None:
-        if self.role_info("generation").status == "disabled":
+    def _observe_native_roles(self, manifest: object) -> None:
+        roles = manifest.get("roles") if isinstance(manifest, dict) else None
+        valid_backend = isinstance(manifest, dict) and manifest.get("backend") == self.backend_id
+        for name, current in self._roles.items():
+            # SlimServe generation has its own stronger evidence validator and
+            # monitor. Its independently placed native roles share this check.
+            if current.status != "healthy" or (name == "generation" and self.engine_name != "llama.cpp"):
+                continue
+            observed = roles.get(name) if isinstance(roles, dict) else None
+            if (
+                valid_backend
+                and (name != "generation" or manifest.get("engine") == self.engine_name)
+                and isinstance(observed, dict)
+                and observed.get("status") == "healthy"
+                and valid_native_model_identity(observed.get("model"))
+                and observed.get("model") == current.engine_model
+                and observed.get("revision") == current.revision
+                and observed.get("context_length") == current.context_length
+            ):
+                continue
+            # Withdrawal is sticky until an explicit startup accepts/probes the
+            # role again. A live child may still have weights in memory; that is
+            # not proof of its current managed identity or embedding dimensions.
+            self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_LOAD_FAILED")
+            if name == "generation":
+                self.generation_paused = True
+
+    async def refresh_role_observations(self) -> None:
+        if not any(info.status != "disabled" for info in self._roles.values()):
             return
+        generation_enabled = self.role_info("generation").status != "disabled"
         try:
             if not self.token:
                 raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
             async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
                 response = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
                 response.raise_for_status()
-                self._observe_generation_admission(response.json())
-        except (httpx.HTTPError, ValueError, TypeError, AttributeError, BackendStartError):
-            self.generation_paused = True
+        except (httpx.HTTPError, BackendStartError):
+            # No authenticated current observation: fence generation without
+            # inventing withdrawal or restored identity for another role.
+            if generation_enabled:
+                self.generation_paused = True
+            return
+        try:
+            manifest = response.json()
+        except ValueError:
+            manifest = None
+        self._observe_native_roles(manifest)
+        if generation_enabled:
+            try:
+                self._observe_generation_admission(manifest)
+            except (TypeError, AttributeError, BackendStartError):
+                self.generation_paused = True
 
     async def available_engines(self) -> list[dict]:
         if not self.token:
@@ -141,13 +183,20 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                 )
                 self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_NOT_FOUND")
                 continue
+            model = agent_role.get("model")
+            # SlimServe generation carries separately validated host evidence;
+            # every llama role must already name its exact managed Runtime file.
+            if self.engine_name == "llama.cpp" or name != "generation":
+                if not valid_native_model_identity(model):
+                    self._roles[name] = RoleInfo(status="unhealthy", error_code="MODEL_LOAD_FAILED")
+                    continue
             self._clients[name] = httpx.AsyncClient(
                 base_url=self.url, headers=self._headers(name), timeout=600.0
             )
             info = RoleInfo(
                 status="healthy",
-                engine_model=agent_role.get("model", "host-agent"),
-                revision=agent_role.get("revision", "host"),
+                engine_model=model,
+                revision=agent_role.get("revision"),
                 context_length=agent_role.get("context_length"),
             )
             self._roles[name] = info
@@ -248,6 +297,10 @@ class AgentBackend(RoleClientMixin, EngineBackend):
         return self._roles.get(role, RoleInfo(status="disabled"))
 
     def role_client(self, role: str) -> httpx.AsyncClient | None:
+        # Keep the client alive for already-admitted streams until shutdown,
+        # but never give a new caller a role whose current proof was withdrawn.
+        if self.role_info(role).status != "healthy":
+            return None
         return self._clients.get(role)
 
     def engine_version(self) -> str | None:

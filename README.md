@@ -261,6 +261,88 @@ container contract while inference runs host-side:
   generation model (+mmproj, reasoning budget 0). Control can add or remove a
   checksum-verified GGUF embedding role through the constrained agent API.
 
+Native llama roles report the actual started child's managed file identity, not
+the requested repository or the file's basename. `SOVEREIGN_AGENT_MODEL_ROOT`
+sets the existing host model root; otherwise it is `models/` beside the agent
+configuration file, or `~/.sovereign/models` when no configuration path is given.
+An existing, canonically spelled regular file strictly inside that resolved root
+projects to `/models/<root-relative-path>`, preserving every directory component.
+For example, a child started with
+`<root>/staged/<artifact-id>/<checksum>/artifact` reports
+`/models/staged/<artifact-id>/<checksum>/artifact`. Merely naming a file
+`artifact` elsewhere does not give it that identity. Relative, missing,
+out-of-root, directory, traversal, and symlinked file paths fail closed before
+starting a native child. If a previously started file ceases to satisfy the
+contract, the role is unhealthy and no model identity or private host path is
+published.
+
+Runtime refreshes authenticated native role observations before publishing its
+manifest, health/readiness and model list, and before forwarding role requests,
+including embedding-only configurations. A missing, unhealthy, malformed or
+unexpectedly changed started model, revision or context observation withdraws
+that role's cached identity and dimensions. It is not silently replaced or
+reaccepted by later passive observations; an explicit Runtime startup must
+accept and probe the role again. Withdrawing generation proof closes Runtime
+generation admission, but does not close the independent host gate or interrupt
+already-admitted streams. A child can retain usable weights in memory after a
+file disappears: loaded memory is not current managed-file identity proof.
+
+Overall readiness still requires every enabled role. Request forwarding checks
+the requested role independently, so withdrawn or paused generation does not
+disable a healthy embedding role, and an embedding-only Runtime ignores host
+generation admission. A failed transport observation closes generation admission
+without asserting that another role's loaded identity was withdrawn. Passive
+observations never reopen generation admission. SlimServe retains its separate
+validated generation observation and existing monitor; native ancillary roles
+use the same exact-identity withdrawal check.
+
+The projected `/models/<root-relative-path>` identity is limited to **512 UTF-8
+bytes including `/models/`** (at most 504 bytes for the relative part), not 512
+bytes for the private absolute host path. Each component is at most 255 UTF-8
+bytes. Ordinary spaces, Unicode names, and filename punctuation are preserved
+exactly, including repeated dots inside a filename. Empty, `.` or `..`
+components, repeated/trailing `/` separators, invalid UTF-8, and Unicode control
+characters (including NUL) are rejected. Paths use POSIX separators; a backslash
+inside a filename is not a separator. Nothing is normalized, truncated, hashed,
+or replaced with a basename. This deliberately bounded contract supports
+space-bearing parents and nested paths longer than the old Control decoder's
+257-character ceiling. Existing host filesystem limits can be lower; an
+existing managed regular file is still required.
+Agent startup, checksum-verified embedding admission, native observation, and
+the Runtime adapter enforce the same native bound. Control applies it only to
+native absolute file observations on Metal; served aliases, repository IDs,
+command validators, and SlimServe generation's separate staged-path grammar
+remain unchanged. Longer native paths must be restaged under a supported exact
+managed path before configuring a child.
+
+Revision and context metadata stay associated with the child's startup inputs;
+later desired configuration changes cannot relabel that child. The Runtime
+adapter copies the canonical identity unchanged and rejects older basename-only
+native manifests, so agent and Runtime must be upgraded together, with the
+coordinated Control decoder for space-bearing, Unicode, or longer native
+identities. The common manifest schema already carries `engine_model` as a
+nonempty string; this native-only admission/decoder correction introduces no
+new schema version or published artifact dependency. Native
+embedding observations use this same contract even when generation uses
+SlimServe; SlimServe generation retains its independently verified host/staged
+mapping. Installed engine discovery is not loaded-engine version evidence:
+native llama `engine_version` remains unknown and the Runtime manifest does not
+invent an `engine` object. The file projection is not a checksum measurement or
+physical serving qualification.
+
+The supported native llama-server contract is the reviewed **b9960** CLI, not
+arbitrary historical versions. The agent makes `model_path` authoritative by
+placing the primary-file argument after extra role arguments and clearing the
+primary URL, Hugging Face, and Docker selectors with their supported empty
+string arguments. This also clears inherited selector environment values and
+primary-model presets; it does not replace auxiliary projector/draft inputs.
+Operators must stage the intended local file and set `model_path` to it rather
+than select another primary model through `args` or environment. Binaries that
+do not support this CLI are not covered; this source-reviewed argument policy
+does not attest the version of a loaded child. See the
+[b9960 string setters](https://github.com/ggml-org/llama.cpp/blob/b9960/common/arg.cpp#L2733-L2768)
+and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b9960/common/arg.cpp#L459-L576).
+
 ### Backends behind one seam (`lazarus/appliance/backends/`)
 
 `vllm` (in-process engines), `agent` (Metal host agent), and `fake` (a

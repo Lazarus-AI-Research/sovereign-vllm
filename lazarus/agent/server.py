@@ -29,7 +29,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from lazarus.agent.config import AgentConfig, load_agent_config
+from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
 from lazarus.appliance.backends.base import BackendStartError
 from lazarus.appliance.backends.slimserve import SlimServeBackend
 from lazarus.appliance.config import RuntimeConfig
@@ -82,10 +82,16 @@ class RoleStreamingResponse(StreamingResponse):
 
 
 class RoleProcess:
-    def __init__(self, name: str, command: list[str], port: int, model_path: str):
+    def __init__(
+        self, name: str, command: list[str], port: int, model_path: str,
+        *, revision: str | None, context_length: int | None,
+    ):
         self.name = name
         self.port = port
         self.model_path = model_path
+        # Keep loader-input metadata with this child, not a later desired config.
+        self.revision = revision
+        self.context_length = context_length
         self.execution_uncertain = False
         # b9960 traces the final four key characters. Keep those public while
         # retaining 256 random bits that never enter native argv or logs.
@@ -287,10 +293,14 @@ class Agent:
         role = self.config.roles[name]
         command = [
             self.config.llama_server,
-            "-m", role.model_path,
             *role.args,
             "--host", "127.0.0.1",
             "--port", str(role.port),
+            # b9960 applies env before argv, then remote selection after argv.
+            # Clear those selectors after user flags/presets before the final
+            # local -m; -m alone does not override HF, URL, or Docker selection.
+            "--model-url", "", "--hf-repo", "", "--docker-repo", "",
+            "-m", role.model_path,
         ]
         if role.mmproj_path:
             command += ["--mmproj", role.mmproj_path]
@@ -300,7 +310,11 @@ class Agent:
 
     def start_role(self, name: str) -> RoleProcess:
         role = self.config.roles[name]
-        return RoleProcess(name, self.role_command(name), role.port, role.model_path)
+        self.observed_model(role.model_path)
+        return RoleProcess(
+            name, self.role_command(name), role.port, role.model_path,
+            revision=role.revision, context_length=role.context_length,
+        )
 
     def start_roles(self) -> None:
         for name in self.config.roles:
@@ -326,8 +340,16 @@ class Agent:
             logger.error("role %s failed to become healthy", name)
 
     def stop(self) -> None:
-        for role in self.roles.values():
-            role.stop()
+        error = None
+        for name, role in self.roles.items():
+            try:
+                role.stop()
+            except Exception as exc:
+                logger.exception("failed to stop role %s", name)
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def save_config(self) -> None:
         if self.config_path is None:
@@ -339,11 +361,10 @@ class Agent:
         temporary.replace(target)
 
     def resolve_model(self, artifact: str, expected_sha256: str) -> Path:
-        relative = Path(artifact)
-        if relative.is_absolute() or ".." in relative.parts or relative.name == "":
-            raise ValueError("artifact must be a relative path within the managed model directory")
-        model = (self.model_root / relative).resolve(strict=True)
-        if not model.is_relative_to(self.model_root) or not model.is_file():
+        if not valid_native_model_identity(f"/models/{artifact}"):
+            raise ValueError("artifact must use a bounded canonical relative native model path")
+        model = self._resolve_managed_path(Path(artifact))
+        if not model.is_file():
             raise ValueError("artifact must resolve to a model file within the managed model directory")
         if model.suffix.lower() != ".gguf":
             raise ValueError("Metal embedding artifacts must be GGUF files")
@@ -354,6 +375,30 @@ class Agent:
         if digest.hexdigest() != expected_sha256.lower():
             raise ValueError("artifact checksum does not match sha256")
         return model
+
+    def _resolve_managed_path(self, relative: Path) -> Path:
+        current = self.model_root
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                raise ValueError("managed model paths cannot contain symlinks")
+        resolved = current.resolve(strict=True)
+        if resolved != current or not resolved.is_relative_to(self.model_root):
+            raise ValueError("model must use its exact managed local path")
+        return resolved
+
+    def observed_model(self, model_path: str) -> str:
+        """Project an actual native loader input, never an intended model alias."""
+        path = Path(model_path)
+        if not path.is_absolute() or str(path) != model_path or ".." in path.parts:
+            raise ValueError("observed model must use a canonical absolute path")
+        relative = path.relative_to(self.model_root)
+        identity = f"/models/{relative.as_posix()}"
+        if not valid_native_model_identity(identity):
+            raise ValueError("native model identity must use at most 512 UTF-8 bytes and canonical path components")
+        if not self._resolve_managed_path(relative).is_file():
+            raise ValueError("observed model must be a managed local file")
+        return identity
 
     async def wait_role_ready(self, role: RoleProcess, timeout: float = 120) -> None:
         deadline = time.monotonic() + timeout
@@ -405,13 +450,8 @@ class Agent:
         if match is None or match[3] != role.engine_profile_id:
             raise ValueError("generation model must use its exact managed staged profile directory")
         relative = Path(model).relative_to("/models")
-        current = self.model_root
-        for component in relative.parts:
-            current = current / component
-            if current.is_symlink():
-                raise ValueError("managed generation paths cannot contain symlinks")
-        resolved = current.resolve(strict=True)
-        if resolved != current or not resolved.is_relative_to(self.model_root) or not resolved.is_dir():
+        resolved = self._resolve_managed_path(relative)
+        if not resolved.is_dir():
             raise ValueError("generation model must be a managed local directory")
         translated = config.model_copy(deep=True)
         translated.roles.generation.model = str(resolved)
@@ -666,18 +706,33 @@ class EmbeddingRoleRequest(BaseModel):
 def build_app(agent: Agent) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        agent.start_roles()
-        await agent.discover_engines()
-        task = asyncio.create_task(agent.wait_ready())
-        generation_task = asyncio.create_task(agent.resume_generation())
+        task = None
+        generation_task = None
+        lifespan_error = None
         try:
+            agent.start_roles()
+            await agent.discover_engines()
+            task = asyncio.create_task(agent.wait_ready())
+            generation_task = asyncio.create_task(agent.resume_generation())
             yield
+        except BaseException as exc:
+            lifespan_error = exc
+            raise
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            # Do not interrupt a generation swap between stop and verified rollback.
-            await generation_task
-            await agent.shutdown()
+            try:
+                try:
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    # Do not interrupt a generation swap between stop and verified rollback.
+                    if generation_task is not None:
+                        await generation_task
+                finally:
+                    await agent.shutdown()
+            except Exception:
+                if lifespan_error is None:
+                    raise
+                logger.exception("agent cleanup failed after lifespan failure")
 
     app = FastAPI(title="Sovereign Runtime Agent", lifespan=lifespan)
 
@@ -691,15 +746,20 @@ def build_app(agent: Agent) -> FastAPI:
     async def manifest():
         roles = {}
         for name, role in list(agent.roles.items()):
-            configured = agent.config.roles.get(name)
-            if configured is None:
-                continue
             healthy = await role.healthy()
+            try:
+                if agent.roles.get(name) is not role or role.name != name:
+                    raise ValueError("native role ownership changed")
+                model = agent.observed_model(role.model_path)
+            except (OSError, ValueError, TypeError, RuntimeError):
+                roles[name] = {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED"}
+                continue
+            running = role.running()
             roles[name] = {
-                "status": "healthy" if healthy else ("loading" if role.running() else "unhealthy"),
-                "model": Path(role.model_path).name,
-                "context_length": configured.context_length,
-                "revision": configured.revision,
+                "status": "healthy" if healthy and running else ("loading" if running else "unhealthy"),
+                "model": model,
+                "context_length": role.context_length,
+                "revision": role.revision,
             }
         backend = agent.generation_backend
         native = backend is not None or agent.config.slimserve_generation is not None
@@ -859,6 +919,7 @@ def build_app(agent: Agent) -> FastAPI:
             try:
                 candidate = agent.start_role("embedding")
                 await agent.wait_role_ready(candidate)
+                observed_model = agent.observed_model(candidate.model_path)
                 agent.save_config()
             except Exception as exc:
                 verified = False
@@ -885,7 +946,7 @@ def build_app(agent: Agent) -> FastAPI:
             return {
                 "status": "healthy",
                 "role": "embedding",
-                "model": model.name,
+                "model": observed_model,
                 "revision": candidate_config.revision,
             }
 

@@ -51,11 +51,12 @@ def native(tmp_path, monkeypatch):
     process_count = 0
 
     class Process:
-        def __init__(self, name, path, port):
+        def __init__(self, name, role):
             nonlocal process_count
             process_count += 1
             self.name, self.key = name, f"{name}-{process_count}"
-            self.model_path, self.port = path, port
+            self.model_path, self.port = role.model_path, role.port
+            self.revision, self.context_length = role.revision, role.context_length
             if name == "generation":
                 assert not live, "overlapping generation processes"
                 live.add(self.key)
@@ -167,7 +168,7 @@ def native(tmp_path, monkeypatch):
         "embedding": AgentRole(model_path=str(old_model), port=9102, revision="e" * 40),
     }), config_path)
     agent.save_config()
-    monkeypatch.setattr(agent, "start_role", lambda name: Process(name, agent.config.roles[name].model_path, agent.config.roles[name].port))
+    monkeypatch.setattr(agent, "start_role", lambda name: Process(name, agent.config.roles[name]))
     agent.start_roles()
     return SimpleNamespace(agent=agent, config=config, events=events, live=live, control=control,
                            path=config_path, model=model, root=root, Process=Process, Backend=Backend)
@@ -253,7 +254,7 @@ def test_restart_revalidates_persisted_generation_without_llama_overlap(native, 
         await native.agent.configure_generation(native.config)
         await native.agent.shutdown()
         restarted = Agent(load_agent_config(native.path), native.path)
-        monkeypatch.setattr(restarted, "start_role", lambda name: native.Process(name, restarted.config.roles[name].model_path, restarted.config.roles[name].port))
+        monkeypatch.setattr(restarted, "start_role", lambda name: native.Process(name, restarted.config.roles[name]))
         restarted.start_roles()
         assert set(restarted.roles) == {"embedding"}
         assert (await restarted.resume_generation())["status"] == "healthy"
@@ -314,6 +315,8 @@ def test_native_proxy_uses_backend_client_and_true_idle_ack(native):
         manifest = client.get("/agent/manifest", headers=HEADERS).json()
         assert manifest["observation"]["engine_model"] == str(native.model)
         assert manifest["model_mapping"]["runtime"] == native.config.roles.generation.model
+        assert manifest["roles"]["embedding"]["model"] == "/models/old.gguf"
+        assert manifest["roles"]["embedding"]["revision"] == "e" * 40
         assert client.post("/agent/admin/roles/generation/quiesce").status_code == 401
         assert client.post("/agent/admin/roles/generation/quiesce", headers=HEADERS, json={}).status_code == 422
         assert client.post("/agent/admin/roles/generation/quiesce", headers=HEADERS).json() == {"paused": True, "idle": True}
@@ -384,7 +387,11 @@ def test_remote_accepts_only_exact_observed_managed_mapping(native, monkeypatch)
     assert len(accepted) == 1
 
 
-def test_remote_sends_only_typed_generation_and_keeps_embedding_proxy(native, monkeypatch):
+@pytest.mark.parametrize("embedding_model", [
+    "/models/embedding/model.gguf", "/models/" + "nested dir/" * 45 + "file.gguf",
+    "/models/" + "é/" * 165 + "file.gguf", "/models/modèles (reviewed)/weights..v2;[Q4].gguf",
+])
+def test_remote_sends_only_typed_generation_and_keeps_embedding_proxy(native, monkeypatch, embedding_model):
     from lazarus.appliance.config import RoleConfig
 
     config = native.config.model_copy(deep=True)
@@ -397,7 +404,7 @@ def test_remote_sends_only_typed_generation_and_keeps_embedding_proxy(native, mo
         "generation_paused": False,
         "roles": {
             "generation": {"status": "healthy", "engine_model": str(native.model), "model": str(native.model)},
-            "embedding": {"status": "healthy", "model": "embedding.gguf", "revision": "e" * 40},
+            "embedding": {"status": "healthy", "model": embedding_model, "revision": "e" * 40},
         },
         "observation": payload,
         "model_mapping": {"runtime": native.config.roles.generation.model, "host": str(native.model)},
@@ -432,7 +439,20 @@ def test_remote_sends_only_typed_generation_and_keeps_embedding_proxy(native, mo
         await backend.start(config, lambda state: None)
         assert backend.role_info("generation").engine_model == config.roles.generation.model
         assert backend.role_info("embedding").dimensions == 2
-        assert backend.role_client("embedding") is not None
+        assert backend.role_info("embedding").engine_model == embedding_model
+        manifest["roles"]["embedding"]["model"] = "/models/other/model.gguf"
+        backend._accept_manifest(manifest)
+        assert backend.role_info("embedding").status == "unhealthy"
+        assert backend.role_info("embedding").dimensions is None
+        assert backend.role_info("embedding").engine_model is None
+        assert backend.role_info("embedding").revision is None
+        assert backend.role_client("embedding") is None
+        assert backend.role_info("generation").engine_model == config.roles.generation.model
+        manifest["roles"]["embedding"]["model"] = embedding_model
+        backend._accept_manifest(manifest)
+        assert backend.role_info("embedding").status == "unhealthy"
+        assert backend.role_info("embedding").engine_model is None
+        assert backend.role_info("embedding").dimensions is None
         await backend.shutdown()
 
     asyncio.run(exercise())
