@@ -202,13 +202,19 @@ def build_app(
     def role_status(name: str) -> str:
         return backend.role_info(name).status
 
-    def is_ready(role: str = "generation") -> bool:
-        if config is None or state.state != "healthy" or (role == "generation" and backend.generation_paused):
+    def is_ready(role: str | None = None) -> bool:
+        if config is None or state.state != "healthy":
             return False
+        if backend.generation_paused and (
+            role == "generation" or (role is None and config.roles.generation.enabled)
+        ):
+            return False
+        if role is not None:
+            return role_status(role) == "healthy"
         return all(role_status(name) == "healthy" for name in config.enabled_roles())
 
-    async def refresh_generation_admission() -> None:
-        refresh = getattr(backend, "refresh_generation_admission", None)
+    async def refresh_role_observations() -> None:
+        refresh = getattr(backend, "refresh_role_observations", None)
         if refresh is not None:
             await refresh()
             manifest.write()
@@ -228,7 +234,7 @@ def build_app(
 
     @app.get("/health/ready")
     async def health_ready() -> JSONResponse:
-        await refresh_generation_admission()
+        await refresh_role_observations()
         ready = is_ready()
         required_roles = {
             name: role_status(name) == "healthy"
@@ -242,7 +248,8 @@ def build_app(
         return JSONResponse(status_code=200 if ready else 503, content=body)
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
+        await refresh_role_observations()
         roles = {}
         configured_roles = [
             name for name in ("generation", "embedding")
@@ -271,7 +278,7 @@ def build_app(
 
     @app.get("/runtime/manifest")
     async def runtime_manifest() -> dict:
-        await refresh_generation_admission()
+        await refresh_role_observations()
         return manifest.build()
 
     @app.get("/runtime/errors")
@@ -331,7 +338,8 @@ def build_app(
     # ── OpenAI surface ───────────────────────────────────────────────────
 
     @app.get("/v1/models")
-    def list_models() -> dict:
+    async def list_models() -> dict:
+        await refresh_role_observations()
         data = [
             {"id": alias, "object": "model", "owned_by": "sovereign"}
             for alias, role in alias_map.items()
@@ -362,7 +370,7 @@ def build_app(
         if client is None:
             return None
         if role == "generation":
-            admission_stack.push_async_callback(refresh_generation_admission)
+            admission_stack.push_async_callback(refresh_role_observations)
         upstream = client.build_request(
             "POST", path, content=raw_body, headers={"Content-Type": "application/json"}
         )
@@ -388,8 +396,6 @@ def build_app(
             body = json.loads(raw_body)
         except json.JSONDecodeError:
             return _error(400, "request body must be JSON", "invalid_request_error")
-        if role == "generation":
-            await refresh_generation_admission()
         if denied := route(body, role, required_fields):
             return denied
         if role == "generation" and request.url.path.endswith("/chat/completions"):
@@ -402,7 +408,8 @@ def build_app(
         try:
             async with AsyncExitStack() as admission_stack:
                 await admission_stack.enter_async_context(admission.slot(role))
-                # A request may have waited for a slot while quiesce closed admission.
+                # A queued request may outlive either admission or role proof.
+                await refresh_role_observations()
                 if not is_ready(role):
                     return _not_ready()
                 if (response := await forward(role, request.url.path, raw_body, admission_stack)) is not None:

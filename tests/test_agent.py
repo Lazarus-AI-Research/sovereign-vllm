@@ -58,6 +58,86 @@ def test_config_rejects_unknown_keys(tmp_path):
         load_agent_config(path)
 
 
+@pytest.mark.parametrize("model_path", [
+    "", "model.gguf", "models/model.gguf", "//models/model.gguf",
+    "/models/./model.gguf", "/models/dir/../model.gguf", "/models//model.gguf", "/models/model.gguf/",
+])
+def test_agent_config_rejects_noncanonical_primary_model_path(tmp_path, model_path):
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text(yaml.safe_dump({"roles": {"generation": {"model_path": model_path, "port": 9101}}}))
+    with pytest.raises(ValueError, match="canonical absolute path"):
+        load_agent_config(config_path)
+
+
+@pytest.mark.parametrize("relative", [
+    "parent with spaces/file.gguf", "nested dir/" * 45 + "file.gguf",
+    "é/" * 165 + "file.gguf", "x" + "é" * 127,
+    "modèles (reviewed)/weights..v2;[Q4]\\final.gguf",
+])
+def test_agent_config_and_resolver_preserve_bounded_native_identity(tmp_path, monkeypatch, relative):
+    # Private host-root bytes do not count against the /models/ identity bound.
+    root = tmp_path / "private host root"
+    model = root / relative
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"native model fixture")
+    monkeypatch.setenv("SOVEREIGN_AGENT_MODEL_ROOT", str(root))
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text(yaml.safe_dump({"roles": {"generation": {"model_path": str(model), "port": 9101}}}))
+    config = load_agent_config(config_path)
+    agent = Agent(config, config_path)
+    identity = f"/models/{relative}"
+    assert config.roles["generation"].model_path == str(model)
+    assert agent.observed_model(config.roles["generation"].model_path) == identity
+    if model.suffix == ".gguf":
+        assert agent.resolve_model(relative, hashlib.sha256(model.read_bytes()).hexdigest()) == model
+    if relative.startswith(("nested dir/", "é/")):
+        assert len(identity.encode("utf-8")) == 512
+        assert len(str(model).encode("utf-8")) > 512
+
+
+@pytest.mark.parametrize("relative", [
+    "nested dir/" * 45 + "xfile.gguf", "a" * 256,
+    "dir/./file.gguf", "dir/../file.gguf", "dir//file.gguf", "file.gguf/",
+    "é/" * 165 + "xfile.gguf", "é" * 128,
+    "model\tname.gguf", "model\nname.gguf", "model\x00.gguf", "model\x7f.gguf", "model\u0085.gguf", "model\ud800.gguf",
+])
+def test_native_admission_rejects_unsupported_paths_before_spawn(native_protocol, relative):
+    native = native_protocol
+    children = list(native.children)
+    # Mutated desired configuration must be rechecked even after YAML parsing.
+    native.agent.config.roles["generation"].model_path = f"{native.agent.model_root}/{relative}"
+    with pytest.raises(ValueError):
+        native.agent.start_role("generation")
+    assert native.children == children
+    with pytest.raises(ValueError):
+        native.agent.resolve_model(relative, "a" * 64)
+
+
+@pytest.mark.parametrize("kind", ["file-symlink", "directory-symlink", "outside-root"])
+def test_native_admission_rejects_noncurrent_managed_paths(native_protocol, kind):
+    native = native_protocol
+    root = native.agent.model_root
+    original = native.model
+    if kind == "file-symlink":
+        path = root / "link.gguf"
+        path.symlink_to(original)
+    elif kind == "directory-symlink":
+        link = root / "linked"
+        link.symlink_to(original.parent, target_is_directory=True)
+        path = link / original.name
+    else:
+        path = original
+        native.agent.model_root = root / "different-current-root"
+    native.agent.config.roles["generation"].model_path = str(path)
+    children = list(native.children)
+    with pytest.raises(ValueError):
+        native.agent.start_role("generation")
+    assert native.children == children
+    if kind != "outside-root":
+        with pytest.raises(ValueError, match="symlinks"):
+            native.agent.resolve_model(path.relative_to(root).as_posix(), hashlib.sha256(original.read_bytes()).hexdigest())
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "agent-secret")
@@ -91,10 +171,12 @@ def test_proxy_requires_known_role(client):
     assert resp.status_code == 404
 
 
-def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relative", ["custom.gguf", "nested dir/" * 45 + "file.gguf", "é/" * 165 + "file.gguf"])
+def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypatch, relative):
     model_root = tmp_path / "models"
     model_root.mkdir()
-    artifact = model_root / "custom.gguf"
+    artifact = model_root / relative
+    artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b"verified gguf")
     checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
     config_path = tmp_path / "agent.yaml"
@@ -132,7 +214,7 @@ def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypa
             "/agent/admin/roles/embedding",
             headers={"Authorization": "Bearer agent-secret"},
             json={
-                "artifact": "custom.gguf",
+                "artifact": relative,
                 "revision": "a" * 40,
                 "sha256": checksum,
                 "pooling": "mean",
@@ -140,6 +222,7 @@ def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypa
             },
         )
         assert accepted.status_code == 200
+        assert accepted.json()["model"] == f"/models/{relative}"
         assert agent.config.roles["embedding"].model_path == str(artifact)
         assert "--embd-normalize" in agent.config.roles["embedding"].args
 
@@ -149,6 +232,26 @@ def test_embedding_admin_only_accepts_managed_verified_models(tmp_path, monkeypa
         )
         assert removed.status_code == 200
         assert "embedding" not in agent.config.roles
+
+
+@pytest.mark.parametrize("artifact", [
+    "nested dir/" * 45 + "xfile.gguf", "é/" * 165 + "xfile.gguf",
+    "generation/./model.gguf", "generation/../embedding/model.gguf", "generation//model.gguf",
+])
+def test_embedding_admin_rejects_native_path_before_changing_current_role(native_protocol, artifact):
+    native = native_protocol
+    previous = native.agent.roles["embedding"]
+    saved = native.agent.config_path.read_bytes()
+    children = list(native.children)
+    response = TestClient(build_app(native.agent)).put(
+        "/agent/admin/roles/embedding",
+        headers={"Authorization": "Bearer agent-secret"},
+        json={"artifact": artifact, "revision": "a" * 40, "sha256": "a" * 64},
+    )
+    assert response.status_code == 422
+    assert native.agent.roles["embedding"] is previous and previous.running()
+    assert native.agent.config_path.read_bytes() == saved
+    assert native.children == children
 
 
 @pytest.mark.parametrize("rollback_ready", [True, False])
@@ -283,7 +386,7 @@ def test_metal_manifest_preserves_roles_without_mislabeling_agent_version(config
             "roles": {
                 name: {
                     "status": "healthy",
-                    "model": role.model,
+                    "model": f"/models/{name}/model.gguf",
                     "revision": "a" * 40,
                     "context_length": 8192,
                 }
@@ -314,8 +417,10 @@ def test_metal_manifest_preserves_roles_without_mislabeling_agent_version(config
     assert manifest["backend"] == "metal"
     assert manifest["profile"] == "metal-arm64"
     assert manifest["roles"]["generation"]["status"] == "healthy"
+    assert manifest["roles"]["generation"]["engine_model"] == "/models/generation/model.gguf"
     assert manifest["roles"]["generation"]["revision"] == "a" * 40
     assert manifest["roles"]["embedding"]["dimensions"] == 384
+    assert manifest["roles"]["embedding"]["engine_model"] == "/models/embedding/model.gguf"
     assert manifest["accelerator"] == {
         "vendor": "apple",
         "device_count": 1,
@@ -336,8 +441,11 @@ def native_protocol(config_file, tmp_path, monkeypatch):
     raw = yaml.safe_load(config_file.read_text())
     raw["runtime"]["profile"] = "metal-arm64"
     config_file.write_text(yaml.safe_dump(raw))
-    model = tmp_path / "model.gguf"
-    model.write_bytes(b"native model")
+    model = tmp_path / "generation" / "model.gguf"
+    embedding_model = tmp_path / "embedding" / "model.gguf"
+    for path in (model, embedding_model):
+        path.parent.mkdir()
+        path.write_bytes(b"native model")
     children, events = [], []
 
     def spawn(command, **kwargs):
@@ -355,8 +463,8 @@ def native_protocol(config_file, tmp_path, monkeypatch):
 
     monkeypatch.setattr("lazarus.agent.server.subprocess.Popen", spawn)
     agent = Agent(AgentConfig(roles={
-        "generation": AgentRole(model_path=str(model), port=9101, revision="a" * 40),
-        "embedding": AgentRole(model_path=str(model), port=9102, revision="b" * 40),
+        "generation": AgentRole(model_path=str(model), port=9101, revision="a" * 40, context_length=8192),
+        "embedding": AgentRole(model_path=str(embedding_model), port=9102, revision="b" * 40, context_length=2048),
     }), tmp_path / "agent.yaml")
     agent.start_roles()
     agent.save_config()
@@ -367,6 +475,7 @@ def native_protocol(config_file, tmp_path, monkeypatch):
         stream_closed=asyncio.Event(), terminal=True, send_failure=False,
         lose_ack=False, ack=None, die_during_metrics=False,
         manifest_failure=None, native_status=200, native_body=None,
+        manifest_transform=None,
         native_media="application/json", generation_bodies=[],
         fence_status=200, fence_unauth_status=401, fence_body=[], fence_gate=None,
         fence_seen=asyncio.Event(), fence_lost=False, fence_die=False,
@@ -452,11 +561,17 @@ def native_protocol(config_file, tmp_path, monkeypatch):
                 failure = control.manifest_failure
                 if failure == "unavailable":
                     raise httpx.ConnectError("host admission unavailable", request=request)
-                if failure == "missing":
-                    return httpx.Response(200, json={"engine": "llama.cpp", "backend": "metal"})
-                if failure == "untyped":
-                    return httpx.Response(200, json={"engine": "llama.cpp", "backend": "metal", "generation_paused": 0})
             response = await apps[request.url.host].handle_async_request(request)
+            if request.url.host == "agent" and request.url.path == "/agent/manifest":
+                body = json.loads(await response.aread())
+                await response.aclose()
+                if control.manifest_failure == "missing":
+                    body.pop("generation_paused")
+                elif control.manifest_failure == "untyped":
+                    body["generation_paused"] = 0
+                if control.manifest_transform is not None:
+                    body = control.manifest_transform(body)
+                return httpx.Response(200, content=json.dumps(body), headers={"content-type": "application/json"})
             if request.url.host == "agent" and request.url.path.endswith(("/quiesce", "/resume")):
                 if control.lose_ack:
                     await response.aclose()
@@ -487,6 +602,642 @@ def native_protocol(config_file, tmp_path, monkeypatch):
                            runtime=runtime, start=start, model=model, client=client)
 
 
+@pytest.mark.parametrize("name", ["generation", "embedding"])
+@pytest.mark.parametrize("args", [
+    [], ["-m", "/other/model.gguf"], ["--model", "/other/model.gguf"],
+    ["--model-url", "https://example.invalid/model.gguf"],
+    ["--hf-repo", "owner/other"], ["--hf_repo", "owner/other"],
+    ["--docker-repo", "ai/other"], ["--gpt-oss-20b-default"],
+])
+def test_native_start_keeps_primary_file_authoritative(native_protocol, monkeypatch, name, args):
+    native = native_protocol
+    for key in ("MODEL", "MODEL_URL", "HF_REPO", "DOCKER_REPO"):
+        monkeypatch.setenv(f"LLAMA_ARG_{key}", "competing-primary-input")
+    configured = native.agent.config.roles[name]
+    configured.args = args
+    native.agent.roles[name].stop()
+    role = native.agent.start_role(name)
+    command = native.children[-1].command
+    owned = [
+        "--host", "127.0.0.1", "--port", str(configured.port),
+        "--model-url", "", "--hf-repo", "", "--docker-repo", "",
+        "-m", role.model_path,
+    ]
+    # The actual child argv must clear the b9960 post-parse selectors after
+    # extra args/presets and supply exactly the recorded primary loader input.
+    assert command[:1 + len(args)] == [native.agent.config.llama_server, *args]
+    assert command[1 + len(args):1 + len(args) + len(owned)] == owned
+    assert role.model_path == configured.model_path
+    assert role.revision == configured.revision
+    assert role.context_length == configured.context_length
+    role.stop()
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_native_lifespan_cleans_child_when_later_model_is_rejected(native_protocol, monkeypatch, caplog, cleanup_failure):
+    native = native_protocol
+    native.agent.stop()
+    native.agent.roles.clear()
+    native.children.clear()
+    native.events.clear()
+    link = native.agent.model_root / "linked.gguf"
+    link.symlink_to(native.model)
+    native.agent.config.roles["embedding"].model_path = str(link)
+
+    if cleanup_failure:
+        original_stop = RoleProcess.stop
+
+        def stop(role):
+            original_stop(role)
+            raise OSError("native child cleanup failed")
+
+        monkeypatch.setattr(RoleProcess, "stop", stop)
+
+    app = build_app(native.agent)
+
+    async def exercise():
+        with pytest.raises(ValueError, match="managed model paths cannot contain symlinks"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("later model admission must reject startup")
+
+    asyncio.run(exercise())
+    assert len(native.children) == 1
+    assert list(native.agent.roles) == ["generation"]
+    generation = native.agent.roles["generation"]
+    assert generation.process is native.children[0]
+    assert generation.model_path == str(native.model)
+    assert not generation.running()
+    assert native.events == ["stop"]
+    if cleanup_failure:
+        assert "native child cleanup failed" in caplog.text
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_native_lifespan_monitors_readiness_and_stops_every_child(native_protocol, monkeypatch, cleanup_failure):
+    native = native_protocol
+    native.agent.stop()
+    native.agent.roles.clear()
+    native.children.clear()
+    native.events.clear()
+    cleanup_error = OSError("generation child cleanup failed")
+    if cleanup_failure:
+        original_stop = RoleProcess.stop
+
+        def stop(role):
+            original_stop(role)
+            if role.name == "generation":
+                raise cleanup_error
+
+        monkeypatch.setattr(RoleProcess, "stop", stop)
+
+    async def exercise():
+        ready = asyncio.Event()
+        resumed = asyncio.Event()
+        wait_ready = native.agent.wait_ready
+        resume_generation = native.agent.resume_generation
+
+        async def monitor():
+            await wait_ready()
+            ready.set()
+
+        async def resume():
+            result = await resume_generation()
+            resumed.set()
+            return result
+
+        monkeypatch.setattr(native.agent, "wait_ready", monitor)
+        monkeypatch.setattr(native.agent, "resume_generation", resume)
+        app = build_app(native.agent)
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(ready.wait(), 2)
+            await asyncio.wait_for(resumed.wait(), 2)
+            assert len(native.children) == 2
+            assert all(child.alive for child in native.children)
+            assert native.events == []
+
+    if cleanup_failure:
+        with pytest.raises(OSError) as error:
+            asyncio.run(exercise())
+        assert error.value is cleanup_error
+    else:
+        asyncio.run(exercise())
+    assert all(not child.alive for child in native.children)
+    assert native.events == ["stop", "stop"]
+
+
+@pytest.mark.parametrize("layout", ["staged", "spaces", "boundary", "unicode-boundary", "punctuation"])
+def test_native_manifest_projects_started_files_and_metadata_end_to_end(native_protocol, layout):
+    native = native_protocol
+    expected = {}
+    for name, revision, context in (("generation", "c" * 40, 4096), ("embedding", "d" * 40, 1024)):
+        relative = f"staged/{name}/{'e' * 64}/artifact"
+        if layout == "spaces":
+            relative = f"parent with spaces/{name}/model.gguf"
+        elif layout == "boundary":
+            relative = f"{name}/" + "nested dir/" * 44
+            relative += "x" * (504 - len(relative) - len("file.gguf")) + "file.gguf"
+            assert len(f"/models/{relative}".encode("utf-8")) == 512
+        elif layout == "unicode-boundary":
+            relative = f"{name}/" + "é/" * 160
+            relative += "x" * (504 - len(relative.encode("utf-8")) - len("file.gguf")) + "file.gguf"
+            assert len(f"/models/{relative}".encode("utf-8")) == 512
+        elif layout == "punctuation":
+            relative = f"modèles (reviewed)/{name}/weights..v2;[Q4]\\final.gguf"
+        path = native.agent.model_root / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes(name.encode())
+        native.agent.roles[name].stop()
+        configured = native.agent.config.roles[name]
+        configured.model_path = str(path)
+        configured.revision = revision
+        configured.context_length = context
+        native.agent.roles[name] = native.agent.start_role(name)
+        expected[name] = {
+            "status": "healthy", "model": f"/models/{relative}",
+            "revision": revision, "context_length": context,
+        }
+        # Changing desired configuration must not relabel the running child.
+        configured.model_path = str(native.model)
+        configured.revision = "f" * 40
+        configured.context_length = 32768
+    native.agent.config.roles.pop("embedding")
+    native.agent.available_engines = [{
+        "name": "llama.cpp", "version": "b9960-discovery-only",
+        "adapter": "metal-host-agent", "variants": ["metal-arm64"],
+    }]
+
+    async def exercise():
+        async with native.client(base_url="http://agent", headers={"Authorization": "Bearer agent-secret"}) as admin:
+            response = await admin.get("/agent/manifest")
+            assert response.status_code == 200
+            assert response.json()["roles"] == expected
+            assert str(native.agent.model_root) not in response.text
+        appliance = native.runtime()
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                response = await client.get("/runtime/manifest")
+                assert response.status_code == 200
+                manifest = response.json()
+                for name, observed in expected.items():
+                    assert manifest["roles"][name]["status"] == "healthy"
+                    assert manifest["roles"][name]["engine_model"] == observed["model"]
+                    assert manifest["roles"][name]["revision"] == observed["revision"]
+                    assert manifest["roles"][name]["context_length"] == observed["context_length"]
+                assert manifest["roles"]["embedding"]["dimensions"] == 384
+                assert str(native.agent.model_root) not in response.text
+                assert appliance.backend.engine_version() is None
+                assert "engine" not in manifest and "vllm_version" not in manifest
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", [
+    "missing", "outside", "sibling-root", "file-symlink", "directory-symlink",
+    "internal-symlink", "directory", "relative", "dot", "parent", "duplicate-slash", "empty",
+    "oversized", "control-character", "unicode-oversized",
+])
+def test_native_manifest_withholds_unprovable_file_identity(native_protocol, failure):
+    native = native_protocol
+    root = native.agent.model_root
+    path = native.model
+    if failure == "missing":
+        path.unlink()
+    elif failure == "outside":
+        path = root.parent / f"{root.name}-outside.gguf"
+        path.write_bytes(b"outside")
+    elif failure == "sibling-root":
+        path = root.with_name(root.name + "-other") / "model.gguf"
+        path.parent.mkdir()
+        path.write_bytes(b"outside")
+    elif failure in {"file-symlink", "internal-symlink"}:
+        target = root.parent / f"{root.name}-outside.gguf" if failure == "file-symlink" else root / "other.gguf"
+        target.write_bytes(b"other")
+        path.unlink()
+        path.symlink_to(target)
+    elif failure == "directory-symlink":
+        target = root / "renamed-generation"
+        path.parent.rename(target)
+        path.parent.symlink_to(target, target_is_directory=True)
+    elif failure == "directory":
+        path = root
+    elif failure == "relative":
+        path = "generation/model.gguf"
+    elif failure == "dot":
+        path = f"{root}/generation/./model.gguf"
+    elif failure == "parent":
+        path = f"{root}/generation/../generation/model.gguf"
+    elif failure == "duplicate-slash":
+        path = f"{root}/generation//model.gguf"
+    elif failure == "empty":
+        path = ""
+    elif failure in {"oversized", "control-character", "unicode-oversized"}:
+        relative = {
+            "oversized": "nested dir/" * 45 + "xfile.gguf",
+            "control-character": "model\tname.gguf",
+            "unicode-oversized": "é/" * 165 + "xfile.gguf",
+        }[failure]
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"unsupported native path")
+    native.agent.roles["generation"].model_path = str(path)
+
+    async def exercise():
+        async with native.client(base_url="http://agent", headers={"Authorization": "Bearer agent-secret"}) as admin:
+            response = await admin.get("/agent/manifest")
+            assert response.status_code == 200
+            observed = response.json()["roles"]
+            assert observed["generation"] == {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED"}
+            assert observed["embedding"]["status"] == "healthy"
+            assert str(root) not in response.text
+        appliance = native.runtime()
+        try:
+            await appliance.backend.start(appliance.config, appliance.state.transition)
+            assert appliance.backend.role_info("generation").status == "unhealthy"
+            assert appliance.backend.role_info("generation").engine_model is None
+            assert appliance.backend.role_client("generation") is None
+            assert appliance.backend.role_info("embedding").status == "healthy"
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("change", ["wrong-role", "replaced", "removed"])
+def test_native_manifest_rejects_changed_role_ownership(native_protocol, monkeypatch, change):
+    native = native_protocol
+    role = native.agent.roles["generation"]
+
+    async def healthy():
+        if change == "wrong-role":
+            role.name = "embedding"
+        elif change == "replaced":
+            native.agent.roles["generation"] = native.agent.roles["embedding"]
+        else:
+            native.agent.roles.pop("generation")
+        return True
+
+    monkeypatch.setattr(role, "healthy", healthy)
+
+    async def exercise():
+        async with native.client(base_url="http://agent", headers={"Authorization": "Bearer agent-secret"}) as admin:
+            roles = (await admin.get("/agent/manifest")).json()["roles"]
+            assert roles["generation"] == {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED"}
+            assert roles["embedding"]["status"] == "healthy"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("model", [
+    None, "model.gguf", "owner/model", "/private/models/model.gguf", "/models",
+    "/models/", "/models/../model.gguf", "/models/./model.gguf", "/models//model.gguf",
+    "/models/" + "nested dir/" * 45 + "xfile.gguf", "/models/" + "a" * 256,
+    "/models/" + "é/" * 165 + "xfile.gguf", "/models/" + "é" * 128,
+    "/models/model\tname.gguf", "/models/model\u0085name.gguf", "/models/model\ud800.gguf",
+])
+def test_native_backend_rejects_legacy_or_ambiguous_model_identity(native_protocol, monkeypatch, model):
+    native = native_protocol
+    appliance = native.runtime()
+
+    async def manifest(_enabled):
+        return {
+            "engine": "llama.cpp", "backend": "metal", "generation_paused": False,
+            "roles": {name: {"status": "healthy", "model": model} for name in ("generation", "embedding")},
+        }
+
+    monkeypatch.setattr(appliance.backend, "_wait_for_agent", manifest)
+
+    async def exercise():
+        try:
+            await appliance.backend.start(appliance.config, appliance.state.transition)
+            for name in ("generation", "embedding"):
+                info = appliance.backend.role_info(name)
+                assert info.status == "unhealthy" and info.error_code == "MODEL_LOAD_FAILED"
+                assert info.engine_model is None
+                assert appliance.backend.role_client(name) is None
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("name,generation_enabled", [("generation", True), ("embedding", True), ("embedding", False)])
+@pytest.mark.parametrize("failure", ["missing", "file-symlink", "replaced", "removed", "revision", "context_length"])
+@pytest.mark.parametrize("probe", ["/runtime/manifest", "/health/ready", "/health", "/v1/models", "forward"])
+def test_native_runtime_withdraws_current_role_proof(native_protocol, config_file, name, generation_enabled, failure, probe):
+    native = native_protocol
+    raw = yaml.safe_load(config_file.read_text())
+    raw["roles"]["generation"]["enabled"] = generation_enabled
+    config_file.write_text(yaml.safe_dump(raw))
+    role = native.agent.roles[name]
+    path = native.agent.model_root / name / "model.gguf"
+    original = path.read_bytes()
+    started = {"model_path": role.model_path, "revision": role.revision, "context_length": role.context_length}
+    endpoints = {
+        "generation": ("/v1/chat/completions", {"model": "assistant-dev", "messages": []}),
+        "embedding": ("/v1/embeddings", {"model": "embedding-custom", "input": "independent"}),
+    }
+
+    async def exercise():
+        appliance = native.runtime()
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                assert (await client.get("/health/ready")).status_code == 200
+                before = (await client.get("/runtime/manifest")).json()["roles"]
+                assert before[name]["status"] == "healthy"
+                assert before[name]["engine_model"] == f"/models/{name}/model.gguf"
+                if name == "embedding":
+                    assert before[name]["dimensions"] == 384
+                if failure == "missing":
+                    path.unlink()
+                elif failure == "file-symlink":
+                    target = path.with_name("symlink-target.gguf")
+                    target.write_bytes(original)
+                    path.unlink()
+                    path.symlink_to(target)
+                elif failure == "replaced":
+                    replacement = path.with_name("replacement.gguf")
+                    replacement.write_bytes(b"different managed model")
+                    role.model_path = str(replacement)
+                elif failure == "removed":
+                    native.agent.roles.pop(name)
+                elif failure == "revision":
+                    role.revision = "e" * 40
+                else:
+                    role.context_length *= 2
+                assert role.running()  # A live loaded child is not current file/identity proof.
+                calls = native.events.count(name)
+                if probe == "forward":
+                    endpoint, body = endpoints[name]
+                    assert (await client.post(endpoint, json=body)).status_code == 503
+                else:
+                    observed = await client.get(probe)
+                    if probe == "/health/ready":
+                        assert observed.status_code == 503
+                    elif probe == "/v1/models":
+                        assert endpoints[name][1]["model"] not in {item["id"] for item in observed.json()["data"]}
+                    else:
+                        assert observed.json()["roles"][name]["status"] == "unhealthy"
+                info = appliance.backend.role_info(name)
+                assert info.status == "unhealthy" and info.error_code == "MODEL_LOAD_FAILED"
+                assert info.engine_model is None and info.revision is None and info.context_length is None
+                assert info.dimensions is None and info.modalities is None
+                assert native.events.count(name) == calls
+                assert appliance.backend.generation_paused is (name == "generation")
+                assert native.agent.generation_admission_paused is False
+                manifest = (await client.get("/runtime/manifest")).json()["roles"]
+                assert not {"engine_model", "revision", "context_length", "dimensions", "modalities"}.intersection(manifest[name])
+                ready = await client.get("/health/ready")
+                assert ready.status_code == 503 and ready.json()["required_roles"][name] is False
+                if generation_enabled:
+                    other = "embedding" if name == "generation" else "generation"
+                    assert manifest[other] == before[other]
+                    endpoint, body = endpoints[other]
+                    assert (await client.post(endpoint, json=body)).status_code == 200
+                # Restoring the same proof does not silently accept either the
+                # replacement or the old identity, and cannot reopen generation.
+                if failure in {"missing", "file-symlink"}:
+                    if path.is_symlink():
+                        path.unlink()
+                    path.write_bytes(original)
+                native.agent.roles[name] = role
+                for field, value in started.items():
+                    setattr(role, field, value)
+                assert (await client.get("/runtime/manifest")).json()["roles"][name]["status"] == "unhealthy"
+                assert (await client.get("/health/ready")).status_code == 503
+                endpoint, body = endpoints[name]
+                assert (await client.post(endpoint, json=body)).status_code == 503
+                assert native.events.count(name) == calls
+                assert appliance.backend.generation_paused is (name == "generation")
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("name,generation_enabled", [("generation", True), ("embedding", True), ("embedding", False)])
+@pytest.mark.parametrize("failure", ["role-null", "role-list", "status", "model-null", "model-list", "model-relative", "model-traversal"])
+def test_native_runtime_rejects_malformed_current_role_proof(native_protocol, config_file, name, generation_enabled, failure):
+    native = native_protocol
+    raw = yaml.safe_load(config_file.read_text())
+    raw["roles"]["generation"]["enabled"] = generation_enabled
+    config_file.write_text(yaml.safe_dump(raw))
+
+    def malformed(manifest):
+        role = manifest["roles"][name]
+        if failure == "role-null":
+            manifest["roles"][name] = None
+        elif failure == "role-list":
+            manifest["roles"][name] = []
+        elif failure == "status":
+            role["status"] = True
+        else:
+            role["model"] = {"model-null": None, "model-list": [], "model-relative": "model.gguf", "model-traversal": "/models/../model.gguf"}[failure]
+        return manifest
+
+    async def exercise():
+        appliance = native.runtime()
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                assert (await client.get("/health/ready")).status_code == 200
+                native.control.manifest_transform = malformed
+                calls = native.events.count(name)
+                endpoint, body = (
+                    ("/v1/completions", {"model": "assistant-dev", "prompt": "must not forward"})
+                    if name == "generation" else
+                    ("/v1/embeddings", {"model": "embedding-custom", "input": "must not forward"})
+                )
+                assert (await client.post(endpoint, json=body)).status_code == 503
+                assert native.events.count(name) == calls
+                manifest = (await client.get("/runtime/manifest")).json()["roles"]
+                assert manifest[name]["status"] == "unhealthy"
+                assert not {"engine_model", "revision", "context_length", "dimensions", "modalities"}.intersection(manifest[name])
+                if generation_enabled:
+                    other = "embedding" if name == "generation" else "generation"
+                    assert manifest[other]["status"] == "healthy"
+                native.control.manifest_transform = None
+                assert (await client.get("/health/ready")).status_code == 503
+                assert (await client.post(endpoint, json=body)).status_code == 503
+                assert appliance.backend.generation_paused is (name == "generation")
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["manifest-null", "manifest-list", "roles-missing", "roles-null", "roles-list", "backend", "engine"])
+def test_native_runtime_rejects_replaced_current_manifest(native_protocol, failure):
+    native = native_protocol
+
+    def malformed(manifest):
+        if failure == "manifest-null":
+            return None
+        if failure == "manifest-list":
+            return []
+        if failure == "roles-missing":
+            manifest.pop("roles")
+        elif failure == "roles-null":
+            manifest["roles"] = None
+        elif failure == "roles-list":
+            manifest["roles"] = []
+        elif failure == "backend":
+            manifest["backend"] = "unexpected"
+        elif failure == "engine":
+            manifest["engine"] = "slimserve"
+        return manifest
+
+    async def exercise():
+        appliance = native.runtime()
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                assert (await client.get("/health/ready")).status_code == 200
+                native.control.manifest_transform = malformed
+                response = await client.get("/runtime/manifest")
+                assert response.status_code == 200
+                manifest = response.json()
+                assert manifest["generation_paused"] is True
+                for name in ("generation", "embedding"):
+                    role = manifest["roles"][name]
+                    if failure == "engine" and name == "embedding":
+                        assert role["status"] == "healthy" and role["dimensions"] == 384
+                        assert (await client.post("/v1/embeddings", json={"model": "embedding-custom", "input": "independent"})).status_code == 200
+                    else:
+                        assert role["status"] == "unhealthy"
+                        assert not {"engine_model", "revision", "context_length", "dimensions", "modalities"}.intersection(role)
+                assert (await client.get("/health/ready")).status_code == 503
+                native.control.manifest_transform = None
+                assert (await client.get("/health/ready")).status_code == 503
+                assert (await client.post("/v1/completions", json={"model": "assistant-dev", "prompt": "still fenced"})).status_code == 503
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_native_runtime_embedding_only_ignores_paused_host_generation(native_protocol, config_file):
+    native = native_protocol
+    raw = yaml.safe_load(config_file.read_text())
+    raw["roles"]["generation"]["enabled"] = False
+    config_file.write_text(yaml.safe_dump(raw))
+
+    async def exercise():
+        appliance = native.runtime()
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                assert (await client.get("/health/ready")).status_code == 200
+                native.agent.generation_admission_paused = True
+                native.model.unlink()
+                ready = await client.get("/health/ready")
+                assert ready.status_code == 200 and ready.json()["required_roles"] == {"embedding": True}
+                manifest = (await client.get("/runtime/manifest")).json()
+                assert manifest["roles"]["generation"]["status"] == "disabled"
+                assert manifest["roles"]["embedding"]["status"] == "healthy"
+                assert manifest["roles"]["embedding"]["dimensions"] == 384
+                assert manifest["generation_paused"] is False
+                body = {"model": "embedding-custom", "input": "generation is not required"}
+                assert (await client.post("/v1/embeddings", json=body)).status_code == 200
+                # Disabling generation must not disable fresh embedding proof.
+                (native.agent.model_root / "embedding/model.gguf").unlink()
+                calls = native.events.count("embedding")
+                assert (await client.post("/v1/embeddings", json=body)).status_code == 503
+                assert native.events.count("embedding") == calls
+                assert (await client.get("/health/ready")).status_code == 503
+                assert native.agent.generation_admission_paused is True
+        finally:
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_native_runtime_current_proof_withdrawal_preserves_admitted_stream(native_protocol):
+    native = native_protocol
+
+    async def exercise():
+        appliance = native.runtime()
+        stream = None
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                stream = asyncio.create_task(client.post("/v1/chat/completions", json={
+                    "model": "assistant-dev", "messages": [], "stream": True,
+                }))
+                await asyncio.wait_for(native.control.stream_started.wait(), 2)
+                native.model.unlink()
+                assert (await client.get("/health/ready")).status_code == 503
+                assert appliance.backend.role_client("generation") is None
+                assert not stream.done() and not native.control.stream_closed.is_set()
+                assert native.agent.generation_requests == 1 and native.children[0].alive
+                assert (await client.post("/v1/completions", json={"model": "assistant-dev", "prompt": "new request"})).status_code == 503
+                assert (await client.post("/v1/embeddings", json={"model": "embedding-custom", "input": "independent"})).status_code == 200
+                native.control.stream_finish.set()
+                result = await asyncio.wait_for(stream, 2)
+                assert result.status_code == 200 and "data: [DONE]" in result.text
+                assert native.control.stream_closed.is_set() and native.agent.generation_requests == 0
+                assert native.children[0].alive and native.children[1].alive
+                assert (await client.get("/health/ready")).status_code == 503
+        finally:
+            if stream is not None and not stream.done():
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("name", ["generation", "embedding"])
+def test_native_runtime_rechecks_current_proof_after_admission_wait(native_protocol, monkeypatch, name):
+    from contextlib import asynccontextmanager
+
+    from lazarus.appliance.api import Admission
+
+    native = native_protocol
+
+    async def exercise():
+        waiting, admit = asyncio.Event(), asyncio.Event()
+        original_slot = Admission.slot
+
+        @asynccontextmanager
+        async def delayed_slot(self, role):
+            async with original_slot(self, role):
+                waiting.set()
+                await admit.wait()
+                yield
+
+        monkeypatch.setattr(Admission, "slot", delayed_slot)
+        appliance = native.runtime()
+        pending = None
+        try:
+            await native.start(appliance)
+            async with native.client(base_url="http://runtime", headers={"Authorization": "Bearer runtime-secret"}) as client:
+                assert (await client.get("/health/ready")).status_code == 200
+                calls = native.events.count(name)
+                endpoint, body = (
+                    ("/v1/completions", {"model": "assistant-dev", "prompt": "queued"})
+                    if name == "generation" else
+                    ("/v1/embeddings", {"model": "embedding-custom", "input": "queued"})
+                )
+                pending = asyncio.create_task(client.post(endpoint, json=body))
+                await asyncio.wait_for(waiting.wait(), 2)
+                (native.agent.model_root / name / "model.gguf").unlink()
+                admit.set()
+                assert (await asyncio.wait_for(pending, 2)).status_code == 503
+                assert native.events.count(name) == calls
+                assert appliance.backend.role_info(name).status == "unhealthy"
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+            await appliance.backend.shutdown()
+
+    asyncio.run(exercise())
+
+
 def test_native_runtime_quiesce_restart_embedding_and_restore(native_protocol):
     native = native_protocol
 
@@ -515,7 +1266,7 @@ def test_native_runtime_quiesce_restart_embedding_and_restore(native_protocol):
                 assert observed["generation_paused"] is True
                 assert generation.running() and embedding.running()
                 response = await admin.put("/agent/admin/roles/embedding", json={
-                    "artifact": native.model.name, "revision": "c" * 40,
+                    "artifact": native.model.relative_to(native.agent.model_root).as_posix(), "revision": "c" * 40,
                     "sha256": hashlib.sha256(native.model.read_bytes()).hexdigest(),
                 })
                 assert response.status_code == 200
@@ -783,7 +1534,10 @@ def test_native_restart_never_discards_host_pause_or_uncertainty(native_protocol
 def test_native_extra_child_credentials_are_not_an_admission_bypass(native_protocol, flag):
     before = len(native_protocol.children)
     with pytest.raises(ValueError, match="agent-owned"):
-        RoleProcess("generation", ["llama-server", flag, "unowned-key"], 9101, str(native_protocol.model))
+        RoleProcess(
+            "generation", ["llama-server", flag, "unowned-key"], 9101, str(native_protocol.model),
+            revision=None, context_length=None,
+        )
     assert len(native_protocol.children) == before
 
 

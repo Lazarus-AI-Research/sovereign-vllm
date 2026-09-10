@@ -84,20 +84,7 @@ class SlimServeAgentBackend(AgentBackend):
         info = {field.name: accepted[field.name] for field in fields(RoleInfo) if field.name in accepted}
         info["status"] = "healthy"
         self._roles["generation"] = RoleInfo(**info)
-        for name, current in self._roles.items():
-            if name == "generation" or current.status == "disabled":
-                continue
-            observed = (manifest.get("roles") or {}).get(name) or {}
-            if (
-                not isinstance(observed, dict)
-                or observed.get("status") != "healthy"
-                or observed.get("model") != current.engine_model
-                or observed.get("revision") != current.revision
-                or observed.get("context_length") != current.context_length
-            ):
-                current.status = "unhealthy"
-                current.error_code = "MODEL_LOAD_FAILED"
-                current.dimensions = None
+        self._observe_native_roles(manifest)
 
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
         if config.runtime.profile != "metal-arm64" or config.roles.generation.engine != "slimserve":
