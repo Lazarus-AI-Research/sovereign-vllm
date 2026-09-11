@@ -57,6 +57,18 @@ def test_manifest_reports_discovered_dimensions(healthy):
     assert manifest["profile"] == "mock"
     assert manifest["generation_paused"] is False
 
+def test_managed_manifest_requires_the_new_identity_wire_version(config_file, monkeypatch):
+    config = yaml.safe_load(config_file.read_text())
+    config["schema_version"] = "1.3"
+    config["runtime"]["runtime_instance_id"] = "11111111-1111-4111-8111-111111111111"
+    config["runtime"]["deployment_id"] = "22222222-2222-4222-8222-222222222222"
+    config_file.write_text(yaml.safe_dump(config))
+
+    manifest = TestClient(make_appliance(config_file, monkeypatch).app).get("/runtime/manifest").json()
+    assert manifest["schema_version"] == "1.4"
+    assert manifest["runtime_instance_id"] == config["runtime"]["runtime_instance_id"]
+    assert manifest["deployment_id"] == config["runtime"]["deployment_id"]
+
 
 @pytest.mark.parametrize("count", [1, 2, 4])
 def test_manifest_reports_exact_managed_multi_gpu_execution(

@@ -50,6 +50,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._agent_manifest: dict = {}
         self.generation_paused = False
+        self._managed_binding: tuple[str, str, str] | None = None
 
     def _headers(self, role: str | None = None) -> dict[str, str]:
         headers = {}
@@ -58,6 +59,52 @@ class AgentBackend(RoleClientMixin, EngineBackend):
         if role:
             headers["X-Sovereign-Role"] = role
         return headers
+
+    def _set_managed_binding(self, config: RuntimeConfig) -> None:
+        runtime = config.runtime
+        if runtime.runtime_instance_id is None:
+            self._managed_binding = None
+            return
+        self._managed_binding = (
+            runtime.runtime_instance_id, runtime.deployment_id, runtime.profile,
+        )
+
+    def _validate_managed_binding(self, manifest: object) -> None:
+        if self._managed_binding is None:
+            return
+        instance_id, deployment_id, profile = self._managed_binding
+        if not isinstance(manifest, dict) or (
+            manifest.get("runtime_instance_id"), manifest.get("deployment_id"), manifest.get("profile")
+        ) != (instance_id, deployment_id, profile):
+            self.generation_paused = True
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "managed host agent identity does not match Runtime binding")
+
+    def _require_managed_role_engines(self, manifest: object) -> None:
+        if self._managed_binding is None:
+            return
+        self._validate_managed_binding(manifest)
+        roles = manifest.get("roles") if isinstance(manifest, dict) else None
+        generation = roles.get("generation") if isinstance(roles, dict) else None
+        embedding = roles.get("embedding") if isinstance(roles, dict) else None
+        if self.engine_name == "slimserve":
+            valid_generation = isinstance(generation, dict) and (
+                manifest.get("engine") == "slimserve" and generation.get("engine") == "slimserve"
+            )
+        else:
+            valid_generation = isinstance(generation, dict) and generation.get("engine") == self.engine_name
+        if not valid_generation or not isinstance(embedding, dict) or embedding.get("engine") != "embeddinggemma":
+            self.generation_paused = True
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "managed host agent role engines do not match Runtime binding")
+
+    async def _verify_managed_binding_before_control(self) -> None:
+        if self._managed_binding is None:
+            return
+        if not self.token:
+            raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
+            response.raise_for_status()
+            self._validate_managed_binding(response.json())
 
     def _observe_generation_admission(self, manifest: dict) -> None:
         # Passive observations may close Runtime ingress, never reopen it. Model
@@ -116,8 +163,11 @@ class AgentBackend(RoleClientMixin, EngineBackend):
             return
         try:
             manifest = response.json()
-        except ValueError:
+            self._validate_managed_binding(manifest)
+            self._require_managed_role_engines(manifest)
+        except (ValueError, TypeError, AttributeError, BackendStartError):
             manifest = None
+            self.generation_paused = True
         self._observe_native_roles(manifest)
         if generation_enabled:
             try:
@@ -133,6 +183,8 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                 response = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
                 response.raise_for_status()
                 manifest = response.json()
+            self._validate_managed_binding(manifest)
+            self._require_managed_role_engines(manifest)
             available = manifest.get("available_engines")
             if not isinstance(available, list) or len(available) > 8:
                 return []
@@ -144,11 +196,12 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                     and entry.get("variants") == (
                         ["metal"] if entry["name"] == "slimserve" else ["metal-arm64"]
                     )]
-        except (httpx.HTTPError, ValueError, AttributeError):
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, BackendStartError):
             return []
 
     async def start(self, config: RuntimeConfig, on_state: Callable[[str], None]) -> None:
         on_state("loading")
+        self._set_managed_binding(config)
         enabled = [name for name, role in config.roles.items() if role.enabled]
         manifest = await self._wait_for_agent(enabled)
         if self.engine_name == "llama.cpp" and (
@@ -165,6 +218,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                     raise BackendStartError("MODEL_LOAD_FAILED", "host engine cutback is not ready")
             except httpx.HTTPError as exc:
                 raise BackendStartError("MODEL_LOAD_FAILED", "host llama generation cutback failed") from exc
+        self._require_managed_role_engines(manifest)
         self._agent_manifest = manifest
         if "generation" in enabled:
             self._observe_generation_admission(manifest)
@@ -221,6 +275,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                     raise BackendStartError("ENGINE_RESUME_FAILED", "host generation could not resume") from exc
 
     async def quiesce(self) -> None:
+        await self._verify_managed_binding_before_control()
         self.generation_paused = True
         if not self.token:
             raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
@@ -238,6 +293,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                 raise RuntimeError("host engine did not acknowledge generation idle")
 
     async def resume(self) -> None:
+        await self._verify_managed_binding_before_control()
         self.generation_paused = True
         if not self.token:
             raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
@@ -266,6 +322,7 @@ class AgentBackend(RoleClientMixin, EngineBackend):
                     resp = await client.get(f"{self.url}/agent/manifest", headers=self._headers())
                     if resp.status_code == 200:
                         manifest = resp.json()
+                        self._validate_managed_binding(manifest)
                         roles = manifest.get("roles") or {}
                         pending = [
                             name

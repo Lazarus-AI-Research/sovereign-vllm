@@ -51,6 +51,27 @@ roles:
     assert config.roles["generation"].revision == "69536a21d70340464240401ba38223d805f6a709"
 
 
+def test_managed_agent_requires_embeddinggemma_and_uses_its_native_command():
+    generation = AgentRole(model_path="/models/generation.gguf", port=9101)
+    embedding = AgentRole(model_path="/models/embedding.gguf", port=9102, engine="embeddinggemma")
+    config = AgentConfig(
+        roles={"generation": generation, "embedding": embedding},
+        runtime_instance_id="11111111-1111-4111-8111-111111111111",
+        deployment_id="22222222-2222-4222-8222-222222222222",
+        llama_server="/installed/llama-server", embeddinggemma="/installed/embeddinggemma",
+    )
+    command = Agent(config).role_command("embedding")
+    assert command == [
+        "/installed/embeddinggemma", "--bind", "127.0.0.1", "--port", "9102",
+        "--backend", "metal", "--model", "/models/embedding.gguf",
+    ]
+    with pytest.raises(ValueError, match="embeddinggemma"):
+        AgentConfig(
+            roles={"generation": generation, "embedding": AgentRole(model_path="/models/embedding.gguf", port=9102)},
+            runtime_instance_id="11111111-1111-4111-8111-111111111111",
+            deployment_id="22222222-2222-4222-8222-222222222222",
+        )
+
 def test_config_rejects_unknown_keys(tmp_path):
     path = tmp_path / "agent.yaml"
     path.write_text("roles: {}\nmystery: true\n")
@@ -160,6 +181,8 @@ def test_manifest_shape(client):
     assert body["engine"] == "llama.cpp"
     assert body["backend"] == "metal"
     assert body["roles"] == {}
+
+
 
 
 def test_proxy_requires_known_role(client):
