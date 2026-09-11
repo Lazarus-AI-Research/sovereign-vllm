@@ -32,6 +32,7 @@ class SlimServeAgentBackend(AgentBackend):
     def _accept_manifest(self, manifest: dict) -> None:
         if self._config is None:
             raise BackendStartError("CONFIG_INVALID", "native generation configuration is missing")
+        self._require_managed_role_engines(manifest)
         if not isinstance(manifest, dict) or not isinstance(manifest.get("roles"), dict):
             raise BackendStartError("CONFIG_INVALID", "native manifest has no typed role observations")
         role = (manifest.get("roles") or {}).get("generation") or {}
@@ -92,12 +93,18 @@ class SlimServeAgentBackend(AgentBackend):
         if not self.token:
             raise BackendStartError("HOST_AGENT_UNREACHABLE", "the host agent token is missing")
         self._config = config
+        self._set_managed_binding(config)
+        await self._verify_managed_binding_before_control()
         # Control's generation role is the only mutation authority carried over
-        # this boundary. API key env names, URLs and independently placed roles
-        # are never forwarded as host configuration.
+        # this boundary. The paired managed identity remains in the private
+        # document so an authenticated but wrong agent cannot accept it.
+        runtime = {"profile": config.runtime.profile}
+        if config.runtime.runtime_instance_id is not None:
+            runtime["runtime_instance_id"] = config.runtime.runtime_instance_id
+            runtime["deployment_id"] = config.runtime.deployment_id
         host_config = RuntimeConfig.model_validate({
             "schema_version": config.schema_version,
-            "runtime": {"profile": config.runtime.profile},
+            "runtime": runtime,
             "roles": {"generation": config.roles.generation.model_dump(exclude_unset=True)},
         })
         self._wire = host_config.model_dump(exclude_unset=True)
@@ -148,6 +155,7 @@ class SlimServeAgentBackend(AgentBackend):
             await asyncio.gather(task, return_exceptions=True)
         try:
             if self._owns_generation:
+                await self._verify_managed_binding_before_control()
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.request(
                         "DELETE", f"{self.url}/agent/admin/roles/generation",
@@ -164,6 +172,7 @@ class SlimServeAgentBackend(AgentBackend):
 
 
     async def quiesce(self) -> None:
+        await self._verify_managed_binding_before_control()
         self.generation_paused = True
         async with httpx.AsyncClient(timeout=600.0) as client:
             response = await client.post(
@@ -174,6 +183,7 @@ class SlimServeAgentBackend(AgentBackend):
                 raise RuntimeError("host engine did not acknowledge scheduler idle")
 
     async def resume(self) -> None:
+        await self._verify_managed_binding_before_control()
         self.generation_paused = True
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(

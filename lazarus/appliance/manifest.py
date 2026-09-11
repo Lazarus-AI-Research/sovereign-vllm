@@ -104,7 +104,7 @@ class ManifestBuilder:
             accelerator = probe()
 
         manifest: dict = {
-            "schema_version": "1.3",
+            "schema_version": "1.4" if self.config and self.config.runtime.runtime_instance_id else "1.3",
             "runtime_id": f"sovereign-runtime-{self.profile}-{RUNTIME_VERSION}",
             "runtime_version": RUNTIME_VERSION,
             "backend": self.backend.backend_id,
@@ -122,6 +122,9 @@ class ManifestBuilder:
                 "metrics": "ok",
             },
         }
+        if self.config and self.config.runtime.runtime_instance_id:
+            manifest["runtime_instance_id"] = self.config.runtime.runtime_instance_id
+            manifest["deployment_id"] = self.config.runtime.deployment_id
         engine_version = self.backend.engine_version()
         if engine_version is not None:
             if self.backend.engine_name == "vllm":

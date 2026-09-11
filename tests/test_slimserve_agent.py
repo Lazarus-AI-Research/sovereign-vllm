@@ -20,6 +20,20 @@ from lazarus.appliance.launcher import Appliance
 
 HEADERS = {"Authorization": "Bearer agent-secret"}
 
+MANAGED_INSTANCE_ID = "11111111-1111-4111-8111-111111111111"
+MANAGED_DEPLOYMENT_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def managed_slimserve_config(config):
+    wire = config.model_dump(exclude_unset=True)
+    wire["schema_version"] = "1.3"
+    wire["runtime"] = {
+        "profile": "metal-arm64",
+        "runtime_instance_id": MANAGED_INSTANCE_ID,
+        "deployment_id": MANAGED_DEPLOYMENT_ID,
+    }
+    return RuntimeConfig.model_validate(wire)
+
 
 @pytest.fixture
 def native(tmp_path, monkeypatch):
@@ -56,7 +70,7 @@ def native(tmp_path, monkeypatch):
             process_count += 1
             self.name, self.key = name, f"{name}-{process_count}"
             self.model_path, self.port = role.model_path, role.port
-            self.revision, self.context_length = role.revision, role.context_length
+            self.revision, self.context_length, self.engine = role.revision, role.context_length, role.engine
             if name == "generation":
                 assert not live, "overlapping generation processes"
                 live.add(self.key)
@@ -165,7 +179,7 @@ def native(tmp_path, monkeypatch):
     config_path = tmp_path / "agent.yaml"
     agent = Agent(AgentConfig(roles={
         "generation": AgentRole(model_path=str(old_model), port=9101, revision="d" * 40),
-        "embedding": AgentRole(model_path=str(old_model), port=9102, revision="e" * 40),
+        "embedding": AgentRole(model_path=str(old_model), port=9102, revision="e" * 40, engine="embeddinggemma"),
     }), config_path)
     agent.save_config()
     monkeypatch.setattr(agent, "start_role", lambda name: Process(name, agent.config.roles[name]))
@@ -457,6 +471,119 @@ def test_remote_sends_only_typed_generation_and_keeps_embedding_proxy(native, mo
 
     asyncio.run(exercise())
     assert recorded[0].method == "PUT" and recorded[-1].method == "DELETE"
+
+
+def test_managed_slimserve_forwards_exact_instance_identity(native, monkeypatch):
+    config = managed_slimserve_config(native.config)
+    recorded = []
+    payload = {"engine_model": str(native.model), "revision": "b" * 40, "context_length": 1024}
+    manifest = {
+        "engine": "slimserve", "configured_engine": "slimserve", "backend": "metal", "profile": "metal-arm64",
+        "runtime_instance_id": MANAGED_INSTANCE_ID, "deployment_id": MANAGED_DEPLOYMENT_ID,
+        "state": "healthy", "errors": [], "generation_paused": False,
+        "roles": {
+            "generation": {"status": "healthy", "engine": "slimserve", "engine_model": str(native.model), "model": str(native.model)},
+            "embedding": {"status": "healthy", "engine": "embeddinggemma", "model": "/models/embedding/model.gguf", "revision": "e" * 40},
+        },
+        "observation": payload,
+        "model_mapping": {"runtime": config.roles.generation.model, "host": str(native.model)},
+    }
+
+    def handle(request):
+        import json
+
+        recorded.append(request)
+        if request.method == "PUT":
+            wire = json.loads(request.content)
+            assert wire["runtime"] == {
+                "profile": "metal-arm64",
+                "runtime_instance_id": MANAGED_INSTANCE_ID,
+                "deployment_id": MANAGED_DEPLOYMENT_ID,
+            }
+            assert set(wire["roles"]) == {"generation"}
+            return httpx.Response(200, json={"status": "healthy"})
+        if request.method == "GET":
+            return httpx.Response(200, json=manifest)
+        assert request.method == "DELETE"
+        return httpx.Response(200, json={"status": "stopped"})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: original_client(*args, transport=httpx.MockTransport(handle), **kwargs))
+    monkeypatch.setattr("lazarus.appliance.backends.slimserve_agent.validate_observation", lambda _, observed: observed)
+    backend = SlimServeAgentBackend()
+
+    async def exercise():
+        await backend.start(config, lambda _: None)
+        await backend.shutdown()
+
+    asyncio.run(exercise())
+    assert [request.method for request in recorded].count("PUT") == 1
+
+
+def test_managed_host_identity_fences_control_before_mutation(native, monkeypatch):
+    config = managed_slimserve_config(native.config)
+    seen = []
+
+    def handle(request):
+        seen.append(request.method)
+        assert request.method == "GET"
+        return httpx.Response(200, json={
+            "runtime_instance_id": MANAGED_INSTANCE_ID,
+            "deployment_id": "33333333-3333-4333-8333-333333333333",
+            "profile": "metal-arm64",
+        })
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: original_client(*args, transport=httpx.MockTransport(handle), **kwargs))
+    backend = AgentBackend()
+    backend._set_managed_binding(config)
+    with pytest.raises(BackendStartError, match="identity"):
+        asyncio.run(backend.quiesce())
+    assert seen == ["GET"] and backend.generation_paused is True
+
+
+def test_managed_agent_refuses_legacy_embedding_mutations(monkeypatch):
+    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "agent-secret")
+    agent = Agent(AgentConfig(
+        roles={
+            "generation": AgentRole(model_path="/models/generation.gguf", port=9101),
+            "embedding": AgentRole(model_path="/models/embedding.gguf", port=9102, engine="embeddinggemma"),
+        },
+        runtime_instance_id=MANAGED_INSTANCE_ID,
+        deployment_id=MANAGED_DEPLOYMENT_ID,
+    ))
+    client = TestClient(build_app(agent))
+    put = client.put("/agent/admin/roles/embedding", headers=HEADERS, json={
+        "artifact": "embedding.gguf", "revision": "a" * 40, "sha256": "b" * 64,
+    })
+    deleted = client.delete("/agent/admin/roles/embedding", headers=HEADERS)
+    assert put.status_code == deleted.status_code == 409
+    assert agent.config.roles["embedding"].engine == "embeddinggemma"
+
+
+def test_managed_agent_manifest_reports_actual_slimserve_role_engine(native):
+    config = managed_slimserve_config(native.config)
+    native.agent.config.runtime_instance_id = MANAGED_INSTANCE_ID
+    native.agent.config.deployment_id = MANAGED_DEPLOYMENT_ID
+
+    async def exercise():
+        await native.agent.configure_generation(config)
+        manifest = TestClient(build_app(native.agent)).get("/agent/manifest", headers=HEADERS).json()
+        assert manifest["engine"] == manifest["configured_engine"] == "slimserve"
+        assert manifest["roles"]["generation"]["engine"] == "slimserve"
+        assert manifest["roles"]["embedding"]["engine"] == "embeddinggemma"
+        await native.agent.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_managed_agent_rejects_mismatched_slimserve_identity(native):
+    native.agent.config.runtime_instance_id = MANAGED_INSTANCE_ID
+    native.agent.config.deployment_id = MANAGED_DEPLOYMENT_ID
+    wrong = managed_slimserve_config(native.config).model_dump(exclude_unset=True)
+    wrong["runtime"]["deployment_id"] = "33333333-3333-4333-8333-333333333333"
+    with pytest.raises(ValueError, match="identity"):
+        native.agent.translate_generation(RuntimeConfig.model_validate(wrong))
 
 
 def test_remote_monitor_clears_readiness_when_host_disappears(native, monkeypatch):

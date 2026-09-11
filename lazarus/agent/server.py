@@ -84,11 +84,12 @@ class RoleStreamingResponse(StreamingResponse):
 class RoleProcess:
     def __init__(
         self, name: str, command: list[str], port: int, model_path: str,
-        *, revision: str | None, context_length: int | None,
+        *, revision: str | None, context_length: int | None, engine: str = "llama.cpp",
     ):
         self.name = name
         self.port = port
         self.model_path = model_path
+        self.engine = engine
         # Keep loader-input metadata with this child, not a later desired config.
         self.revision = revision
         self.context_length = context_length
@@ -108,7 +109,7 @@ class RoleProcess:
             command = [*command, "--metrics"]
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path = log_dir / f"{name}.llama.log"
+        self.log_path = log_dir / f"{name}.{engine}.log"
         logger.info("starting %s: %s (log: %s)", name, " ".join(command), self.log_path)
         with open(self.log_path, "ab") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=log_file, env=child_env)
@@ -122,9 +123,10 @@ class RoleProcess:
     async def healthy(self) -> bool:
         if not self.running():
             return False
+        path = "/healthz" if self.engine == "embeddinggemma" else "/health"
         try:
             async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
-                resp = await client.get(f"http://127.0.0.1:{self.port}/health", headers=self.headers())
+                resp = await client.get(f"http://127.0.0.1:{self.port}{path}", headers=self.headers())
                 return resp.status_code == 200
         except httpx.HTTPError:
             return False
@@ -291,6 +293,14 @@ class Agent:
 
     def role_command(self, name: str) -> list[str]:
         role = self.config.roles[name]
+        if role.engine == "embeddinggemma":
+            return [
+                self.config.embeddinggemma,
+                "--bind", "127.0.0.1",
+                "--port", str(role.port),
+                "--backend", "metal",
+                "--model", role.model_path,
+            ]
         command = [
             self.config.llama_server,
             *role.args,
@@ -313,7 +323,7 @@ class Agent:
         self.observed_model(role.model_path)
         return RoleProcess(
             name, self.role_command(name), role.port, role.model_path,
-            revision=role.revision, context_length=role.context_length,
+            revision=role.revision, context_length=role.context_length, engine=role.engine,
         )
 
     def start_roles(self) -> None:
@@ -423,12 +433,25 @@ class Agent:
     def translate_generation(self, config: RuntimeConfig) -> RuntimeConfig:
         """Map only the fixed private staging layout into installer-owned storage."""
         wire = config.model_dump(exclude_unset=True)
+        expected_runtime = {"profile"}
+        managed_id = self.config.runtime_instance_id
+        if managed_id is not None:
+            expected_runtime |= {"runtime_instance_id", "deployment_id"}
+            if (
+                config.schema_version != "1.3"
+                or config.runtime.runtime_instance_id != managed_id
+                or config.runtime.deployment_id != self.config.deployment_id
+                or config.runtime.profile != self.config.hardware_profile
+            ):
+                raise ValueError("host generation identity does not match its managed agent")
+        elif config.runtime.runtime_instance_id is not None or config.runtime.deployment_id is not None:
+            raise ValueError("legacy host agent cannot accept a managed generation identity")
         if (
             set(wire) - {"schema_version", "runtime", "roles"}
-            or set(wire.get("runtime", {})) != {"profile"}
+            or set(wire.get("runtime", {})) != expected_runtime
             or set(wire.get("roles", {})) != {"generation"}
         ):
-            raise ValueError("host input permits only Runtime schema, Metal profile, and generation role")
+            raise ValueError("host input permits only Runtime schema, exact identity, Metal profile, and generation role")
         role = config.roles.generation
         if (
             config.runtime.profile != "metal-arm64"
@@ -755,18 +778,23 @@ def build_app(agent: Agent) -> FastAPI:
                 roles[name] = {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED"}
                 continue
             running = role.running()
-            roles[name] = {
+            entry = {
                 "status": "healthy" if healthy and running else ("loading" if running else "unhealthy"),
                 "model": model,
                 "context_length": role.context_length,
                 "revision": role.revision,
             }
+            if agent.config.runtime_instance_id:
+                entry["engine"] = role.engine
+            roles[name] = entry
         backend = agent.generation_backend
         native = backend is not None or agent.config.slimserve_generation is not None
         observation = backend.observation() if backend is not None else {}
         if backend is not None:
             roles["generation"] = asdict(backend.role_info("generation"))
             roles["generation"]["model"] = roles["generation"]["engine_model"]
+            if agent.config.runtime_instance_id:
+                roles["generation"]["engine"] = "slimserve"
         elif native:
             roles["generation"] = {"status": "unhealthy"}
         if agent.generation_state != "healthy" and "generation" in roles:
@@ -774,7 +802,7 @@ def build_app(agent: Agent) -> FastAPI:
                 "loading" if agent.generation_state in {"initializing", "loading", "compiling"}
                 else "unhealthy"
             )
-        return {
+        result = {
             "agent_version": AGENT_VERSION,
             "engine": "slimserve" if observation.get("engine", {}).get("name") == "slimserve" else ("unavailable" if native else "llama.cpp"),
             "configured_engine": "slimserve" if agent.config.slimserve_generation is not None else "llama.cpp",
@@ -790,6 +818,11 @@ def build_app(agent: Agent) -> FastAPI:
             "model_mapping": agent.generation_mapping if backend is not None else None,
             "available_engines": agent.available_engines,
         }
+        if agent.config.runtime_instance_id:
+            result["runtime_instance_id"] = agent.config.runtime_instance_id
+            result["deployment_id"] = agent.config.deployment_id
+            result["profile"] = agent.config.hardware_profile
+        return result
 
     @app.put("/agent/admin/roles/generation")
     async def configure_generation(request: RuntimeConfig):
@@ -885,10 +918,12 @@ def build_app(agent: Agent) -> FastAPI:
                 agent.generation_admission_paused = False
             except Exception:
                 return JSONResponse(status_code=503, content={"error": "engine resume acknowledgement failed"})
-            return {"paused": False}
+        return {"paused": False}
 
     @app.put("/agent/admin/roles/embedding")
     async def configure_embedding(request: EmbeddingRoleRequest):
+        if agent.config.runtime_instance_id is not None:
+            return JSONResponse(status_code=409, content={"error": "managed embedding role is immutable"})
         if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", request.revision):
             return JSONResponse(status_code=422, content={"error": "revision must be an immutable git commit"})
         try:
@@ -949,9 +984,10 @@ def build_app(agent: Agent) -> FastAPI:
                 "model": observed_model,
                 "revision": candidate_config.revision,
             }
-
     @app.delete("/agent/admin/roles/embedding")
     async def remove_embedding():
+        if agent.config.runtime_instance_id is not None:
+            return JSONResponse(status_code=409, content={"error": "managed embedding role is immutable"})
         async with agent.role_lock:
             previous_config = agent.config.roles.get("embedding")
             if previous_config is None:

@@ -67,6 +67,40 @@ def test_embedding_role_can_be_omitted(tmp_path, config_file):
     assert config.roles.embedding is None
     assert list(config.enabled_roles()) == ["generation"]
 
+def test_managed_runtime_identity_requires_distinct_uuid_pair(tmp_path, config_file):
+    data = yaml.safe_load(config_file.read_text())
+    instance_id = "11111111-1111-4111-8111-111111111111"
+    deployment_id = "22222222-2222-4222-8222-222222222222"
+    data["schema_version"] = "1.3"
+    data["runtime"]["runtime_instance_id"] = instance_id
+    data["runtime"]["deployment_id"] = deployment_id
+    path = tmp_path / "managed.yaml"
+    path.write_text(yaml.safe_dump(data))
+    config = load_config(path)
+    assert config.runtime.runtime_instance_id == instance_id
+    assert config.runtime.deployment_id == deployment_id
+
+    for broken in ({"runtime_instance_id": instance_id}, {"runtime_instance_id": instance_id, "deployment_id": instance_id}):
+        data["runtime"].pop("runtime_instance_id", None)
+        data["runtime"].pop("deployment_id", None)
+        data["runtime"].update(broken)
+        path.write_text(yaml.safe_dump(data))
+        with pytest.raises(ConfigError, match="runtime_instance_id"):
+            load_config(path)
+
+    data["runtime"].pop("runtime_instance_id", None)
+    data["runtime"].pop("deployment_id", None)
+    path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ConfigError, match="config schema 1.3"):
+        load_config(path)
+
+    data["schema_version"] = "1.2"
+    data["runtime"]["runtime_instance_id"] = instance_id
+    data["runtime"]["deployment_id"] = deployment_id
+    path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ConfigError, match="config schema 1.3"):
+        load_config(path)
+
 
 def test_tool_parser_field(tmp_path, config_file):
     data = yaml.safe_load(config_file.read_text())

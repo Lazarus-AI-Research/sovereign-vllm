@@ -109,15 +109,20 @@ Metal backend.
 
 ### Generation gate observations and managed controls
 
-Current Runtime publishes manifest schema **1.3**, independently of the
-compatible **1.2** configuration schema. Its required top-level
-`generation_paused` boolean reports the actual first-party generation ingress
-gate for every backend. `true` means ingress is closed, including while drain
-or an engine acknowledgement is pending and after failed or cancelled control.
-`false` means only that this ingress gate is open: it is not proof of engine
-availability, readiness, idle work, response completion, or model qualification.
-Historical manifests at 1.0–1.2 omit this observation; that absence remains
-unknown and must not be rewritten as `false`.
+Legacy fixed Runtime publishes manifest schema **1.3**, independently of the
+compatible **1.2** configuration schema. Managed Runtime instances publish
+configuration schema **1.3** and manifest schema **1.4**, pairing distinct
+lowercase UUID `runtime_instance_id` and `deployment_id` values in both
+documents. A Stack must reject managed identity on an older wire version; the
+published runtime release remains unchanged and does not thereby gain this
+capability. The required top-level `generation_paused` boolean reports the
+actual first-party generation ingress gate for every backend. `true` means
+ingress is closed, including while drain or an engine acknowledgement is
+pending and after failed or cancelled control. `false` means only that this
+ingress gate is open: it is not proof of engine availability, readiness, idle
+work, response completion, or model qualification. Historical manifests at
+1.0–1.2 omit this observation; that absence remains unknown and must not be
+rewritten as `false`.
 
 The existing bearer-authenticated, empty-body controls are
 `POST /runtime/admin/generation/quiesce` and
@@ -197,9 +202,10 @@ loaded-model state may remain healthy while the gate is closed;
 `/health/ready` and public generation remain unavailable until resume succeeds.
 Embedding admission is independent.
 
-This current source requires a Stack reader compatible with manifest 1.3. It
-does not change historical manifest acceptance or advance the published Runtime
-release pin; physical serving and release qualification remain separate.
+This current source requires a Stack reader compatible with legacy manifest
+1.3 and managed manifest 1.4. It does not change historical manifest
+acceptance, advance the published Runtime release pin, or establish physical
+serving or release qualification.
 
 ### Multi-role serving (`lazarus/appliance/backends/vllm_engine.py`)
 
@@ -248,18 +254,21 @@ Docker on macOS exposes no GPU, so the `metal-arm64` runtime keeps the
 container contract while inference runs host-side:
 
 - **`sovereign-runtime-agent`** — a launchd-managed host daemon that
-  supervises one llama.cpp server per role (multimodal projector support
-  included), fails closed without its bearer token, binds loopback only,
-  and exposes a single private port with an `/agent/manifest` and a
-  streaming role proxy.
+  supervises native generation and embedding processes, fails closed without
+  its bearer token, binds loopback only, and exposes a single private port
+  with an `/agent/manifest` and a streaming role proxy. Managed instances
+  require their exact instance/deployment identity and an EmbeddingGemma
+  embedding process; generation uses llama.cpp or the selected SlimServe path.
 - **The `agent` engine backend** — the container half. Discovers roles from
   the agent manifest, forwards role traffic, and degrades to
   `configuration_error` (alive, diagnosable, no crash loop) when the agent
   is unreachable.
 - **`agent-dist/`** — launchd plist template plus install/uninstall scripts.
   The default is the canonical `google/gemma-4-E2B-it-qat-q4_0-gguf`
-  generation model (+mmproj, reasoning budget 0). Control can add or remove a
-  checksum-verified GGUF embedding role through the constrained agent API.
+  generation model (+mmproj, reasoning budget 0). For legacy fixed agents,
+  Control can add or remove a checksum-verified GGUF embedding role through
+  the constrained agent API. Managed instances reject these legacy mutations
+  with HTTP 409; their composite configuration is owned by deployment lifecycle.
 
 Native llama roles report the actual started child's managed file identity, not
 the requested repository or the file's basename. `SOVEREIGN_AGENT_MODEL_ROOT`

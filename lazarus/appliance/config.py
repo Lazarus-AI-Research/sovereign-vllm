@@ -150,6 +150,24 @@ class RuntimeSection(BaseModel):
     port: int = Field(default=8000, ge=1, le=65535)
     api_key_env: str | None = None
     profile: str = "cpu-x86_64"
+    # Managed deployments supply durable identities before any process effect.
+    # Legacy fixed Runtime configs intentionally omit both fields.
+    runtime_instance_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    deployment_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+
+    @model_validator(mode="after")
+    def managed_instance_identity(self):
+        if (self.runtime_instance_id is None) != (self.deployment_id is None):
+            raise ValueError("runtime_instance_id and deployment_id must be configured together")
+        if self.runtime_instance_id is not None and self.runtime_instance_id == self.deployment_id:
+            raise ValueError("runtime_instance_id and deployment_id must be distinct")
+        return self
 
 
 class StartupSection(BaseModel):
@@ -200,7 +218,7 @@ class RolesSection(BaseModel):
 class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.2"]
+    schema_version: Literal["1.2", "1.3"]
     runtime: RuntimeSection = RuntimeSection()
     startup: StartupSection = StartupSection()
     roles: RolesSection
@@ -221,6 +239,9 @@ class RuntimeConfig(BaseModel):
 
     @model_validator(mode="after")
     def slimserve_placement(self):
+        managed = self.runtime.runtime_instance_id is not None
+        if (self.schema_version == "1.3") != managed:
+            raise ValueError("managed runtime identity requires config schema 1.3")
         generation = self.roles.generation
         for name, role in self.roles.items():
             if name != "generation" and role.model_fields_set.intersection({"engine", "engine_profile_id", "slimserve"}):
