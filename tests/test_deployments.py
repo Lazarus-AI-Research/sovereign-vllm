@@ -863,9 +863,9 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
     seen = {}
     real_run = deployments.run_transition
 
-    async def observed_run(agent, worker_coroutine, transition):
+    async def observed_run(agent, worker_coroutine, transition, http_request=None):
         seen["transition"] = transition
-        return await real_run(agent, worker_coroutine, transition)
+        return await real_run(agent, worker_coroutine, transition, http_request)
 
     monkeypatch.setattr(deployments, "run_transition", observed_run)
 
@@ -1042,9 +1042,9 @@ def test_a_candidate_that_dies_before_the_commit_is_rolled_back(harness, monkeyp
     seen = {}
     real_run = deployments.run_transition
 
-    async def observed_run(agent, worker_coroutine, transition):
+    async def observed_run(agent, worker_coroutine, transition, http_request=None):
         seen["transition"] = transition
-        return await real_run(agent, worker_coroutine, transition)
+        return await real_run(agent, worker_coroutine, transition, http_request)
 
     monkeypatch.setattr(deployments, "run_transition", observed_run)
 
@@ -1110,3 +1110,37 @@ def test_an_abandoned_drain_wakes_at_once(harness, monkeypatch):
 
     paused, elapsed, stopped = asyncio.run(scenario())
     assert paused is False and stopped == [] and elapsed < 1.0
+
+
+# A client that goes away mid-transition is not cancelled by the server; the
+# transition is abandoned all the same, and rolled back.
+def test_a_disconnected_request_abandons_its_transition(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    monkeypatch.setattr(deployments, "DISCONNECT_POLL", 0.02)
+
+    class GoneClient:
+        def __init__(self):
+            self.polls = 0
+
+        async def is_disconnected(self):
+            self.polls += 1
+            return self.polls > 2
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        real_wait = deployments.wait_deployment_ready
+
+        async def slow_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await asyncio.sleep(0.3)
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
+        result = await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40)), http_request=GoneClient())
+        return result, harness.agent.config.deployments["assistant-second"].revision, harness.agent.deployment_admission["assistant-second"].paused
+
+    result, revision, paused = asyncio.run(scenario())
+    assert result["status"] == "unhealthy" and result["rolled_back"] is True and "cancelled" in result["error"]
+    assert revision == "c" * 40 and paused is False

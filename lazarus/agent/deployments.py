@@ -336,7 +336,7 @@ class Transition:
         self.committing = False
 
 
-async def run_transition(agent: Agent, worker_coroutine, transition: Transition) -> dict:
+async def run_transition(agent: Agent, worker_coroutine, transition: Transition, http_request: Request | None = None) -> dict:
     worker = asyncio.create_task(worker_coroutine)
     # A worker abandoned by its request still finishes and is joined at
     # shutdown; its outcome is read so a failure there is never an
@@ -344,15 +344,33 @@ async def run_transition(agent: Agent, worker_coroutine, transition: Transition)
     agent.transitions.add(worker)
     worker.add_done_callback(agent.transitions.discard)
     worker.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    # A client that went away is not cancelled by the server; it is watched
+    # for, and its transition abandoned like a cancelled one.
+    watcher = asyncio.create_task(abandon_on_disconnect(http_request, worker, transition)) if http_request is not None else None
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
         transition.abandoned = True
         transition.gone.set()
         raise
+    finally:
+        if watcher is not None:
+            watcher.cancel()
 
 
-async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest) -> dict:
+DISCONNECT_POLL = 0.5
+
+
+async def abandon_on_disconnect(http_request: Request, worker: asyncio.Task, transition: Transition) -> None:
+    while not worker.done():
+        if await http_request.is_disconnected():
+            transition.abandoned = True
+            transition.gone.set()
+            return
+        await asyncio.sleep(DISCONNECT_POLL)
+
+
+async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, http_request: Request | None = None) -> dict:
     # Checksumming multi-gigabyte weights must not stall every other
     # deployment's stream, so it runs off the event loop.
     model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256)
@@ -360,7 +378,7 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     if request.mmproj:
         mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256)
     transition = Transition()
-    return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, transition), transition)
+    return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, transition), transition, http_request)
 
 
 async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition) -> dict:
@@ -471,9 +489,9 @@ class PersistenceError(RuntimeError):
     agent would serve again."""
 
 
-async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
+async def remove_deployment(agent: Agent, deployment_id: str, http_request: Request | None = None) -> dict:
     transition = Transition()
-    return await run_transition(agent, forget_deployment(agent, deployment_id, transition), transition)
+    return await run_transition(agent, forget_deployment(agent, deployment_id, transition), transition, http_request)
 
 
 async def forget_deployment(agent: Agent, deployment_id: str, transition: Transition) -> dict:
@@ -513,23 +531,23 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         return {"deployments": await observe_deployments(agent)}
 
     @app.put("/agent/admin/deployments/{deployment_id}")
-    async def put_deployment(deployment_id: str, request: DeploymentRequest):
+    async def put_deployment(deployment_id: str, request: DeploymentRequest, http_request: Request):
         if not DEPLOYMENT_ID.match(deployment_id):
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
         if deployment_id in RESERVED_DEPLOYMENT_IDS or deployment_id in agent.config.roles:
             return JSONResponse(status_code=409, content={"error": "a role owns that name"})
         try:
-            result = await apply_deployment(agent, deployment_id, request)
+            result = await apply_deployment(agent, deployment_id, request, http_request)
         except (OSError, ValueError, RuntimeError) as exc:
             return JSONResponse(status_code=422, content={"error": str(exc)})
         return JSONResponse(status_code=200 if result["status"] == "healthy" else 422, content=result)
 
     @app.delete("/agent/admin/deployments/{deployment_id}")
-    async def delete_deployment(deployment_id: str):
+    async def delete_deployment(deployment_id: str, http_request: Request):
         if not DEPLOYMENT_ID.match(deployment_id):
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
         try:
-            return await remove_deployment(agent, deployment_id)
+            return await remove_deployment(agent, deployment_id, http_request)
         except (PersistenceError, OSError, RuntimeError) as exc:
             # The child may still be there; the record says so, and a retry
             # stops it again.
