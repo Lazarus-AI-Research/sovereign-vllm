@@ -584,9 +584,9 @@ def test_a_candidate_rewritten_during_the_drain_is_refused(harness, monkeypatch)
         replacement = second_request(harness, revision="d" * 40)
         real_quiesce = deployments.quiesce
 
-        async def rewrite_during_drain(agent, deployment_id):
+        async def rewrite_during_drain(agent, deployment_id, transition=None):
             harness.weights.write_bytes(b"rewritten while draining")
-            return await real_quiesce(agent, deployment_id)
+            return await real_quiesce(agent, deployment_id, transition)
 
         monkeypatch.setattr(deployments, "quiesce", rewrite_during_drain)
         answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=replacement)
