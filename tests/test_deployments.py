@@ -38,12 +38,17 @@ def harness(tmp_path, monkeypatch):
     weights.write_bytes(b"second model")
     projector = models / "second-mmproj.gguf"
     projector.write_bytes(b"projector")
+    diffusion = models / "flux1-schnell-Q4_0.gguf"
+    diffusion.write_bytes(b"diffusion")
+    for name in ("clip_l-Q8_0.gguf", "t5xxl-Q8_0.gguf", "ae.safetensors"):
+        (models / name).write_bytes(name.encode())
     children, stopped = [], []
     healthy_ports = set()
     inference = []
 
     def spawn(command, **kwargs):
-        port = int(command[command.index("--port") + 1])
+        port_flag = "--port" if "--port" in command else "--listen-port"
+        port = int(command[command.index(port_flag) + 1])
         child = SimpleNamespace(alive=True, command=command, port=port, env=kwargs.get("env"))
         child.poll = lambda: None if child.alive else 0
         child.wait = lambda timeout=None: 0
@@ -85,6 +90,8 @@ def harness(tmp_path, monkeypatch):
             raise httpx.ConnectError("refused")
         if request.url.path == "/health":
             return answer({"status": "ok"})
+        if request.url.path == "/v1/models" and request.method == "GET":
+            return answer({"data": [{"id": "served", "object": "model"}]})
         inference.append((port, request.url.path, request.headers.get("Authorization"), request.content))
         if request.url.path == "/v1/embeddings":
             return answer({"data": [{"embedding": [0.1, 0.2]}]})
@@ -103,7 +110,7 @@ def harness(tmp_path, monkeypatch):
     agent.save_config()
     return SimpleNamespace(
         agent=agent, children=children, stopped=stopped, inference=inference, control=control,
-        weights=weights, projector=projector, config_path=tmp_path / "agent.yaml",
+        weights=weights, projector=projector, diffusion=diffusion, models=models, config_path=tmp_path / "agent.yaml",
         headers={"Authorization": "Bearer agent-secret"},
     )
 
@@ -1155,3 +1162,69 @@ def test_a_real_http_disconnect_abandons_the_transition(harness, monkeypatch):
 
     revision, saved, paused = asyncio.run(scenario())
     assert revision == "c" * 40 and saved == "c" * 40 and paused is False
+
+
+def image_request(harness, **overrides):
+    request = {
+        "kind": "image", "artifact": "metal/flux1-schnell-Q4_0.gguf", "sha256": digest(harness.diffusion),
+        "revision": "c" * 40, "served_model_name": "pictures",
+        "components": {
+            name: {"artifact": f"metal/{file}", "sha256": digest(harness.models / file)}
+            for name, file in (("clip_l", "clip_l-Q8_0.gguf"), ("t5xxl", "t5xxl-Q8_0.gguf"), ("vae", "ae.safetensors"))
+        },
+        "steps": 4, "cfg_scale": 1.0, "sampler": "euler",
+    }
+    request.update(overrides)
+    return request
+
+
+# An image deployment is a stable-diffusion.cpp server child: its diffusion
+# weights and the named components it loads beside them, each checksummed,
+# started with the pinned sampling, probed on its models route, and proxied
+# on the images route alone.
+def test_an_image_deployment_is_an_sd_server_child(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=image_request(harness))
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert body["status"] == "healthy" and body["engine"] == "stable-diffusion.cpp" and body["model"] == "/models/metal/flux1-schnell-Q4_0.gguf"
+        child = harness.children[-1]
+        command = child.command
+        assert command[0] == "sd-server" and child.env is None
+        assert command[command.index("--diffusion-model") + 1] == str(harness.diffusion)
+        assert command[command.index("--clip_l") + 1].endswith("clip_l-Q8_0.gguf")
+        assert command[command.index("--t5xxl") + 1].endswith("t5xxl-Q8_0.gguf")
+        assert command[command.index("--vae") + 1].endswith("ae.safetensors")
+        assert command[command.index("--steps") + 1] == "4" and command[command.index("--cfg-scale") + 1] == "1.0"
+        assert command[command.index("--sampling-method") + 1] == "euler" and "--port" not in command
+        assert command[command.index("--listen-port") + 1] == "9110"
+
+        pictured = api.post("/deployments/pictures/v1/images/generations", headers=harness.headers, json={"prompt": "a cat"})
+        assert pictured.status_code == 200 and harness.inference[-1][0] == 9110 and harness.inference[-1][1] == "/v1/images/generations"
+        assert api.post("/deployments/pictures/v1/chat/completions", headers=harness.headers, json={}).status_code == 404
+
+    saved = load_agent_config(harness.config_path)
+    record = saved.deployments["pictures"]
+    assert record.kind == "image" and set(record.components) == {"clip_l", "t5xxl", "vae"} and record.steps == 4
+    assert record.components["vae"].sha256 == digest(harness.models / "ae.safetensors")
+
+
+# A component the server has no flag for, a component on a language model,
+# or a diffusion request without its sampling are refused before anything
+# starts; a component whose bytes changed since is refused at restart.
+def test_image_components_are_constrained_and_verified(harness, caplog):
+    with TestClient(build_app(harness.agent)) as api:
+        wrong = image_request(harness)
+        wrong["components"]["lora"] = wrong["components"]["vae"]
+        assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=wrong).status_code == 422
+        mixed = second_request(harness, components=image_request(harness)["components"])
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=mixed).status_code == 422
+        assert harness.children == []
+        assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=image_request(harness)).status_code == 200
+    (harness.models / "t5xxl-Q8_0.gguf").write_bytes(b"tampered encoder")
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    restarted.deployment_ready_timeout = 2
+    restarted.start_deployments()
+    assert "pictures" not in restarted.deployments
+    assert "no longer matches its recorded checksum" in caplog.text
+    restarted.stop()

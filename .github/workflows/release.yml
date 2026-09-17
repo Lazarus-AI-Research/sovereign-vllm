@@ -13,6 +13,11 @@ env:
   REGISTRY: ghcr.io/lazarus-ai-research
   LLAMA_VERSION: b9960
   LLAMA_SHA256: 7a8c6b6ae3395e15b5cc330ed2938cc0aa4510905db1189658fd022035734b48
+  # stable-diffusion.cpp serves image deployments; its Metal build ships
+  # beside llama-server in the Metal distribution.
+  SD_VERSION: master-872-cc515a0
+  SD_ASSET: sd-master-cc515a0-bin-Darwin-macOS-26.6.2-arm64.zip
+  SD_SHA256: 39412a6abb2f19a18524903ccaa63ebbd21e4818540ce4a1d64ea5e55f474b6d
   UV_VERSION: 0.11.28
   PYTHON_VERSION: 3.12.11
 
@@ -121,12 +126,20 @@ jobs:
           cp "$LLAMA" stage/bin/llama-server
           cp -pPR "$LLAMA_DIR"/*.dylib stage/bin/
           test -n "$(find stage/bin -maxdepth 1 -name '*.dylib' -print -quit)"
+          curl -fL -o sd.zip "https://github.com/leejet/stable-diffusion.cpp/releases/download/$SD_VERSION/$SD_ASSET"
+          echo "$SD_SHA256  sd.zip" | shasum -a 256 -c -
+          mkdir -p sdcpp && unzip -q sd.zip -d sdcpp
+          SD="$(find sdcpp -type f -name sd-server -perm -111 -print -quit)"
+          test -n "$SD"
+          cp "$SD" stage/bin/sd-server
+          cp -pPR "$(dirname "$SD")"/libstable-diffusion.dylib stage/bin/
           TEST_HOME="$(mktemp -d)"
           HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
             stage/agent-dist/install-agent.sh
           "$TEST_HOME/.sovereign/runtime/venv/bin/python" -c \
             'import fastapi, lazarus.agent.server, yaml'
           "$TEST_HOME/.sovereign/runtime/bin/llama-server" --version
+          "$TEST_HOME/.sovereign/runtime/bin/sd-server" -h >/dev/null
           rm -rf "$TEST_HOME"
           tar -C stage -czf "sovereign-metal-agent-$VERSION-arm64.tar.gz" .
           shasum -a 256 "sovereign-metal-agent-$VERSION-arm64.tar.gz" > "sovereign-metal-agent-$VERSION-arm64.tar.gz.sha256"

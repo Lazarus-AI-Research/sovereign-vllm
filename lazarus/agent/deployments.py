@@ -1,7 +1,8 @@
-"""Deployments: one supervised llama.cpp process per served model, created and
-removed by Sovereign Control through the admin API and reached through
-``/deployments/{id}/v1``. Each has its own port, admission gate and lifecycle,
-so none restarts another."""
+"""Deployments: one supervised process per served model, created and removed
+by Sovereign Control through the admin API and reached through
+``/deployments/{id}/v1``. An LLM or embedding model is a llama-server child;
+an image model is a stable-diffusion.cpp server child. Each has its own port,
+admission gate and lifecycle, so none restarts another."""
 
 from __future__ import annotations
 
@@ -37,7 +38,42 @@ OBSERVE_TIMEOUT = 1.5
 ALLOWED_PATHS = {
     "generation": {"chat/completions", "completions", "models"},
     "embedding": {"embeddings", "models"},
+    "image": {"images/generations", "models"},
 }
+
+# The files an image model is served with beside its diffusion weights, by
+# the flag stable-diffusion.cpp takes them under. A model that needs none of
+# them (a single-file checkpoint) names none.
+IMAGE_COMPONENTS = {"clip_l": "--clip_l", "t5xxl": "--t5xxl", "vae": "--vae"}
+IMAGE_SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpm++2m", "lcm")
+# A weight file the agent loads: GGUF for llama.cpp, GGUF or safetensors for
+# stable-diffusion.cpp, whose text encoders and autoencoder ship as either.
+WEIGHT_SUFFIXES = (".gguf", ".safetensors")
+
+# Where each kind's server says it is up. llama-server answers /health once
+# its model is loaded; sd-server listens only once its model is loaded and
+# answers the models listing.
+HEALTH_PATHS = {"generation": "/health", "embedding": "/health", "image": "/v1/models"}
+ENGINES = {"generation": "llama.cpp", "embedding": "llama.cpp", "image": "stable-diffusion.cpp"}
+
+
+class Component(BaseModel):
+    """One named file an image deployment loads beside its diffusion model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    sha256: str
+
+    @field_validator("path")
+    @classmethod
+    def canonical_path(cls, value: str) -> str:
+        from pathlib import Path
+
+        path = Path(value)
+        if not path.is_absolute() or str(path) != value or value.startswith("//") or ".." in path.parts:
+            raise ValueError("model paths must be canonical absolute paths")
+        return value
 
 
 class AgentDeployment(BaseModel):
@@ -45,7 +81,7 @@ class AgentDeployment(BaseModel):
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
-    kind: Literal["generation", "embedding"]
+    kind: Literal["generation", "embedding", "image"]
     model_path: str
     mmproj_path: str | None = None
     mmproj_sha256: str | None = None
@@ -53,9 +89,14 @@ class AgentDeployment(BaseModel):
     sha256: str
     port: int = Field(ge=1, le=65535)
     served_model_name: str
-    context_length: int = Field(ge=128, le=131072)
+    context_length: int = Field(default=0, ge=0, le=131072)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
+    # An image deployment's companions and the sampling it was pinned with.
+    components: dict[str, Component] = {}
+    steps: int | None = Field(default=None, ge=1, le=150)
+    cfg_scale: float | None = Field(default=None, ge=0, le=30)
+    sampler: Literal[IMAGE_SAMPLERS] | None = None
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -78,7 +119,30 @@ class AgentDeployment(BaseModel):
             self.normalization = self.normalization or "l2"
         elif self.pooling is not None or self.normalization is not None:
             raise ValueError("pooling and normalization apply to embedding deployments only")
+        if self.kind == "image":
+            if self.mmproj_path is not None:
+                raise ValueError("an image deployment has no projector")
+            unknown = set(self.components) - set(IMAGE_COMPONENTS)
+            if unknown:
+                raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
+            self.steps = self.steps or 20
+            self.cfg_scale = 7.0 if self.cfg_scale is None else self.cfg_scale
+            self.sampler = self.sampler or "euler"
+        else:
+            if self.components:
+                raise ValueError("components apply to image deployments only")
+            if self.steps is not None or self.cfg_scale is not None or self.sampler is not None:
+                raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
+            if self.context_length < 128:
+                raise ValueError("a language model deployment needs a context length of at least 128")
         return self
+
+
+class ComponentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact: str
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
 
 
 class DeploymentRequest(BaseModel):
@@ -86,7 +150,7 @@ class DeploymentRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["generation", "embedding"]
+    kind: Literal["generation", "embedding", "image"]
     artifact: str
     mmproj: str | None = None
     revision: str = Field(pattern=r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -96,11 +160,21 @@ class DeploymentRequest(BaseModel):
     context_length: int = Field(default=8192, ge=128, le=131072)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
+    components: dict[str, ComponentRequest] = {}
+    steps: int | None = Field(default=None, ge=1, le=150)
+    cfg_scale: float | None = Field(default=None, ge=0, le=30)
+    sampler: Literal[IMAGE_SAMPLERS] | None = None
 
     @model_validator(mode="after")
     def projector_checksum(self):
         if (self.mmproj is None) != (self.mmproj_sha256 is None):
             raise ValueError("a projector is named together with its sha256")
+        if self.kind != "image" and (self.components or self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
+            raise ValueError("components, steps, cfg_scale and sampler apply to image deployments only")
+        if self.kind == "image":
+            unknown = set(self.components) - set(IMAGE_COMPONENTS)
+            if unknown:
+                raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
         return self
 
 
@@ -126,6 +200,8 @@ class Admission:
 
 
 def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    if deployment.kind == "image":
+        return image_command(agent, deployment)
     command = [agent.config.llama_server]
     if deployment.kind == "embedding":
         command += [
@@ -146,6 +222,27 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     if deployment.mmproj_path:
         command += ["--mmproj", deployment.mmproj_path]
     command += ["-c", str(deployment.context_length)]
+    return command
+
+
+# The server has no API key of its own; it listens on loopback and is
+# reached through the agent's proxy, which gates admission.
+def image_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    command = [
+        agent.config.sd_server,
+        "--listen-ip", "127.0.0.1",
+        "--listen-port", str(deployment.port),
+        "--diffusion-model", deployment.model_path,
+    ]
+    for name, flag in IMAGE_COMPONENTS.items():
+        component = deployment.components.get(name)
+        if component is not None:
+            command += [flag, component.path]
+    command += [
+        "--steps", str(deployment.steps),
+        "--cfg-scale", str(deployment.cfg_scale),
+        "--sampling-method", deployment.sampler,
+    ]
     return command
 
 
@@ -202,7 +299,7 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "served_model_name": deployment.served_model_name,
         "context_length": deployment.context_length,
         "revision": deployment.revision,
-        "engine": "llama.cpp",
+        "engine": ENGINES[deployment.kind],
     }
 
 
@@ -258,6 +355,9 @@ def verify_deployment_files(deployment: AgentDeployment) -> None:
         raise ValueError(f"{deployment.model_path} no longer matches its recorded checksum")
     if deployment.mmproj_path and deployment.mmproj_sha256 and file_digest(deployment.mmproj_path) != deployment.mmproj_sha256.lower():
         raise ValueError(f"{deployment.mmproj_path} no longer matches its recorded checksum")
+    for component in deployment.components.values():
+        if file_digest(component.path) != component.sha256.lower():
+            raise ValueError(f"{component.path} no longer matches its recorded checksum")
 
 
 def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, record: AgentDeployment | None = None) -> ServerProcess:
@@ -277,6 +377,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         deployment_id, deployment_command(agent, deployment), deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
         authenticated=deployment.kind == "generation",
+        health_path=HEALTH_PATHS[deployment.kind], engine=ENGINES[deployment.kind],
     )
 
 
@@ -371,11 +472,15 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     mmproj = None
     if request.mmproj:
         mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256)
+    components = {}
+    for name, component in request.components.items():
+        path = await asyncio.to_thread(agent.resolve_model, component.artifact, component.sha256)
+        components[name] = Component(path=str(path), sha256=component.sha256.lower())
     transition = Transition()
-    return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, transition), transition, http_request)
+    return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, components, transition), transition, http_request)
 
 
-async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition) -> dict:
+async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, components: dict[str, Component], transition: Transition) -> dict:
     async with deployment_lock(agent, deployment_id):
         if transition.abandoned:
             # The request went away while this waited for the lock; nothing
@@ -390,12 +495,12 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
             port = previous.port if previous else free_port(agent)
             agent.port_reservations.add(port)
         try:
-            return await replace_on_port(agent, deployment_id, request, model, mmproj, transition, previous, port)
+            return await replace_on_port(agent, deployment_id, request, model, mmproj, components, transition, previous, port)
         finally:
             agent.port_reservations.discard(port)
 
 
-async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition, previous, port: int) -> dict:
+async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, components: dict[str, Component], transition: Transition, previous, port: int) -> dict:
     """The transition proper, with the deployment's own lock held and its
     port reserved by the caller."""
     candidate = AgentDeployment(
@@ -403,8 +508,10 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         mmproj_sha256=request.mmproj_sha256.lower() if request.mmproj_sha256 else None,
         revision=request.revision.lower(), sha256=request.sha256.lower(),
         port=port,
-        served_model_name=request.served_model_name, context_length=request.context_length,
+        served_model_name=request.served_model_name,
+        context_length=0 if request.kind == "image" else request.context_length,
         pooling=request.pooling, normalization=request.normalization,
+        components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)
