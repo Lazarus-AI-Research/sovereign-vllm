@@ -934,3 +934,59 @@ def test_shutdown_joins_abandoned_transitions(harness, monkeypatch):
 
     alive, remaining = asyncio.run(scenario())
     assert not any(alive) and remaining == 0
+
+
+# A candidate whose save fails is not a record: the previous record stays,
+# in memory as on disk, and the previous process is restored.
+def test_a_candidate_whose_save_fails_is_not_persisted_by_the_rollback(harness, monkeypatch):
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+        real_save = harness.agent.save_config
+        failures = {"left": 1}
+
+        def flaky_save():
+            if failures["left"] > 0 and harness.agent.config.deployments["assistant-second"].revision == "d" * 40:
+                failures["left"] -= 1
+                raise OSError("disk full")
+            real_save()
+
+        monkeypatch.setattr(harness.agent, "save_config", flaky_save)
+        answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="d" * 40))
+        body = answer.json()
+        assert answer.status_code == 422 and "disk full" in body["error"] and body["rolled_back"] is True
+        assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
+        assert load_agent_config(harness.config_path).deployments["assistant-second"].revision == "c" * 40
+        assert harness.agent.deployment_admission["assistant-second"].paused is False
+
+
+# A request that goes while its worker waits for the shared lock never
+# begins: no drain, no process.
+def test_a_transition_abandoned_while_waiting_for_the_shared_lock_touches_nothing(harness, monkeypatch):
+    import time as clock
+
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    monkeypatch.setattr(deployments, "IDLE_TIMEOUT", 3)
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        admission = harness.agent.deployment_admission["assistant-second"]
+        admission.enter()
+        spawned = len(harness.children)
+        async with harness.agent.role_lock:
+            replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+            await asyncio.sleep(0.05)
+            replacement.cancel()
+            try:
+                await replacement
+            except asyncio.CancelledError:
+                pass
+        started = clock.monotonic()
+        await settled(harness.agent)
+        elapsed = clock.monotonic() - started
+        admission.leave()
+        return admission.paused, len(harness.children) - spawned, harness.stopped, elapsed
+
+    paused, spawned, stopped, elapsed = asyncio.run(scenario())
+    assert paused is False and spawned == 0 and stopped == [] and elapsed < 1.0
