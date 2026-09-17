@@ -113,6 +113,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+async def settled(agent):
+    """A transition worker holds the role lock until it is done; taking the
+    lock waits for it."""
+    async with agent.role_lock:
+        pass
+
+
 def second_request(harness, **overrides):
     request = {
         "kind": "generation", "artifact": "metal/second.gguf", "sha256": digest(harness.weights),
@@ -325,6 +332,7 @@ def test_a_cancelled_drain_reopens_the_deployment(harness):
         with pytest.raises(asyncio.CancelledError):
             await removal
         admission.leave()
+        await settled(harness.agent)
         return admission.paused, "assistant-second" in harness.agent.deployments
 
     paused, present = asyncio.run(scenario())
@@ -409,6 +417,7 @@ def test_a_replacement_cancelled_during_the_old_shutdown_restores_it(harness):
         replacement.cancel()
         with pytest.raises(asyncio.CancelledError):
             await replacement
+        await settled(harness.agent)
         restored = harness.agent.deployments.get("assistant-second")
         return restored is not None and restored.running(), harness.agent.deployment_admission["assistant-second"].paused, harness.agent.config.deployments["assistant-second"].revision
 
@@ -470,8 +479,64 @@ def test_a_cancelled_replacement_waits_for_the_old_child_to_die_first(harness):
         replacement.cancel()
         with pytest.raises(asyncio.CancelledError):
             await replacement
+        await settled(harness.agent)
         restored = harness.agent.deployments["assistant-second"]
         return seen["children_when_old_died"], harness.children.index(next(c for c in harness.children if c.port == restored.port and c.alive))
 
     old_died_at, restored_index = asyncio.run(scenario())
     assert restored_index >= old_died_at
+
+
+# A rollback restores the previous files only if they still match the
+# checksums recorded for them; otherwise the deployment stays closed.
+def test_a_rollback_refuses_previous_files_that_changed_on_disk(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+        harness.weights.write_bytes(b"rewritten under the same name")
+        harness.control.refuse_next = 1
+        failed = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="d" * 40))
+        body = failed.json()
+        assert failed.status_code == 422 and body["rolled_back"] is False
+        assert "no longer matches its recorded checksum" in body["rollback_error"]
+        assert harness.agent.deployment_admission["assistant-second"].paused is True
+        listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]["assistant-second"]
+        assert listed["status"] != "healthy"
+
+
+# A request cancelled through the HTTP layer, under the server's own cancel
+# scope, still leaves the deployment restored: the worker is never cancelled.
+def test_a_request_cancelled_under_the_server_scope_still_restores(harness):
+    import time as clock
+
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        first = harness.children[-1]
+        original = first.terminate
+
+        def slow_terminate():
+            clock.sleep(0.3)
+            original()
+
+        first.terminate = slow_terminate
+        import anyio
+
+        outcome = {}
+        with anyio.CancelScope() as scope:
+            async def cancel_soon():
+                await asyncio.sleep(0.1)
+                scope.cancel()
+
+            canceller = asyncio.create_task(cancel_soon())
+            try:
+                await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40)))
+            except asyncio.CancelledError:
+                outcome["cancelled"] = True
+            await canceller
+        await settled(harness.agent)
+        restored = harness.agent.deployments["assistant-second"]
+        return outcome.get("cancelled"), restored.running(), harness.agent.config.deployments["assistant-second"].revision, harness.agent.deployment_admission["assistant-second"].paused
+
+    cancelled, running, revision, paused = asyncio.run(scenario())
+    assert running and revision == "c" * 40 and paused is False
