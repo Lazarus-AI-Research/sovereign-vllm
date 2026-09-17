@@ -234,17 +234,25 @@ def start_deployment(agent: Agent, deployment_id: str) -> RoleProcess:
 
 async def quiesce(agent: Agent, deployment_id: str) -> None:
     admission = agent.deployment_admission.setdefault(deployment_id, Admission())
+    was_paused = admission.paused
     admission.paused = True
     try:
         await asyncio.wait_for(admission.idle.wait(), timeout=IDLE_TIMEOUT)
     except asyncio.TimeoutError:
         pass
+    except asyncio.CancelledError:
+        # Nothing has changed yet: the process that was serving keeps serving,
+        # so the gate it had before the drain began is put back.
+        admission.paused = was_paused
+        raise
 
 
-def stop_deployment(agent: Agent, deployment_id: str) -> None:
+async def stop_deployment(agent: Agent, deployment_id: str) -> None:
+    # Terminating a child can take up to ten seconds of blocking waits; that
+    # runs off the event loop so every other deployment keeps streaming.
     process = agent.deployments.pop(deployment_id, None)
     if process is not None:
-        process.stop()
+        await asyncio.to_thread(process.stop)
 
 
 async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest) -> dict:
@@ -265,7 +273,7 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         )
         if previous is not None:
             await quiesce(agent, deployment_id)
-            stop_deployment(agent, deployment_id)
+            await stop_deployment(agent, deployment_id)
         agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
         agent.deployment_admission[deployment_id] = Admission()
         agent.deployment_admission[deployment_id].paused = True
@@ -279,7 +287,7 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
             # already stopped, so the rollback runs to completion before the
             # cancellation is re-raised.
             with CancelScope(shield=True):
-                stop_deployment(agent, deployment_id)
+                await stop_deployment(agent, deployment_id)
                 rolled_back, rollback_error = False, None
                 try:
                     if previous is None:
@@ -317,7 +325,7 @@ async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
         if previous is None:
             return {"status": "absent", "id": deployment_id}
         await quiesce(agent, deployment_id)
-        stop_deployment(agent, deployment_id)
+        await stop_deployment(agent, deployment_id)
         agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
         try:
             agent.save_config()
