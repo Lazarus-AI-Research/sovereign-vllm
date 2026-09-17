@@ -641,3 +641,75 @@ def test_a_candidate_whose_stop_raises_keeps_the_previous_record_and_the_child(h
         # The agent's shutdown stops the child it still holds; that must work.
         candidate = seen["candidate"].process
         candidate.terminate = candidate.kill
+
+
+# A first creation whose candidate fails and cannot be stopped keeps the child
+# registered; the next removal stops it, and the next creation stops it before
+# taking its handle.
+def test_a_child_a_failed_creation_could_not_stop_is_still_stopped_later(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+
+    with TestClient(build_app(harness.agent), raise_server_exceptions=False) as api:
+        real_wait = deployments.wait_deployment_ready
+        attempts = {"stops": 0}
+
+        async def fail_and_break_stop(agent, deployment, process):
+            original = process.process.terminate
+
+            def flaky():
+                attempts["stops"] += 1
+                if attempts["stops"] == 1:
+                    raise RuntimeError("wait timed out")
+                original()
+
+            process.process.terminate = flaky
+            raise RuntimeError("did not become ready")
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", fail_and_break_stop)
+        failed = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        assert failed.status_code == 422 and failed.json()["rolled_back"] is False
+        child = harness.children[-1]
+        assert "assistant-second" not in harness.agent.config.deployments
+        assert harness.agent.deployments["assistant-second"].process is child and child.alive
+        monkeypatch.setattr(deployments, "wait_deployment_ready", real_wait)
+        removed = api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers)
+        assert removed.status_code == 200 and removed.json()["status"] == "stopped"
+        assert not child.alive and "assistant-second" not in harness.agent.deployments
+
+
+def test_a_new_creation_stops_a_child_left_registered_without_a_record(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        stray = harness.agent.deployments["assistant-second"]
+        # The record is gone but the child was left behind, as a failed
+        # creation whose stop failed leaves it.
+        harness.agent.config.deployments = {}
+        created = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="d" * 40))
+        assert created.status_code == 200
+        assert not stray.process.alive and harness.agent.deployments["assistant-second"] is not stray
+
+
+# A transition cancelled while it waited for the lock touches nothing: the
+# deployment is never paused for a request that is already gone.
+def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harness):
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment, remove_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        admission = harness.agent.deployment_admission["assistant-second"]
+        outcomes = []
+        async with harness.agent.role_lock:
+            replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+            removal = asyncio.create_task(remove_deployment(harness.agent, "assistant-second"))
+            await asyncio.sleep(0.05)
+            for task in (replacement, removal):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    outcomes.append("cancelled")
+        await settled(harness.agent)
+        return outcomes, admission.paused, harness.agent.config.deployments["assistant-second"].revision, harness.stopped
+
+    outcomes, paused, revision, stopped = asyncio.run(scenario())
+    assert outcomes == ["cancelled", "cancelled"] and paused is False and revision == "c" * 40 and stopped == []
