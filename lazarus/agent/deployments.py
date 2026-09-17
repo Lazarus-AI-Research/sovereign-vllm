@@ -489,12 +489,22 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         body = await request.body()
         if admission.paused or agent.deployments.get(deployment_id) is not process:
             return JSONResponse(status_code=503, content={"error": "deployment is being replaced"})
-        admission.enter()
+        # A child that exited still owns its record until it is stopped; its
+        # port may meanwhile belong to something else, so nothing is forwarded.
+        if not process.running():
+            return JSONResponse(status_code=503, content={"error": "deployment process is not running"})
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)
-        upstream = client.build_request(
-            request.method, f"http://127.0.0.1:{process.port}/v1/{path}", content=body,
-            headers={"Content-Type": request.headers.get("Content-Type", "application/json"), **process.headers()},
-        )
+        # The request is built before admission is taken, so a request that
+        # cannot be built never leaves a count behind.
+        try:
+            upstream = client.build_request(
+                request.method, f"http://127.0.0.1:{process.port}/v1/{path}", content=body,
+                headers={"Content-Type": request.headers.get("Content-Type", "application/json"), **process.headers()},
+            )
+        except (UnicodeError, ValueError) as exc:
+            await client.aclose()
+            return JSONResponse(status_code=400, content={"error": f"request could not be forwarded: {exc}"})
+        admission.enter()
         try:
             response = await client.send(upstream, stream=True)
         except httpx.HTTPError:

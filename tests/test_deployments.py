@@ -725,3 +725,28 @@ def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harne
     outcomes, paused, revision, stopped, elapsed = asyncio.run(scenario())
     assert outcomes == ["cancelled", "cancelled"] and paused is False and revision == "c" * 40 and stopped == []
     assert elapsed < 1.0
+
+
+# A child that exited keeps its record until it is stopped, but nothing is
+# forwarded to a port that may now belong to something else.
+def test_an_exited_child_is_not_forwarded_to(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        harness.children[-1].alive = False
+        before = len(harness.inference)
+        answer = api.post("/deployments/assistant-second/v1/chat/completions", headers=harness.headers, json={"messages": []})
+        assert answer.status_code == 503 and "not running" in answer.json()["error"]
+        assert len(harness.inference) == before
+        assert harness.agent.deployment_admission["assistant-second"].requests == 0
+
+
+# A request that cannot be built never leaves an admission count behind, so
+# no later transition drains for it.
+def test_an_unbuildable_request_leaves_no_admission_count(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        # Sent as raw bytes: the wire carries it, and the server decodes it.
+        bad = "application/json; boundary=\u00e9".encode("latin-1")
+        answer = api.post("/deployments/assistant-second/v1/chat/completions", headers={**harness.headers, "Content-Type": bad}, content=b"{}")
+        assert answer.status_code == 400
+        assert harness.agent.deployment_admission["assistant-second"].requests == 0
