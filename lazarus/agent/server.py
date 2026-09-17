@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
-from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
+from lazarus.agent.deployments import WEIGHT_SUFFIXES, Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
@@ -55,10 +55,13 @@ class ServerProcess:
     def __init__(
         self, name: str, command: list[str], port: int, model_path: str,
         *, revision: str | None, context_length: int | None, authenticated: bool = False,
+        health_path: str = "/health", engine: str = "llama.cpp",
     ):
         self.name = name
         self.port = port
         self.model_path = model_path
+        self.health_path = health_path
+        self.engine = engine
         # Keep loader-input metadata with this child, not a later desired config.
         self.revision = revision
         self.context_length = context_length
@@ -78,7 +81,7 @@ class ServerProcess:
             child_env["LLAMA_API_KEY"] = self.api_key
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path = log_dir / f"{name}.llama.cpp.log"
+        self.log_path = log_dir / f"{name}.{engine}.log"
         logger.info("starting %s: %s (log: %s)", name, " ".join(command), self.log_path)
         with open(self.log_path, "ab") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=log_file, env=child_env)
@@ -94,7 +97,7 @@ class ServerProcess:
             return False
         try:
             async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
-                resp = await client.get(f"http://127.0.0.1:{self.port}/health", headers=self.headers())
+                resp = await client.get(f"http://127.0.0.1:{self.port}{self.health_path}", headers=self.headers())
                 return resp.status_code == 200
         except httpx.HTTPError:
             return False
@@ -226,8 +229,8 @@ class Agent:
         model = self._resolve_managed_path(Path(artifact))
         if not model.is_file():
             raise ValueError("artifact must resolve to a model file within the managed model directory")
-        if model.suffix.lower() != ".gguf":
-            raise ValueError("Metal artifacts must be GGUF files")
+        if model.suffix.lower() not in WEIGHT_SUFFIXES:
+            raise ValueError("Metal artifacts must be GGUF or safetensors files")
         digest = hashlib.sha256()
         with model.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):

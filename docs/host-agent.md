@@ -1,15 +1,16 @@
 # Host inference agent
 
 `sovereign-runtime-agent` (`lazarus.agent`) runs on a Mac beside the appliance
-because containers cannot reach Metal. It supervises one `llama-server` process
-per deployment, proxies inference to each, and exposes a small
+because containers cannot reach Metal. It supervises one server process per
+deployment (`llama-server` for language and embedding models, stable-diffusion.cpp's
+`sd-server` for image models), proxies inference to each, and exposes a small
 bearer-authenticated admin API on `127.0.0.1:9100` that Sovereign Control drives.
 It fails closed: no token, no service.
 
 A deployment is what Control creates while the appliance runs: the shipped
-assistant, a second generation model, an embedding profile's model. Each has its
-own id, port, process and admission gate, is persisted in `agent.yaml` so a
-restarted agent serves it again, and is reached through
+assistant, a second generation model, an embedding profile's model, an image
+model. Each has its own id, port, process and admission gate, is persisted in
+`agent.yaml` so a restarted agent serves it again, and is reached through
 `/deployments/{id}/v1/*`. Starting or failing one never touches another. A fresh
 agent serves nothing until Control asks.
 
@@ -46,9 +47,15 @@ is constrained; arbitrary `llama.cpp` flags never cross this boundary:
 ```
 
 An embedding deployment takes `pooling` (`mean`, `last`, `cls`) and
-`normalization` (`l2`, `none`) instead of a projector. Artifacts are relative to
-the managed model root, must already exist, must be GGUF, and are checksummed
-before anything starts: the agent never downloads.
+`normalization` (`l2`, `none`) instead of a projector. An image deployment
+(`"kind": "image"`) names its diffusion weights as the artifact and the files
+served beside them under `components` (`clip_l`, `t5xxl`, `vae`, each
+`{"artifact", "sha256"}`), with the sampling it is pinned to: `steps`,
+`cfg_scale`, `sampler` (`euler`, `euler_a`, `heun`, `dpm2`, `dpm++2m`, `lcm`).
+It answers `images/generations` and `models`; its server carries no API key of
+its own and listens on loopback behind the agent's proxy. Artifacts are relative
+to the managed model root, must already exist, must be GGUF or safetensors, and
+are checksummed before anything starts: the agent never downloads.
 
 Ports are allocated from `9110`–`9199`; the agent itself listens on `9100`. A
 generation deployment's process is started with an ephemeral API key the agent

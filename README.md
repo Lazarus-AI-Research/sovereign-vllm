@@ -255,7 +255,8 @@ container at all: inference runs host-side and Sovereign Control drives it
 directly.
 
 - **`sovereign-runtime-agent`** — a launchd-managed host daemon that
-  supervises one `llama-server` process per deployment, fails closed without
+  supervises one server process per deployment (`llama-server`, or
+  stable-diffusion.cpp's `sd-server` for image models), fails closed without
   its bearer token, binds loopback only, and exposes a single private port
   with `/agent/manifest`, the deployments admin API and a streaming proxy per
   deployment. See [docs/host-agent.md](docs/host-agent.md).

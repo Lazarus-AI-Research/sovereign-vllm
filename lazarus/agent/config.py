@@ -43,6 +43,8 @@ class AgentConfig(BaseModel):
     port: int = Field(default=9100, ge=1, le=65535)
     token_env: str = "SOVEREIGN_AGENT_TOKEN"
     llama_server: str = "llama-server"
+    # The stable-diffusion.cpp server an image deployment runs on.
+    sd_server: str = "sd-server"
     # Every served model: created by Control while the appliance runs and
     # persisted so a restarted agent serves them again.
     deployments: dict[str, AgentDeployment] = {}
