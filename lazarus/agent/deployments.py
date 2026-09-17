@@ -367,19 +367,21 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
                 raise RuntimeError("the request was cancelled before the deployment was confirmed")
             agent.save_config()
         except Exception as exc:
-            # A cancelled request is a failed one. The previous process is
-            # already gone, so it is restored, from files checked again
-            # against their recorded checksums: the disk may have changed.
-            await stop_deployment(agent, deployment_id)
+            # A cancelled request is a failed one. The record goes back before
+            # any cleanup: whatever stopping the candidate or verifying the
+            # previous files does next, the rejected candidate is never what
+            # is persisted. The previous process is already gone, so it is
+            # restored from files checked again against their checksums.
+            if previous is None:
+                agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+            else:
+                agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
             rolled_back, rollback_error = False, None
             try:
+                await stop_deployment(agent, deployment_id)
                 if previous is None:
-                    agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
                     agent.deployment_admission.pop(deployment_id, None)
                 else:
-                    # The record goes back first: whatever the verification
-                    # says, the rejected candidate is never what is persisted.
-                    agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
                     await asyncio.to_thread(verify_deployment_files, previous)
                     restored = start_deployment(agent, deployment_id)
                     agent.deployments[deployment_id] = restored
