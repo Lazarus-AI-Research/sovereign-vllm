@@ -7,6 +7,7 @@ port, admission gate and lifecycle and none restarts another."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import socket
 import time
@@ -48,6 +49,7 @@ class AgentDeployment(BaseModel):
     kind: Literal["generation", "embedding"]
     model_path: str
     mmproj_path: str | None = None
+    mmproj_sha256: str | None = None
     revision: str
     sha256: str
     port: int = Field(ge=1, le=65535)
@@ -176,8 +178,17 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         model = agent.observed_model(deployment.model_path)
     except (OSError, ValueError, TypeError, RuntimeError):
         return {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED", "kind": deployment.kind}
+    admission = agent.deployment_admission.get(deployment_id)
+    paused = admission is not None and admission.paused
+    if healthy and running:
+        # A child that answers behind a closed gate is not serving: nothing
+        # reaches it until the gate reopens.
+        status = "paused" if paused else "healthy"
+    else:
+        status = "loading" if running else "unhealthy"
     return {
-        "status": "healthy" if healthy and running else ("loading" if running else "unhealthy"),
+        "status": status,
+        "admission": "paused" if paused else "open",
         "kind": deployment.kind,
         "model": model,
         "port": deployment.port,
@@ -225,11 +236,32 @@ async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, proce
     raise RuntimeError("deployment did not become healthy before timeout")
 
 
-def start_deployment(agent: Agent, deployment_id: str) -> RoleProcess:
+def file_digest(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_deployment_files(deployment: AgentDeployment) -> None:
+    """The bytes on disk are the bytes the record was made for. A weight
+    overwritten since is refused, never loaded under the recorded revision."""
+    if file_digest(deployment.model_path) != deployment.sha256.lower():
+        raise ValueError(f"{deployment.model_path} no longer matches its recorded checksum")
+    if deployment.mmproj_path and deployment.mmproj_sha256 and file_digest(deployment.mmproj_path) != deployment.mmproj_sha256.lower():
+        raise ValueError(f"{deployment.mmproj_path} no longer matches its recorded checksum")
+
+
+def start_deployment(agent: Agent, deployment_id: str, verify: bool = False) -> RoleProcess:
     from lazarus.agent.server import RoleProcess
 
     deployment = agent.config.deployments[deployment_id]
     agent.observed_model(deployment.model_path)
+    # A request's files were checked as it arrived; a restart from agent.yaml
+    # checks them again, since the disk may have changed meanwhile.
+    if verify:
+        verify_deployment_files(deployment)
     return RoleProcess(
         deployment_id, deployment_command(agent, deployment), deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
@@ -258,9 +290,16 @@ async def stop_deployment(agent: Agent, deployment_id: str) -> None:
     # cancellation arriving meanwhile is delivered once the child is gone, so
     # a caller never has to reason about a half-stopped process.
     process = agent.deployments.pop(deployment_id, None)
-    if process is not None:
-        with CancelScope(shield=True):
-            await asyncio.to_thread(process.stop)
+    if process is None:
+        return
+    shutdown = asyncio.ensure_future(asyncio.to_thread(process.stop))
+    try:
+        await asyncio.shield(shutdown)
+    except asyncio.CancelledError:
+        # The child is gone before the cancellation moves on, so whatever
+        # runs next never competes with it for the port.
+        await shutdown
+        raise
 
 
 async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest) -> dict:
@@ -274,6 +313,7 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         previous = agent.config.deployments.get(deployment_id)
         candidate = AgentDeployment(
             kind=request.kind, model_path=str(model), mmproj_path=str(mmproj) if mmproj else None,
+            mmproj_sha256=request.mmproj_sha256.lower() if request.mmproj_sha256 else None,
             revision=request.revision.lower(), sha256=request.sha256.lower(),
             port=previous.port if previous else free_port(agent),
             served_model_name=request.served_model_name, context_length=request.context_length,

@@ -414,3 +414,64 @@ def test_a_replacement_cancelled_during_the_old_shutdown_restores_it(harness):
 
     running, paused, revision = asyncio.run(scenario())
     assert running and paused is False and revision == "c" * 40
+
+
+# A weight overwritten between a deployment's creation and an agent restart
+# is refused at the restart: the record's checksum, not the path, is trusted.
+def test_a_restart_refuses_a_weight_that_no_longer_matches_its_checksum(harness, caplog):
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+    saved = load_agent_config(harness.config_path)
+    assert saved.deployments["assistant-second"].mmproj_sha256 == digest(harness.projector)
+    harness.weights.write_bytes(b"tampered model")
+    restarted = Agent(saved, harness.config_path)
+    restarted.deployment_ready_timeout = 2
+    restarted.start_roles()
+    assert "assistant-second" not in restarted.deployments
+    assert "no longer matches its recorded checksum" in caplog.text
+    restarted.stop()
+
+
+# A healthy child behind a closed gate is reported paused, never healthy:
+# nothing reaches it until the gate reopens.
+def test_a_paused_deployment_is_not_reported_healthy(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        harness.agent.deployment_admission["assistant-second"].paused = True
+        listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]["assistant-second"]
+        assert listed["status"] == "paused" and listed["admission"] == "paused"
+        harness.agent.deployment_admission["assistant-second"].paused = False
+        listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]["assistant-second"]
+        assert listed["status"] == "healthy" and listed["admission"] == "open"
+
+
+# The old child is gone before a cancelled replacement restores it, so the
+# restored child never competes with it for the port.
+def test_a_cancelled_replacement_waits_for_the_old_child_to_die_first(harness):
+    import time as clock
+
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        first = harness.children[-1]
+        original = first.terminate
+        seen = {}
+
+        def slow_terminate():
+            clock.sleep(0.3)
+            original()
+            seen["children_when_old_died"] = len(harness.children)
+
+        first.terminate = slow_terminate
+        replacement = asyncio.create_task(apply_deployment(
+            harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        replacement.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+        restored = harness.agent.deployments["assistant-second"]
+        return seen["children_when_old_died"], harness.children.index(next(c for c in harness.children if c.port == restored.port and c.alive))
+
+    old_died_at, restored_index = asyncio.run(scenario())
+    assert restored_index >= old_died_at
