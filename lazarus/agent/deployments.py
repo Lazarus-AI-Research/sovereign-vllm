@@ -159,15 +159,19 @@ def free_port(agent: Agent) -> int:
     taken |= {deployment.port for deployment in agent.config.deployments.values()}
     taken.add(agent.config.port)
     for port in DEPLOYMENT_PORTS:
-        if port in taken:
-            continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            try:
-                probe.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-        return port
+        if port not in taken and port_available(port):
+            return port
     raise RuntimeError("no free deployment port")
+
+
+def port_available(port: int) -> bool:
+    """A port nothing on this host listens on, whatever the records say."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
 
 def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool) -> dict:
@@ -286,9 +290,14 @@ async def stop_deployment(agent: Agent, deployment_id: str) -> None:
     # runs off the event loop so every other deployment keeps streaming. Only
     # a transition worker calls this, and no request's cancel scope reaches a
     # worker, so the wait always runs to the child's end.
-    process = agent.deployments.pop(deployment_id, None)
-    if process is not None:
-        await asyncio.to_thread(process.stop)
+    process = agent.deployments.get(deployment_id)
+    if process is None:
+        return
+    # The child stays registered until it is confirmed gone, so a failed stop
+    # can be retried and an agent shutdown still finds it.
+    await asyncio.to_thread(process.stop)
+    if agent.deployments.get(deployment_id) is process:
+        del agent.deployments[deployment_id]
 
 
 class Transition:
@@ -347,6 +356,9 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
         try:
             if previous is not None:
                 await stop_deployment(agent, deployment_id)
+            # The drain may have taken minutes; the files are checked again
+            # right before they are loaded, so what starts is what was pinned.
+            await asyncio.to_thread(verify_deployment_files, candidate)
             agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
             process = start_deployment(agent, deployment_id)
             agent.deployments[deployment_id] = process
@@ -365,8 +377,10 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
                     agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
                     agent.deployment_admission.pop(deployment_id, None)
                 else:
-                    await asyncio.to_thread(verify_deployment_files, previous)
+                    # The record goes back first: whatever the verification
+                    # says, the rejected candidate is never what is persisted.
                     agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+                    await asyncio.to_thread(verify_deployment_files, previous)
                     restored = start_deployment(agent, deployment_id)
                     agent.deployments[deployment_id] = restored
                     await wait_deployment_ready(agent, previous, restored)
@@ -437,7 +451,9 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
         try:
             return await remove_deployment(agent, deployment_id)
-        except PersistenceError as exc:
+        except (PersistenceError, OSError, RuntimeError) as exc:
+            # The child may still be there; the record says so, and a retry
+            # stops it again.
             return JSONResponse(status_code=500, content={"error": str(exc), "id": deployment_id})
 
     @app.api_route("/deployments/{deployment_id}/v1/{path:path}", methods=["GET", "POST"])

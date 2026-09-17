@@ -67,6 +67,9 @@ def harness(tmp_path, monkeypatch):
         return child
 
     monkeypatch.setattr("lazarus.agent.server.subprocess.Popen", spawn)
+    # The port ledger is what is under test; whatever listens on this host
+    # (a live appliance, another test) must not shift the ports it hands out.
+    monkeypatch.setattr("lazarus.agent.deployments.port_available", lambda port: True, raising=False)
 
     class Body(httpx.AsyncByteStream):
         def __init__(self, value):
@@ -499,6 +502,8 @@ def test_a_rollback_refuses_previous_files_that_changed_on_disk(harness):
         assert failed.status_code == 422 and body["rolled_back"] is False
         assert "no longer matches its recorded checksum" in body["rollback_error"]
         assert harness.agent.deployment_admission["assistant-second"].paused is True
+        # The rejected candidate is never what is recorded.
+        assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
         listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]["assistant-second"]
         assert listed["status"] != "healthy"
 
@@ -540,3 +545,49 @@ def test_a_request_cancelled_under_the_server_scope_still_restores(harness):
 
     cancelled, running, revision, paused = asyncio.run(scenario())
     assert running and revision == "c" * 40 and paused is False
+
+
+# A child whose termination fails stays registered, so the next removal
+# stops it again instead of reporting a process that is still there as gone.
+def test_a_failed_stop_keeps_the_child_for_a_retry(harness):
+    with TestClient(build_app(harness.agent), raise_server_exceptions=False) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        child = harness.children[-1]
+        original = child.terminate
+        attempts = {"count": 0}
+
+        def flaky_terminate():
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("wait timed out")
+            original()
+
+        child.terminate = flaky_terminate
+        first = api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers)
+        assert first.status_code == 500 and "wait timed out" in first.json()["error"]
+        assert harness.agent.deployments["assistant-second"].process is child
+        assert "assistant-second" in harness.agent.config.deployments
+        second = api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers)
+        assert second.status_code == 200 and second.json()["status"] == "stopped"
+        assert "assistant-second" not in harness.agent.deployments and not child.alive
+
+
+# The files are checked again right before they are loaded: a weight rewritten
+# while the transition waited never starts under the checksum it was pinned to.
+def test_a_candidate_rewritten_during_the_drain_is_refused(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+        replacement = second_request(harness, revision="d" * 40)
+        real_quiesce = deployments.quiesce
+
+        async def rewrite_during_drain(agent, deployment_id):
+            harness.weights.write_bytes(b"rewritten while draining")
+            return await real_quiesce(agent, deployment_id)
+
+        monkeypatch.setattr(deployments, "quiesce", rewrite_during_drain)
+        answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=replacement)
+        assert answer.status_code == 422
+        assert "no longer matches its recorded checksum" in answer.json()["error"]
+        assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
