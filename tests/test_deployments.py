@@ -307,3 +307,59 @@ def test_artifacts_are_checksummed_off_the_event_loop(harness, monkeypatch):
     with TestClient(build_app(harness.agent)) as api:
         assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
     assert threads.count("resolve_model") == 2
+
+
+# A replacement or removal cancelled while it drains an in-flight request has
+# changed nothing, so the process that was serving must keep admitting.
+def test_a_cancelled_drain_reopens_the_deployment(harness):
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment, remove_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        admission = harness.agent.deployment_admission["assistant-second"]
+        admission.enter()
+        removal = asyncio.create_task(remove_deployment(harness.agent, "assistant-second"))
+        await asyncio.sleep(0.05)
+        assert admission.paused is True
+        removal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await removal
+        admission.leave()
+        return admission.paused, "assistant-second" in harness.agent.deployments
+
+    paused, present = asyncio.run(scenario())
+    assert paused is False and present
+    assert harness.stopped == []
+
+
+# Terminating a child blocks for as long as the child takes to die; that wait
+# must not stall the event loop every other deployment streams on.
+def test_a_slow_child_shutdown_does_not_block_other_traffic(harness):
+    import time as clock
+
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment, remove_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        child = harness.children[-1]
+        original = child.terminate
+
+        def slow_terminate():
+            clock.sleep(0.4)
+            original()
+
+        child.terminate = slow_terminate
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        clock_task = asyncio.create_task(ticker())
+        await remove_deployment(harness.agent, "assistant-second")
+        clock_task.cancel()
+        return ticks
+
+    assert asyncio.run(scenario()) >= 5
