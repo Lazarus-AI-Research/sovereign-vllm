@@ -872,10 +872,22 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
     async def scenario():
         await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
         seen.clear()
+        gate = asyncio.Event()
+        real_wait = deployments.wait_deployment_ready
+
+        async def gated_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await gate.wait()
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", gated_wait)
+        replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        # The worker is past its port and waiting for the gate; the shared
+        # lock is taken before the gate opens, so the confirmed candidate
+        # waits to commit. Only then does the request go.
         async with harness.agent.role_lock:
-            replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
-            # The candidate becomes ready and waits for the lock; only then
-            # does the request go.
+            gate.set()
             for _ in range(200):
                 await asyncio.sleep(0.02)
                 if getattr(seen.get("transition"), "committing", False):
