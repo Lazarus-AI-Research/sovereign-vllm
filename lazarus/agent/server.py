@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
-from lazarus.agent.deployments import WEIGHT_SUFFIXES, Admission, observe_deployments, register_deployment_routes, start_deployment
+from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
@@ -223,14 +223,14 @@ class Agent:
         temporary.chmod(0o600)
         temporary.replace(target)
 
-    def resolve_model(self, artifact: str, expected_sha256: str) -> Path:
+    def resolve_model(self, artifact: str, expected_sha256: str, suffixes: tuple[str, ...] = (".gguf",)) -> Path:
         if not valid_native_model_identity(f"/models/{artifact}"):
             raise ValueError("artifact must use a bounded canonical relative native model path")
         model = self._resolve_managed_path(Path(artifact))
         if not model.is_file():
             raise ValueError("artifact must resolve to a model file within the managed model directory")
-        if model.suffix.lower() not in WEIGHT_SUFFIXES:
-            raise ValueError("Metal artifacts must be GGUF or safetensors files")
+        if model.suffix.lower() not in suffixes:
+            raise ValueError(f"Metal artifacts must be {' or '.join(suffixes)} files")
         digest = hashlib.sha256()
         with model.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):

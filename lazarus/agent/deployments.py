@@ -226,13 +226,16 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
 
 
 # The server has no API key of its own; it listens on loopback and is
-# reached through the agent's proxy, which gates admission.
+# reached through the agent's proxy, which gates admission. A model with
+# components is standalone diffusion weights; one without is a full
+# checkpoint carrying its own text encoder and autoencoder, which the server
+# loads under a different flag.
 def image_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     command = [
         agent.config.sd_server,
         "--listen-ip", "127.0.0.1",
         "--listen-port", str(deployment.port),
-        "--diffusion-model", deployment.model_path,
+        "--diffusion-model" if deployment.components else "--model", deployment.model_path,
     ]
     for name, flag in IMAGE_COMPONENTS.items():
         component = deployment.components.get(name)
@@ -468,13 +471,17 @@ async def abandon_on_disconnect(http_request: Request, worker: asyncio.Task, tra
 async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, http_request: Request | None = None) -> dict:
     # Checksumming multi-gigabyte weights must not stall every other
     # deployment's stream, so it runs off the event loop.
-    model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256)
+    # llama-server loads GGUF alone; stable-diffusion.cpp takes its encoders
+    # and autoencoder as safetensors too. A file the loader would refuse is
+    # refused here, before a serving process is touched.
+    suffixes = WEIGHT_SUFFIXES if request.kind == "image" else (".gguf",)
+    model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
     if request.mmproj:
-        mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256)
+        mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256, suffixes)
     components = {}
     for name, component in request.components.items():
-        path = await asyncio.to_thread(agent.resolve_model, component.artifact, component.sha256)
+        path = await asyncio.to_thread(agent.resolve_model, component.artifact, component.sha256, suffixes)
         components[name] = Component(path=str(path), sha256=component.sha256.lower())
     transition = Transition()
     return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, components, transition), transition, http_request)

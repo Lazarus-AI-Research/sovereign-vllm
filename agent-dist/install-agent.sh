@@ -42,6 +42,12 @@ cp -pPR "${LLAMA_LIBS[@]}" "$RUNTIME_HOME/bin/"
 if [[ ! -f "$CONFIG" ]]; then
   sed "s|__AGENT_HOME__|$AGENT_HOME|g" "$CONFIG_SRC" > "$CONFIG"
 fi
+# An upgraded installation keeps its agent.yaml, written before image
+# deployments existed: the image server it now needs is named without
+# touching anything the file already says.
+if ! grep -q '^sd_server:' "$CONFIG"; then
+  printf 'sd_server: %s\n' "$RUNTIME_HOME/bin/sd-server" >> "$CONFIG"
+fi
 chmod 600 "$CONFIG"
 if [[ ! -f "$TOKEN_FILE" ]]; then
   openssl rand -hex 32 > "$TOKEN_FILE"

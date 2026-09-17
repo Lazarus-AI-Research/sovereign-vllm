@@ -103,6 +103,9 @@ def test_resolver_preserves_bounded_native_identity(tmp_path, monkeypatch, relat
     assert agent.observed_model(str(model)) == identity
     if model.suffix == ".gguf":
         assert agent.resolve_model(relative, hashlib.sha256(model.read_bytes()).hexdigest()) == model
+    else:
+        with pytest.raises(ValueError, match=".gguf"):
+            agent.resolve_model(relative, hashlib.sha256(model.read_bytes()).hexdigest())
     if relative.startswith(("nested dir/", "é/")):
         assert len(identity.encode("utf-8")) == 512
         assert len(str(model).encode("utf-8")) > 512

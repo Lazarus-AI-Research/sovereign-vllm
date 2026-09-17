@@ -140,6 +140,14 @@ jobs:
             'import fastapi, lazarus.agent.server, yaml'
           "$TEST_HOME/.sovereign/runtime/bin/llama-server" --version
           "$TEST_HOME/.sovereign/runtime/bin/sd-server" -h >/dev/null
+          grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
+          # An agent.yaml from before image deployments gains the image server
+          # at upgrade and keeps everything else.
+          printf 'listen: 127.0.0.1\nport: 9100\ndeployments: {}\n' > "$TEST_HOME/.sovereign/agent.yaml"
+          HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
+            stage/agent-dist/install-agent.sh
+          grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
+          grep -q "^port: 9100" "$TEST_HOME/.sovereign/agent.yaml"
           rm -rf "$TEST_HOME"
           tar -C stage -czf "sovereign-metal-agent-$VERSION-arm64.tar.gz" .
           shasum -a 256 "sovereign-metal-agent-$VERSION-arm64.tar.gz" > "sovereign-metal-agent-$VERSION-arm64.tar.gz.sha256"
