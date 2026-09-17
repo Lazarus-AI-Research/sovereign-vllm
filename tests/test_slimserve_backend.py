@@ -15,11 +15,9 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from lazarus.appliance.backends import select_backend
-from lazarus.appliance.backends.agent import AgentBackend
 from lazarus.appliance.backends.base import BackendStartError
 from lazarus.appliance.backends.fake import FakeBackend
 from lazarus.appliance.backends.slimserve import SlimServeBackend, _stop_group, child_environment, validate_observation
-from lazarus.appliance.backends.slimserve_agent import SlimServeAgentBackend
 from lazarus.appliance.backends.vllm_engine import VllmBackend
 from lazarus.appliance.config import (
     QUIXICORE_CUDA_COMMIT,
@@ -219,7 +217,7 @@ def test_slimserve_rejects_secondary_runtime_roles(slimserve_document, name):
 
 @pytest.mark.parametrize("selection,expected", [
     (None, SlimServeBackend), ("vllm", SlimServeBackend), ("fake", SlimServeBackend),
-    ("slimserve", SlimServeBackend), ("agent", SlimServeAgentBackend),
+    ("slimserve", SlimServeBackend),
 ])
 def test_explicit_slimserve_selection_wins_over_legacy_environment(slimserve_config, monkeypatch, selection, expected):
     if selection is not None:
@@ -228,7 +226,7 @@ def test_explicit_slimserve_selection_wins_over_legacy_environment(slimserve_con
 
 
 @pytest.mark.parametrize("selection,expected", [
-    (None, VllmBackend), ("vllm", VllmBackend), ("fake", FakeBackend), ("agent", AgentBackend),
+    (None, VllmBackend), ("vllm", VllmBackend), ("fake", FakeBackend),
 ])
 @pytest.mark.parametrize("with_config", [False, True])
 def test_legacy_selection_is_unchanged(config_file, monkeypatch, selection, expected, with_config):
@@ -1093,58 +1091,6 @@ def test_cancelled_spawn_without_handle_never_claims_withdrawal(slimserve_config
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("adapter", [AgentBackend, SlimServeAgentBackend])
-def test_native_installed_slimserve_survives_host_manifest_and_inherited_adapter(boundaries, tmp_path, monkeypatch, adapter):
-    from lazarus.agent.config import AgentConfig
-    from lazarus.agent.server import Agent, build_app
-
-    boundaries.availability.update(
-        variants=["metal"],
-        kernel_library={"name": "quixicore-metal", "version": f"{QUIXICORE_METAL_COMMIT}+slimserve.{SLIMSERVE_COMMIT}"},
-    )
-    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "host-secret")
-    monkeypatch.setenv("SOVEREIGN_AGENT_URL", "http://host")
-    host = Agent(AgentConfig(roles={}, llama_server=str(tmp_path / "missing" / "llama-server")))
-
-    async def exercise():
-        await host.discover_engines()
-        assert host.available_engines == [boundaries.availability]
-        assert [call.kind for call in boundaries.calls] == ["availability"]
-        assert not any(process.group_alive for process in boundaries.processes)
-        app = build_app(host)
-        monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: AsyncClient(
-            *args, transport=ASGITransport(app=app), **kwargs,
-        ))
-        available = await adapter().available_engines()
-        assert available == host.available_engines
-        assert available[0]["variants"] == ["metal"]
-        assert available[0]["kernel_library"] == boundaries.availability["kernel_library"]
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("adapter", [AgentBackend, SlimServeAgentBackend])
-def test_host_variants_are_engine_specific_without_normalizing_identity(monkeypatch, adapter):
-    llama = {"name": "llama.cpp", "version": "b9960-a935fbffe", "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
-    slimserve = {"name": "slimserve", "version": SLIMSERVE_COMMIT, "adapter": "slimserve-runtime", "variants": ["metal"]}
-    available = [
-        llama, slimserve,
-        {**llama, "variants": ["metal"]}, {**slimserve, "variants": ["metal-arm64"]},
-        {**slimserve, "variants": ["a100", "rtx3090"]}, {**slimserve, "version": None},
-        {**slimserve, "name": ["slimserve"]},
-    ]
-    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "host-secret")
-
-    def respond(request):
-        assert request.headers["Authorization"] == "Bearer host-secret"
-        return httpx.Response(200, json={"available_engines": available})
-
-    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: AsyncClient(
-        *args, transport=httpx.MockTransport(respond), **kwargs,
-    ))
-    assert asyncio.run(adapter().available_engines()) == [llama, slimserve]
-
-
 def test_native_owned_group_is_reaped_before_withdrawal_acknowledgement():
     # Exercise OS supervision, not a simulated returncode or successful signal.
     program = (
@@ -1172,73 +1118,6 @@ def test_native_owned_group_is_reaped_before_withdrawal_acknowledgement():
         finally:
             if process.returncode is None:
                 await _stop_group(process)
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("uncertain_cleanup", [False, True])
-def test_host_recovery_drains_handlers_then_requires_verified_withdrawal(
-    slimserve_document, boundaries, tmp_path, monkeypatch, uncertain_cleanup,
-):
-    from lazarus.agent.config import AgentConfig
-    from lazarus.agent.server import Agent, build_app
-
-    config = _metal_config(slimserve_document)
-    boundaries.chat_status = 500
-    boundaries.observation = _observation(config)
-    if uncertain_cleanup:
-        boundaries.group_probe_error = PermissionError("cannot prove native group absence")
-    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "host-secret")
-    monkeypatch.setenv("SOVEREIGN_AGENT_URL", "http://host")
-    backend = SlimServeBackend()
-    host = Agent(AgentConfig(roles={}), tmp_path / "agent.yaml")
-    host.generation_backend = backend
-
-    async def exercise():
-        try:
-            with pytest.raises(PermissionError if uncertain_cleanup else BackendStartError):
-                await backend.start(config, lambda state: None)
-            handler_wait = asyncio.Event()
-
-            class HandlerDrain(asyncio.Event):
-                async def wait(self):
-                    handler_wait.set()
-                    return await super().wait()
-
-            host.generation_idle = HandlerDrain()
-            host.generation_requests = 1
-            app = build_app(host)
-            monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: AsyncClient(
-                *args, transport=ASGITransport(app=app), **kwargs,
-            ))
-            remote = SlimServeAgentBackend()
-            pending = asyncio.create_task(remote.quiesce())
-            await asyncio.wait_for(handler_wait.wait(), 2)
-            assert host.generation_admission_paused is True
-            assert remote.generation_paused is True
-            assert not pending.done(), "withdrawal cannot bypass admitted handler completion"
-            host.generation_requests = 0
-            host.generation_idle.set()
-            if uncertain_cleanup:
-                with pytest.raises(httpx.HTTPStatusError) as error:
-                    await asyncio.wait_for(pending, 2)
-                assert error.value.response.status_code == 503
-                assert backend._process is not None
-            else:
-                await asyncio.wait_for(pending, 2)
-                assert backend._process is None
-            with pytest.raises(httpx.HTTPStatusError) as error:
-                await remote.resume()
-            assert error.value.response.status_code == 503
-            assert remote.generation_paused is True
-            assert host.generation_admission_paused is True
-            boundaries.group_probe_error = None
-            await backend.shutdown()
-            await remote.quiesce()
-            assert remote.generation_paused is True
-        finally:
-            boundaries.group_probe_error = None
-            await backend.shutdown()
 
     asyncio.run(exercise())
 

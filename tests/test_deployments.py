@@ -12,7 +12,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from lazarus.agent.config import AgentConfig, AgentRole, load_agent_config
+from lazarus.agent.config import AgentConfig, load_agent_config
 from lazarus.agent.server import Agent, build_app
 
 
@@ -26,7 +26,7 @@ def no_native_availability_probe(monkeypatch):
 
 @pytest.fixture()
 def harness(tmp_path, monkeypatch):
-    """An agent with one installer role, a fake llama-server that answers
+    """An agent with no deployments yet, a fake llama-server that answers
     health and inference on whatever port it was started on, and a record of
     every child spawned and stopped."""
     monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "agent-secret")
@@ -38,8 +38,6 @@ def harness(tmp_path, monkeypatch):
     weights.write_bytes(b"second model")
     projector = models / "second-mmproj.gguf"
     projector.write_bytes(b"projector")
-    generation = models / "generation.gguf"
-    generation.write_bytes(b"generation")
     children, stopped = [], []
     healthy_ports = set()
     inference = []
@@ -100,9 +98,7 @@ def harness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", client)
     control = SimpleNamespace(refuse_next=0)
-    agent = Agent(AgentConfig(roles={
-        "generation": AgentRole(model_path=str(generation), port=9101, revision="a" * 40, context_length=8192),
-    }), tmp_path / "agent.yaml")
+    agent = Agent(AgentConfig(), tmp_path / "agent.yaml")
     agent.deployment_ready_timeout = 2
     agent.save_config()
     return SimpleNamespace(
@@ -145,14 +141,14 @@ def test_deployment_is_its_own_process_on_its_own_port_and_is_persisted(harness)
         child = harness.children[-1]
         assert child.port == 9110 and child.command[child.command.index("-c") + 1] == "4096"
         assert child.command[child.command.index("--alias") + 1] == "assistant-second"
-        assert "--jinja" in child.command and "--mmproj" in child.command and child.command[-1] == "--metrics"
+        assert "--jinja" in child.command and "--mmproj" in child.command and "--metrics" not in child.command
         assert child.env["LLAMA_API_KEY"].endswith("-agent")
 
         listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]
         assert listed["assistant-second"]["served_model_name"] == "assistant-second"
         assert listed["assistant-second"]["status"] == "healthy"
         manifest = api.get("/agent/manifest", headers=harness.headers).json()
-        assert "assistant-second" in manifest["deployments"] and "generation" in manifest["roles"]
+        assert "assistant-second" in manifest["deployments"] and "roles" not in manifest
 
     saved = yaml.safe_load(harness.config_path.read_text())
     assert saved["deployments"]["assistant-second"]["port"] == 9110
@@ -194,7 +190,7 @@ def test_removing_a_deployment_stops_only_that_process(harness):
         assert removed.status_code == 200 and removed.json()["status"] == "stopped"
         assert harness.stopped == [9110]
         assert "assistant-second" not in harness.agent.config.deployments
-        assert "assistant-third" in harness.agent.deployments and harness.agent.roles["generation"].running()
+        assert "assistant-third" in harness.agent.deployments and harness.agent.deployments["assistant-third"].running()
         assert api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers).json()["status"] == "absent"
     assert "assistant-second" not in yaml.safe_load(harness.config_path.read_text()).get("deployments", {})
 
@@ -229,23 +225,22 @@ def test_bad_requests_are_refused_before_any_process_starts(harness, bad):
     with TestClient(build_app(harness.agent)) as api:
         response = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, **bad))
         assert response.status_code == 422, response.text
-        assert len(harness.children) == 1
+        assert harness.children == []
     assert api.put("/agent/admin/deployments/Bad_ID", headers=harness.headers, json=second_request(harness)).status_code == 422
-    assert api.put("/agent/admin/deployments/generation", headers=harness.headers, json=second_request(harness)).status_code == 409
 
 
 def test_restarted_agent_serves_its_recorded_deployments(harness):
     with TestClient(build_app(harness.agent)) as api:
         api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
     restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
-    restarted.start_roles()
-    assert {child.port for child in harness.children[-2:]} == {9101, 9110}
+    restarted.start_deployments()
+    assert {child.port for child in harness.children[-1:]} == {9110}
     assert asyncio.run(restarted.wait_ready(timeout=5)) is None
     assert "assistant-second" in restarted.deployments
 
 
-# A deployment that hangs must not make the manifest, which the runtime reads
-# with a five-second budget, fail for the roles beside it.
+# A deployment that hangs must not make the manifest, which Control reads
+# with a five-second budget, fail for the deployments beside it.
 def test_a_hung_deployment_does_not_stall_the_manifest(harness, monkeypatch):
     import time as clock
 
@@ -255,8 +250,7 @@ def test_a_hung_deployment_does_not_stall_the_manifest(harness, monkeypatch):
         async def hang():
             await asyncio.sleep(30)
 
-        # Only the deployment's own probe hangs; the manifest's role probes are
-        # unbounded and would otherwise stall the request themselves.
+        # Only the deployment's own probe hangs.
         monkeypatch.setattr(harness.agent.deployments["assistant-second"], "healthy", hang)
         started = clock.monotonic()
         manifest = api.get("/agent/manifest", headers=harness.headers)
@@ -267,18 +261,18 @@ def test_a_hung_deployment_does_not_stall_the_manifest(harness, monkeypatch):
 # Listing a deployment that is removed while it is being probed reports it
 # absent rather than failing the whole listing.
 def test_listing_survives_a_deployment_removed_mid_probe(harness, monkeypatch):
-    from lazarus.agent.server import RoleProcess
+    from lazarus.agent.server import ServerProcess
 
     with TestClient(build_app(harness.agent)) as api:
         api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
-        original = RoleProcess.healthy
+        original = ServerProcess.healthy
 
         async def remove_then_answer(self):
             harness.agent.config.deployments = {}
             harness.agent.deployments.pop("assistant-second", None)
             return await original(self)
 
-        monkeypatch.setattr(RoleProcess, "healthy", remove_then_answer)
+        monkeypatch.setattr(ServerProcess, "healthy", remove_then_answer)
         listed = api.get("/agent/deployments", headers=harness.headers)
         assert listed.status_code == 200 and listed.json()["deployments"] == {}
 
@@ -378,15 +372,6 @@ def test_a_slow_child_shutdown_does_not_block_other_traffic(harness):
     assert asyncio.run(scenario()) >= 5
 
 
-# The fixed role names stay reserved whether or not the role is configured:
-# enabling the embedding role later must never collide with a deployment.
-def test_role_names_are_reserved_even_when_the_role_is_absent(harness):
-    with TestClient(build_app(harness.agent)) as api:
-        assert "embedding" not in harness.agent.config.roles
-        refused = api.put("/agent/admin/deployments/embedding", headers=harness.headers, json=second_request(harness))
-        assert refused.status_code == 409
-
-
 # While a replacement waits for the old child to die, the deployment is still
 # configured: a request then is told to retry, not that the name is unknown.
 def test_a_deployment_between_processes_answers_503_not_404(harness):
@@ -440,7 +425,7 @@ def test_a_restart_refuses_a_weight_that_no_longer_matches_its_checksum(harness,
     harness.weights.write_bytes(b"tampered model")
     restarted = Agent(saved, harness.config_path)
     restarted.deployment_ready_timeout = 2
-    restarted.start_roles()
+    restarted.start_deployments()
     assert "assistant-second" not in restarted.deployments
     assert "no longer matches its recorded checksum" in caplog.text
     restarted.stop()
@@ -800,31 +785,6 @@ def test_concurrent_creations_never_share_a_port(harness):
     assert len(set(ports.values())) == 2 and harness.agent.port_reservations == set()
 
 
-# Deployment probes run beside the role probes, so a slow deployment never
-# pushes the manifest past what the roles alone take.
-def test_deployment_probes_do_not_add_to_the_manifest_time(harness, monkeypatch):
-    import time as clock
-
-    with TestClient(build_app(harness.agent)) as api:
-        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
-
-        async def slow_role():
-            await asyncio.sleep(1.2)
-            return True
-
-        async def slower_deployment():
-            await asyncio.sleep(1.2)
-            return True
-
-        monkeypatch.setattr(harness.agent.roles["generation"], "healthy", slow_role)
-        monkeypatch.setattr(harness.agent.deployments["assistant-second"], "healthy", slower_deployment)
-        started = clock.monotonic()
-        manifest = api.get("/agent/manifest", headers=harness.headers)
-        elapsed = clock.monotonic() - started
-        assert manifest.status_code == 200 and manifest.json()["deployments"]["assistant-second"]["status"] == "healthy"
-        assert elapsed < 2.0
-
-
 # A candidate is never in the configuration before it is confirmed, so a save
 # another deployment makes meanwhile persists only what was verified.
 def test_a_candidate_is_never_persisted_before_it_is_confirmed(harness, monkeypatch):
@@ -843,7 +803,7 @@ def test_a_candidate_is_never_persisted_before_it_is_confirmed(harness, monkeypa
         monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
         replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
         await asyncio.sleep(0.1)
-        async with harness.agent.role_lock:
+        async with harness.agent.records_lock:
             harness.agent.save_config()
         during = load_agent_config(harness.config_path).deployments["assistant-second"].revision
         await replacement
@@ -886,7 +846,7 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
         # The worker is past its port and waiting for the gate; the shared
         # lock is taken before the gate opens, so the confirmed candidate
         # waits to commit. Only then does the request go.
-        async with harness.agent.role_lock:
+        async with harness.agent.records_lock:
             gate.set()
             for _ in range(200):
                 await asyncio.sleep(0.02)
@@ -974,7 +934,7 @@ def test_a_transition_abandoned_while_waiting_for_the_shared_lock_touches_nothin
         admission = harness.agent.deployment_admission["assistant-second"]
         admission.enter()
         spawned = len(harness.children)
-        async with harness.agent.role_lock:
+        async with harness.agent.records_lock:
             replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
             await asyncio.sleep(0.05)
             replacement.cancel()
@@ -1062,7 +1022,7 @@ def test_a_candidate_that_dies_before_the_commit_is_rolled_back(harness, monkeyp
         monkeypatch.setattr(deployments, "wait_deployment_ready", gated_wait)
         replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
         await asyncio.sleep(0.1)
-        async with harness.agent.role_lock:
+        async with harness.agent.records_lock:
             gate.set()
             for _ in range(200):
                 await asyncio.sleep(0.02)

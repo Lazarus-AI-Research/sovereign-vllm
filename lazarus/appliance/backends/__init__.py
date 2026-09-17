@@ -24,10 +24,6 @@ __all__ = ["BackendStartError", "EngineBackend", "FakeBackend", "RoleInfo", "sel
 def select_backend(config: RuntimeConfig | None = None) -> EngineBackend:
     name = os.environ.get("SOVEREIGN_ENGINE_BACKEND", "vllm").lower()
     if config is not None and config.roles.generation.engine == "slimserve":
-        if name == "agent":
-            from lazarus.appliance.backends.slimserve_agent import SlimServeAgentBackend
-
-            return SlimServeAgentBackend()
         from lazarus.appliance.backends.slimserve import SlimServeBackend
 
         return SlimServeBackend()
@@ -37,8 +33,4 @@ def select_backend(config: RuntimeConfig | None = None) -> EngineBackend:
         from lazarus.appliance.backends.vllm_engine import VllmBackend
 
         return VllmBackend()
-    if name == "agent":
-        from lazarus.appliance.backends.agent import AgentBackend
-
-        return AgentBackend()
     raise ValueError(f"unknown SOVEREIGN_ENGINE_BACKEND: {name!r}")
