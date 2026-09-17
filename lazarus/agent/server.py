@@ -339,7 +339,7 @@ class Agent:
             self.roles[name] = self.start_role(name)
         for deployment_id in self.config.deployments:
             try:
-                self.deployments[deployment_id] = start_deployment(self, deployment_id)
+                self.deployments[deployment_id] = start_deployment(self, deployment_id, verify=True)
             except (OSError, ValueError) as exc:
                 logger.error("deployment %s did not start: %s", deployment_id, exc)
 
