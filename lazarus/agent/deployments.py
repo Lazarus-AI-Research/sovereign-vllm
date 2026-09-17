@@ -335,6 +335,10 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
 
 async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition) -> dict:
     async with agent.role_lock:
+        if transition.abandoned:
+            # The request went away while this waited for the lock; nothing
+            # has been touched, and nothing will be.
+            return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
         candidate = AgentDeployment(
             kind=request.kind, model_path=str(model), mmproj_path=str(mmproj) if mmproj else None,
@@ -354,7 +358,10 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
         agent.deployment_admission[deployment_id] = Admission()
         agent.deployment_admission[deployment_id].paused = True
         try:
-            if previous is not None:
+            # The previous process goes, and so does a child a failed creation
+            # left registered without a record: a handle is never overwritten
+            # while its child may still run.
+            if previous is not None or deployment_id in agent.deployments:
                 await stop_deployment(agent, deployment_id)
             # The drain may have taken minutes; the files are checked again
             # right before they are loaded, so what starts is what was pinned.
@@ -412,8 +419,16 @@ async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
 
 async def forget_deployment(agent: Agent, deployment_id: str, transition: Transition) -> dict:
     async with agent.role_lock:
+        if transition.abandoned:
+            return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
         if previous is None:
+            # No record, but a child a failed creation could not stop may
+            # still be registered; it is stopped rather than called absent.
+            if deployment_id in agent.deployments:
+                await stop_deployment(agent, deployment_id)
+                agent.deployment_admission.pop(deployment_id, None)
+                return {"status": "stopped", "id": deployment_id}
             return {"status": "absent", "id": deployment_id}
         was_paused = await quiesce(agent, deployment_id)
         if transition.abandoned:
