@@ -1210,8 +1210,8 @@ def test_an_image_deployment_is_an_sd_server_child(harness):
 
 
 # A component the server has no flag for, a component on a language model,
-# or a diffusion request without its sampling are refused before anything
-# starts; a component whose bytes changed since is refused at restart.
+# or a safetensors file for llama-server are refused before anything starts;
+# a component whose bytes changed since is refused at restart.
 def test_image_components_are_constrained_and_verified(harness, caplog):
     with TestClient(build_app(harness.agent)) as api:
         wrong = image_request(harness)
@@ -1219,6 +1219,9 @@ def test_image_components_are_constrained_and_verified(harness, caplog):
         assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=wrong).status_code == 422
         mixed = second_request(harness, components=image_request(harness)["components"])
         assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=mixed).status_code == 422
+        tensors = second_request(harness, artifact="metal/ae.safetensors", sha256=digest(harness.models / "ae.safetensors"), mmproj=None, mmproj_sha256=None)
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=tensors)
+        assert refused.status_code == 422 and ".gguf" in refused.text
         assert harness.children == []
         assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=image_request(harness)).status_code == 200
     (harness.models / "t5xxl-Q8_0.gguf").write_bytes(b"tampered encoder")
@@ -1228,3 +1231,18 @@ def test_image_components_are_constrained_and_verified(harness, caplog):
     assert "pictures" not in restarted.deployments
     assert "no longer matches its recorded checksum" in caplog.text
     restarted.stop()
+
+
+# A single-file checkpoint carries its own encoders and autoencoder, and the
+# server loads it under its full-model flag rather than as standalone
+# diffusion weights.
+def test_a_single_file_checkpoint_loads_as_a_full_model(harness):
+    checkpoint = harness.models / "sd-v1-5.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    with TestClient(build_app(harness.agent)) as api:
+        request = image_request(harness, artifact="metal/sd-v1-5.safetensors", sha256=digest(checkpoint), components={}, steps=None, cfg_scale=None, sampler=None)
+        created = api.put("/agent/admin/deployments/sketches", headers=harness.headers, json=request)
+        assert created.status_code == 200, created.text
+        command = harness.children[-1].command
+        assert command[command.index("--model") + 1] == str(checkpoint) and "--diffusion-model" not in command
+        assert command[command.index("--steps") + 1] == "20" and command[command.index("--cfg-scale") + 1] == "7.0"
