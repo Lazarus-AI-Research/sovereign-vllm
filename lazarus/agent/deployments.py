@@ -13,8 +13,9 @@ import time
 from typing import TYPE_CHECKING, Literal
 
 import httpx
+from anyio import CancelScope
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
@@ -28,6 +29,10 @@ DEPLOYMENT_PORTS = range(9110, 9200)
 # in this long is not worth keeping a replacement waiting for.
 IDLE_TIMEOUT = 600.0
 READY_TIMEOUT = 300.0
+# The manifest is read by clients with a five-second budget; every deployment
+# is probed at once and each probe is cut off well inside it, so a hung
+# deployment can never make the manifest fail for the roles beside it.
+OBSERVE_TIMEOUT = 1.5
 
 ALLOWED_PATHS = {
     "generation": {"chat/completions", "completions", "models"},
@@ -129,6 +134,7 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     else:
         command += ["--jinja"]
     command += [
+        "--alias", deployment.served_model_name,
         "--host", "127.0.0.1",
         "--port", str(deployment.port),
         # b9960 applies env before argv, then remote selection after argv; the
@@ -158,8 +164,7 @@ def free_port(agent: Agent) -> int:
     raise RuntimeError("no free deployment port")
 
 
-def status_of(agent: Agent, deployment_id: str, healthy: bool) -> dict:
-    deployment = agent.config.deployments[deployment_id]
+def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool) -> dict:
     process = agent.deployments.get(deployment_id)
     running = process is not None and process.running()
     try:
@@ -179,11 +184,24 @@ def status_of(agent: Agent, deployment_id: str, healthy: bool) -> dict:
 
 
 async def observe_deployments(agent: Agent) -> dict[str, dict]:
-    result = {}
-    for deployment_id in list(agent.config.deployments):
+    snapshot = list(agent.config.deployments.items())
+
+    async def probe(deployment_id: str) -> bool:
         process = agent.deployments.get(deployment_id)
-        healthy = process is not None and await process.healthy()
-        result[deployment_id] = status_of(agent, deployment_id, healthy)
+        if process is None:
+            return False
+        try:
+            return await asyncio.wait_for(process.healthy(), timeout=OBSERVE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+
+    healthy = await asyncio.gather(*(probe(deployment_id) for deployment_id, _ in snapshot))
+    result = {}
+    for (deployment_id, deployment), is_healthy in zip(snapshot, healthy):
+        # A deployment removed while it was being probed is not reported.
+        if agent.config.deployments.get(deployment_id) is not deployment:
+            continue
+        result[deployment_id] = status_of(agent, deployment_id, deployment, is_healthy)
     return result
 
 
@@ -230,8 +248,12 @@ def stop_deployment(agent: Agent, deployment_id: str) -> None:
 
 
 async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest) -> dict:
-    model = agent.resolve_model(request.artifact, request.sha256)
-    mmproj = agent.resolve_model(request.mmproj, request.mmproj_sha256) if request.mmproj else None
+    # Checksumming multi-gigabyte weights must not stall every other
+    # deployment's stream, so it runs off the event loop.
+    model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256)
+    mmproj = None
+    if request.mmproj:
+        mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256)
     async with agent.role_lock:
         previous = agent.config.deployments.get(deployment_id)
         candidate = AgentDeployment(
@@ -252,40 +274,57 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
             agent.deployments[deployment_id] = process
             await wait_deployment_ready(agent, candidate, process)
             agent.save_config()
-        except Exception as exc:
-            stop_deployment(agent, deployment_id)
-            rolled_back, rollback_error = False, None
-            try:
-                if previous is None:
-                    agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
-                    agent.deployment_admission.pop(deployment_id, None)
-                else:
-                    agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
-                    restored = start_deployment(agent, deployment_id)
-                    agent.deployments[deployment_id] = restored
-                    await wait_deployment_ready(agent, previous, restored)
-                    agent.deployment_admission[deployment_id].paused = False
-                agent.save_config()
-                rolled_back = True
-            except Exception as rollback_exc:
-                rollback_error = str(rollback_exc)
+        except (Exception, asyncio.CancelledError) as exc:
+            # A cancelled request is a failed one: the previous process is
+            # already stopped, so the rollback runs to completion before the
+            # cancellation is re-raised.
+            with CancelScope(shield=True):
+                stop_deployment(agent, deployment_id)
+                rolled_back, rollback_error = False, None
+                try:
+                    if previous is None:
+                        agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+                        agent.deployment_admission.pop(deployment_id, None)
+                    else:
+                        agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+                        restored = start_deployment(agent, deployment_id)
+                        agent.deployments[deployment_id] = restored
+                        await wait_deployment_ready(agent, previous, restored)
+                        agent.deployment_admission[deployment_id].paused = False
+                    agent.save_config()
+                    rolled_back = True
+                except Exception as rollback_exc:
+                    rollback_error = str(rollback_exc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             return {
                 "status": "unhealthy", "id": deployment_id, "error": str(exc),
                 "rolled_back": rolled_back, "rollback_verified": rolled_back, "rollback_error": rollback_error,
             }
         agent.deployment_admission[deployment_id].paused = False
-        return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, True)}
+        return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, candidate, True)}
+
+
+class PersistenceError(RuntimeError):
+    """The process is gone but agent.yaml still records it; a retry finishes
+    the removal rather than reporting a deployment absent that a restarted
+    agent would serve again."""
 
 
 async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
     async with agent.role_lock:
-        if deployment_id not in agent.config.deployments:
+        previous = agent.config.deployments.get(deployment_id)
+        if previous is None:
             return {"status": "absent", "id": deployment_id}
         await quiesce(agent, deployment_id)
         stop_deployment(agent, deployment_id)
         agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+        try:
+            agent.save_config()
+        except Exception as exc:
+            agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+            raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
         agent.deployment_admission.pop(deployment_id, None)
-        agent.save_config()
         return {"status": "stopped", "id": deployment_id}
 
 
@@ -310,7 +349,10 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     async def delete_deployment(deployment_id: str):
         if not DEPLOYMENT_ID.match(deployment_id):
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
-        return await remove_deployment(agent, deployment_id)
+        try:
+            return await remove_deployment(agent, deployment_id)
+        except PersistenceError as exc:
+            return JSONResponse(status_code=500, content={"error": str(exc), "id": deployment_id})
 
     @app.api_route("/deployments/{deployment_id}/v1/{path:path}", methods=["GET", "POST"])
     async def proxy_deployment(deployment_id: str, path: str, request: Request):
@@ -344,12 +386,22 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             raise
 
         async def relay():
+            async for chunk in response.aiter_raw():
+                yield chunk
+
+        async def cleanup():
+            # Runs shielded from the client's disconnect, and releases
+            # admission even when closing the upstream fails: a leaked count
+            # would make the next replacement wait the whole drain timeout.
             try:
-                async for chunk in response.aiter_raw():
-                    yield chunk
-            finally:
                 await response.aclose()
                 await client.aclose()
+            finally:
                 admission.leave()
 
-        return StreamingResponse(relay(), status_code=response.status_code, media_type=response.headers.get("content-type"))
+        from lazarus.agent.server import RoleStreamingResponse
+
+        return RoleStreamingResponse(
+            relay(), cleanup=cleanup, status_code=response.status_code,
+            media_type=response.headers.get("content-type"),
+        )

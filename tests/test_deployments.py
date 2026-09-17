@@ -132,6 +132,7 @@ def test_deployment_is_its_own_process_on_its_own_port_and_is_persisted(harness)
 
         child = harness.children[-1]
         assert child.port == 9110 and child.command[child.command.index("-c") + 1] == "4096"
+        assert child.command[child.command.index("--alias") + 1] == "assistant-second"
         assert "--jinja" in child.command and "--mmproj" in child.command and child.command[-1] == "--metrics"
         assert child.env["LLAMA_API_KEY"].endswith("-agent")
 
@@ -229,3 +230,80 @@ def test_restarted_agent_serves_its_recorded_deployments(harness):
     assert {child.port for child in harness.children[-2:]} == {9101, 9110}
     assert asyncio.run(restarted.wait_ready(timeout=5)) is None
     assert "assistant-second" in restarted.deployments
+
+
+# A deployment that hangs must not make the manifest, which the runtime reads
+# with a five-second budget, fail for the roles beside it.
+def test_a_hung_deployment_does_not_stall_the_manifest(harness, monkeypatch):
+    import time as clock
+
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+
+        async def hang():
+            await asyncio.sleep(30)
+
+        # Only the deployment's own probe hangs; the manifest's role probes are
+        # unbounded and would otherwise stall the request themselves.
+        monkeypatch.setattr(harness.agent.deployments["assistant-second"], "healthy", hang)
+        started = clock.monotonic()
+        manifest = api.get("/agent/manifest", headers=harness.headers)
+        assert manifest.status_code == 200 and clock.monotonic() - started < 4
+        assert manifest.json()["deployments"]["assistant-second"]["status"] == "loading"
+
+
+# Listing a deployment that is removed while it is being probed reports it
+# absent rather than failing the whole listing.
+def test_listing_survives_a_deployment_removed_mid_probe(harness, monkeypatch):
+    from lazarus.agent.server import RoleProcess
+
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        original = RoleProcess.healthy
+
+        async def remove_then_answer(self):
+            harness.agent.config.deployments = {}
+            harness.agent.deployments.pop("assistant-second", None)
+            return await original(self)
+
+        monkeypatch.setattr(RoleProcess, "healthy", remove_then_answer)
+        listed = api.get("/agent/deployments", headers=harness.headers)
+        assert listed.status_code == 200 and listed.json()["deployments"] == {}
+
+
+# A removal whose record cannot be written is reported as a failure and
+# finished by the retry, never as an absence a restarted agent would contradict.
+def test_removal_that_cannot_persist_is_retried_not_forgotten(harness, monkeypatch):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        real_save = harness.agent.save_config
+        attempts = []
+
+        def failing_save():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("disk full")
+            real_save()
+
+        monkeypatch.setattr(harness.agent, "save_config", failing_save)
+        first = api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers)
+        assert first.status_code == 500 and "assistant-second" in harness.agent.config.deployments
+        assert "assistant-second" in yaml.safe_load(harness.config_path.read_text())["deployments"]
+        second = api.delete("/agent/admin/deployments/assistant-second", headers=harness.headers)
+        assert second.status_code == 200 and second.json()["status"] == "stopped"
+        assert "assistant-second" not in yaml.safe_load(harness.config_path.read_text()).get("deployments", {})
+
+
+# The checksum of a multi-gigabyte artifact never runs on the event loop.
+def test_artifacts_are_checksummed_off_the_event_loop(harness, monkeypatch):
+    threads = []
+    real_to_thread = asyncio.to_thread
+
+    async def recording_to_thread(function, *args, **kwargs):
+        threads.append(getattr(function, "__name__", str(function)))
+        return await real_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+    assert threads.count("resolve_model") == 2
