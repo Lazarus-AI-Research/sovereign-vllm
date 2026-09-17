@@ -356,6 +356,10 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
             return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
         async with agent.role_lock:
+            if transition.abandoned:
+                # The request went away while this waited for the shared
+                # lock; no drain, no process, nothing.
+                return {"status": "unchanged", "id": deployment_id}
             port = previous.port if previous else free_port(agent)
             agent.port_reservations.add(port)
         try:
@@ -404,8 +408,15 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
             # this waited for it.
             if transition.abandoned:
                 raise RuntimeError("the request was cancelled before the deployment was confirmed")
-            agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
-            agent.save_config()
+            committed = agent.config.deployments
+            agent.config.deployments = {**committed, deployment_id: candidate}
+            try:
+                agent.save_config()
+            except Exception:
+                # A record that could not be saved is not a record: what was
+                # committed before stays, in memory as on disk.
+                agent.config.deployments = committed
+                raise
     except Exception as exc:
         # A cancelled request is a failed one. The configuration never held
         # the candidate, so whatever cleanup does next, the rejected
@@ -465,13 +476,15 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
             agent.deployment_admission[deployment_id].paused = was_paused
             return {"status": "unchanged", "id": deployment_id}
         await stop_deployment(agent, deployment_id)
-        agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
-        try:
-            async with agent.role_lock:
+        # The record goes, is saved, or comes back, under one acquisition of
+        # the shared lock: no creation can take the port in between.
+        async with agent.role_lock:
+            agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+            try:
                 agent.save_config()
-        except Exception as exc:
-            agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
-            raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
+            except Exception as exc:
+                agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+                raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
         agent.deployment_admission.pop(deployment_id, None)
         return {"status": "stopped", "id": deployment_id}
 
