@@ -410,9 +410,12 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         transition.committing = True
         async with agent.role_lock:
             # Checked again under the lock: the request may have gone while
-            # this waited for it.
+            # this waited for it, and so may the candidate. Either is the
+            # failure the rollback below handles, never a record.
             if transition.abandoned:
                 raise RuntimeError("the request was cancelled before the deployment was confirmed")
+            if not process.running():
+                raise RuntimeError("the deployment exited before it could be recorded")
             committed = agent.config.deployments
             agent.config.deployments = {**committed, deployment_id: candidate}
             try:
