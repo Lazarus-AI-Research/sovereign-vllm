@@ -1144,3 +1144,54 @@ def test_a_disconnected_request_abandons_its_transition(harness, monkeypatch):
     result, revision, paused = asyncio.run(scenario())
     assert result["status"] == "unhealthy" and result["rolled_back"] is True and "cancelled" in result["error"]
     assert revision == "c" * 40 and paused is False
+
+
+# A real client disconnect, delivered through the application's own ASGI
+# stack (authentication included), abandons the transition and rolls it back.
+def test_a_real_http_disconnect_abandons_the_transition(harness, monkeypatch):
+    import time as clock
+
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    monkeypatch.setattr(deployments, "DISCONNECT_POLL", 0.02)
+    app = build_app(harness.agent)
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        real_wait = deployments.wait_deployment_ready
+
+        async def slow_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await asyncio.sleep(0.5)
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
+        body = json.dumps(second_request(harness, revision="d" * 40)).encode()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+        gone_at = clock.monotonic() + 0.15
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            if clock.monotonic() >= gone_at:
+                return {"type": "http.disconnect"}
+            await asyncio.sleep(3600)
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "PUT", "scheme": "http",
+            "path": "/agent/admin/deployments/assistant-second", "raw_path": b"/agent/admin/deployments/assistant-second",
+            "query_string": b"", "root_path": "", "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 9100),
+            "headers": [(b"authorization", b"Bearer agent-secret"), (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+        }
+        await app(scope, receive, send)
+        await settled(harness.agent)
+        return harness.agent.config.deployments["assistant-second"].revision, load_agent_config(harness.config_path).deployments["assistant-second"].revision, harness.agent.deployment_admission["assistant-second"].paused
+
+    revision, saved, paused = asyncio.run(scenario())
+    assert revision == "c" * 40 and saved == "c" * 40 and paused is False
