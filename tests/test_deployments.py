@@ -691,12 +691,20 @@ def test_a_new_creation_stops_a_child_left_registered_without_a_record(harness):
 
 # A transition cancelled while it waited for the lock touches nothing: the
 # deployment is never paused for a request that is already gone.
-def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harness):
+def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harness, monkeypatch):
+    import time as clock
+
+    import lazarus.agent.deployments as deployments
     from lazarus.agent.deployments import DeploymentRequest, apply_deployment, remove_deployment
+
+    # A request in flight would make a drain wait the whole idle timeout; an
+    # abandoned transition must not drain at all.
+    monkeypatch.setattr(deployments, "IDLE_TIMEOUT", 3)
 
     async def scenario():
         await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
         admission = harness.agent.deployment_admission["assistant-second"]
+        admission.enter()
         outcomes = []
         async with harness.agent.role_lock:
             replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
@@ -708,8 +716,12 @@ def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harne
                     await task
                 except asyncio.CancelledError:
                     outcomes.append("cancelled")
+        started = clock.monotonic()
         await settled(harness.agent)
-        return outcomes, admission.paused, harness.agent.config.deployments["assistant-second"].revision, harness.stopped
+        elapsed = clock.monotonic() - started
+        admission.leave()
+        return outcomes, admission.paused, harness.agent.config.deployments["assistant-second"].revision, harness.stopped, elapsed
 
-    outcomes, paused, revision, stopped = asyncio.run(scenario())
+    outcomes, paused, revision, stopped, elapsed = asyncio.run(scenario())
     assert outcomes == ["cancelled", "cancelled"] and paused is False and revision == "c" * 40 and stopped == []
+    assert elapsed < 1.0
