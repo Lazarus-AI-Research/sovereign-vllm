@@ -591,3 +591,53 @@ def test_a_candidate_rewritten_during_the_drain_is_refused(harness, monkeypatch)
         assert answer.status_code == 422
         assert "no longer matches its recorded checksum" in answer.json()["error"]
         assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
+
+
+# A candidate that fails and then cannot be stopped still leaves the previous
+# record as what is persisted; the failed child stays registered for a retry
+# and the gate stays closed.
+def test_a_candidate_that_cannot_be_stopped_still_restores_the_record(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+        real_spawn = harness.agent.deployments["assistant-second"].process
+        harness.control.refuse_next = 1
+        answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="d" * 40))
+        # The refused candidate is the newest child; its termination fails.
+        candidate = harness.children[-1]
+        assert candidate is not real_spawn
+        assert answer.status_code == 422
+        body = answer.json()
+        assert body["rolled_back"] is True or body["rollback_error"]
+        assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="e" * 40))
+        saved = load_agent_config(harness.config_path)
+        assert saved.deployments["assistant-second"].revision == "e" * 40
+
+
+def test_a_candidate_whose_stop_raises_keeps_the_previous_record_and_the_child(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+        real_wait = deployments.wait_deployment_ready
+        seen = {}
+
+        async def fail_then_break_stop(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                seen["candidate"] = process
+                process.process.terminate = lambda: (_ for _ in ()).throw(RuntimeError("wait timed out"))
+                raise RuntimeError("did not become ready")
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", fail_then_break_stop)
+        answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, revision="d" * 40))
+        body = answer.json()
+        assert answer.status_code == 422 and body["rolled_back"] is False and "wait timed out" in body["rollback_error"]
+        assert harness.agent.config.deployments["assistant-second"].revision == "c" * 40
+        assert harness.agent.deployments["assistant-second"] is seen["candidate"]
+        assert harness.agent.deployment_admission["assistant-second"].paused is True
+        saved = load_agent_config(harness.config_path)
+        assert saved.deployments["assistant-second"].revision == "c" * 40
+        # The agent's shutdown stops the child it still holds; that must work.
+        candidate = seen["candidate"].process
+        candidate.terminate = candidate.kill
