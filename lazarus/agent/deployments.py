@@ -154,9 +154,16 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     return command
 
 
+def deployment_lock(agent: Agent, deployment_id: str) -> asyncio.Lock:
+    return agent.deployment_locks.setdefault(deployment_id, asyncio.Lock())
+
+
 def free_port(agent: Agent) -> int:
+    """Called with role_lock held; a port handed out is reserved until the
+    transition that took it commits or gives it back."""
     taken = {role.port for role in agent.config.roles.values()}
     taken |= {deployment.port for deployment in agent.config.deployments.values()}
+    taken |= agent.port_reservations
     taken.add(agent.config.port)
     for port in DEPLOYMENT_PORTS:
         if port not in taken and port_available(port):
@@ -334,76 +341,90 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
 
 
 async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition) -> dict:
-    async with agent.role_lock:
+    async with deployment_lock(agent, deployment_id):
         if transition.abandoned:
             # The request went away while this waited for the lock; nothing
             # has been touched, and nothing will be.
             return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
-        candidate = AgentDeployment(
-            kind=request.kind, model_path=str(model), mmproj_path=str(mmproj) if mmproj else None,
-            mmproj_sha256=request.mmproj_sha256.lower() if request.mmproj_sha256 else None,
-            revision=request.revision.lower(), sha256=request.sha256.lower(),
-            port=previous.port if previous else free_port(agent),
-            served_model_name=request.served_model_name, context_length=request.context_length,
-            pooling=request.pooling, normalization=request.normalization,
-        )
-        if previous is not None:
-            was_paused = await quiesce(agent, deployment_id)
-            if transition.abandoned:
-                # Nothing has changed: the process that was serving keeps
-                # serving, behind the gate it had before the drain.
-                agent.deployment_admission[deployment_id].paused = was_paused
-                return {"status": "unchanged", "id": deployment_id}
-        agent.deployment_admission[deployment_id] = Admission()
-        agent.deployment_admission[deployment_id].paused = True
+        async with agent.role_lock:
+            port = previous.port if previous else free_port(agent)
+            agent.port_reservations.add(port)
         try:
-            # The previous process goes, and so does a child a failed creation
-            # left registered without a record: a handle is never overwritten
-            # while its child may still run.
-            if previous is not None or deployment_id in agent.deployments:
-                await stop_deployment(agent, deployment_id)
-            # The drain may have taken minutes; the files are checked again
-            # right before they are loaded, so what starts is what was pinned.
-            await asyncio.to_thread(verify_deployment_files, candidate)
-            agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
-            process = start_deployment(agent, deployment_id)
-            agent.deployments[deployment_id] = process
-            await wait_deployment_ready(agent, candidate, process)
-            if transition.abandoned:
-                raise RuntimeError("the request was cancelled before the deployment was confirmed")
+            return await replace_on_port(agent, deployment_id, request, model, mmproj, transition, previous, port)
+        finally:
+            agent.port_reservations.discard(port)
+
+
+async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition, previous, port: int) -> dict:
+    """The transition proper, with the deployment's own lock held and its
+    port reserved by the caller."""
+    candidate = AgentDeployment(
+        kind=request.kind, model_path=str(model), mmproj_path=str(mmproj) if mmproj else None,
+        mmproj_sha256=request.mmproj_sha256.lower() if request.mmproj_sha256 else None,
+        revision=request.revision.lower(), sha256=request.sha256.lower(),
+        port=port,
+        served_model_name=request.served_model_name, context_length=request.context_length,
+        pooling=request.pooling, normalization=request.normalization,
+    )
+    if previous is not None:
+        was_paused = await quiesce(agent, deployment_id)
+        if transition.abandoned:
+            # Nothing has changed: the process that was serving keeps
+            # serving, behind the gate it had before the drain.
+            agent.deployment_admission[deployment_id].paused = was_paused
+            return {"status": "unchanged", "id": deployment_id}
+    agent.deployment_admission[deployment_id] = Admission()
+    agent.deployment_admission[deployment_id].paused = True
+    try:
+        # The previous process goes, and so does a child a failed creation
+        # left registered without a record: a handle is never overwritten
+        # while its child may still run.
+        if previous is not None or deployment_id in agent.deployments:
+            await stop_deployment(agent, deployment_id)
+        # The drain may have taken minutes; the files are checked again
+        # right before they are loaded, so what starts is what was pinned.
+        await asyncio.to_thread(verify_deployment_files, candidate)
+        agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
+        process = start_deployment(agent, deployment_id)
+        agent.deployments[deployment_id] = process
+        await wait_deployment_ready(agent, candidate, process)
+        if transition.abandoned:
+            raise RuntimeError("the request was cancelled before the deployment was confirmed")
+        async with agent.role_lock:
             agent.save_config()
-        except Exception as exc:
-            # A cancelled request is a failed one. The record goes back before
-            # any cleanup: whatever stopping the candidate or verifying the
-            # previous files does next, the rejected candidate is never what
-            # is persisted. The previous process is already gone, so it is
-            # restored from files checked again against their checksums.
+    except Exception as exc:
+        # A cancelled request is a failed one. The record goes back before
+        # any cleanup: whatever stopping the candidate or verifying the
+        # previous files does next, the rejected candidate is never what
+        # is persisted. The previous process is already gone, so it is
+        # restored from files checked again against their checksums.
+        if previous is None:
+            agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+        else:
+            agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+        rolled_back, rollback_error = False, None
+        try:
+            await stop_deployment(agent, deployment_id)
             if previous is None:
-                agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
+                agent.deployment_admission.pop(deployment_id, None)
             else:
-                agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
-            rolled_back, rollback_error = False, None
-            try:
-                await stop_deployment(agent, deployment_id)
-                if previous is None:
-                    agent.deployment_admission.pop(deployment_id, None)
-                else:
-                    await asyncio.to_thread(verify_deployment_files, previous)
-                    restored = start_deployment(agent, deployment_id)
-                    agent.deployments[deployment_id] = restored
-                    await wait_deployment_ready(agent, previous, restored)
-                    agent.deployment_admission[deployment_id].paused = False
+                await asyncio.to_thread(verify_deployment_files, previous)
+                restored = start_deployment(agent, deployment_id)
+                agent.deployments[deployment_id] = restored
+                await wait_deployment_ready(agent, previous, restored)
+                agent.deployment_admission[deployment_id].paused = False
+            async with agent.role_lock:
                 agent.save_config()
-                rolled_back = True
-            except Exception as rollback_exc:
-                rollback_error = str(rollback_exc)
-            return {
-                "status": "unhealthy", "id": deployment_id, "error": str(exc),
-                "rolled_back": rolled_back, "rollback_verified": rolled_back, "rollback_error": rollback_error,
-            }
-        agent.deployment_admission[deployment_id].paused = False
-        return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, candidate, True)}
+            rolled_back = True
+        except Exception as rollback_exc:
+            rollback_error = str(rollback_exc)
+        return {
+            "status": "unhealthy", "id": deployment_id, "error": str(exc),
+            "rolled_back": rolled_back, "rollback_verified": rolled_back, "rollback_error": rollback_error,
+        }
+    agent.deployment_admission[deployment_id].paused = False
+    return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, candidate, True)}
 
 
 class PersistenceError(RuntimeError):
@@ -418,7 +439,7 @@ async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
 
 
 async def forget_deployment(agent: Agent, deployment_id: str, transition: Transition) -> dict:
-    async with agent.role_lock:
+    async with deployment_lock(agent, deployment_id):
         if transition.abandoned:
             return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
@@ -437,7 +458,8 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
         await stop_deployment(agent, deployment_id)
         agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
         try:
-            agent.save_config()
+            async with agent.role_lock:
+                agent.save_config()
         except Exception as exc:
             agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
             raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc

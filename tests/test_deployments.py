@@ -116,10 +116,12 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-async def settled(agent):
-    """A transition worker holds the role lock until it is done; taking the
-    lock waits for it."""
-    async with agent.role_lock:
+async def settled(agent, deployment_id="assistant-second"):
+    """A transition worker holds the deployment's lock until it is done;
+    taking the lock waits for it."""
+    from lazarus.agent.deployments import deployment_lock
+
+    async with deployment_lock(agent, deployment_id):
         pass
 
 
@@ -706,7 +708,7 @@ def test_a_transition_abandoned_while_waiting_for_the_lock_touches_nothing(harne
         admission = harness.agent.deployment_admission["assistant-second"]
         admission.enter()
         outcomes = []
-        async with harness.agent.role_lock:
+        async with deployments.deployment_lock(harness.agent, "assistant-second"):
             replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
             removal = asyncio.create_task(remove_deployment(harness.agent, "assistant-second"))
             await asyncio.sleep(0.05)
@@ -750,3 +752,74 @@ def test_an_unbuildable_request_leaves_no_admission_count(harness):
         answer = api.post("/deployments/assistant-second/v1/chat/completions", headers={**harness.headers, "Content-Type": bad}, content=b"{}")
         assert answer.status_code == 400
         assert harness.agent.deployment_admission["assistant-second"].requests == 0
+
+
+# A long transition on one deployment never holds up another: only ports and
+# the saved configuration are shared.
+def test_a_slow_replacement_does_not_block_another_deployments_removal(harness, monkeypatch):
+    import time as clock
+
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment, remove_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        await apply_deployment(harness.agent, "assistant-third", DeploymentRequest(**second_request(harness, served_model_name="assistant-third")))
+        real_wait = deployments.wait_deployment_ready
+
+        async def slow_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await asyncio.sleep(1.0)
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
+        slow = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.05)
+        started = clock.monotonic()
+        removed = await remove_deployment(harness.agent, "assistant-third")
+        elapsed = clock.monotonic() - started
+        await slow
+        return removed["status"], elapsed
+
+    status, elapsed = asyncio.run(scenario())
+    assert status == "stopped" and elapsed < 0.5
+
+
+# Two deployments created at once never share a port: a port handed out is
+# reserved until the transition that took it commits or gives it back.
+def test_concurrent_creations_never_share_a_port(harness):
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        first = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness))))
+        second = asyncio.create_task(apply_deployment(harness.agent, "assistant-third", DeploymentRequest(**second_request(harness, served_model_name="assistant-third"))))
+        await asyncio.gather(first, second)
+        return {name: d.port for name, d in harness.agent.config.deployments.items()}
+
+    ports = asyncio.run(scenario())
+    assert len(set(ports.values())) == 2 and harness.agent.port_reservations == set()
+
+
+# Deployment probes run beside the role probes, so a slow deployment never
+# pushes the manifest past what the roles alone take.
+def test_deployment_probes_do_not_add_to_the_manifest_time(harness, monkeypatch):
+    import time as clock
+
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+
+        async def slow_role():
+            await asyncio.sleep(1.2)
+            return True
+
+        async def slower_deployment():
+            await asyncio.sleep(1.2)
+            return True
+
+        monkeypatch.setattr(harness.agent.roles["generation"], "healthy", slow_role)
+        monkeypatch.setattr(harness.agent.deployments["assistant-second"], "healthy", slower_deployment)
+        started = clock.monotonic()
+        manifest = api.get("/agent/manifest", headers=harness.headers)
+        elapsed = clock.monotonic() - started
+        assert manifest.status_code == 200 and manifest.json()["deployments"]["assistant-second"]["status"] == "healthy"
+        assert elapsed < 2.0
