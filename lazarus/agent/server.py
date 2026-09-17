@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
+from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.appliance.backends.base import BackendStartError
 from lazarus.appliance.backends.slimserve import SlimServeBackend
 from lazarus.appliance.config import RuntimeConfig
@@ -85,6 +86,7 @@ class RoleProcess:
     def __init__(
         self, name: str, command: list[str], port: int, model_path: str,
         *, revision: str | None, context_length: int | None, engine: str = "llama.cpp",
+        authenticated: bool | None = None,
     ):
         self.name = name
         self.port = port
@@ -94,9 +96,11 @@ class RoleProcess:
         self.revision = revision
         self.context_length = context_length
         self.execution_uncertain = False
+        if authenticated is None:
+            authenticated = name == "generation"
         # b9960 traces the final four key characters. Keep those public while
         # retaining 256 random bits that never enter native argv or logs.
-        self.api_key = secrets.token_urlsafe(32) + "-agent" if name == "generation" else None
+        self.api_key = secrets.token_urlsafe(32) + "-agent" if authenticated else None
         child_env = None
         if self.api_key is not None:
             # b9960 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
@@ -244,6 +248,8 @@ class Agent:
         self.config_path = Path(config_path).resolve() if config_path else None
         self.token = os.environ.get(config.token_env, "")
         self.roles: dict[str, RoleProcess] = {}
+        self.deployments: dict[str, RoleProcess] = {}
+        self.deployment_admission: dict[str, Admission] = {}
         self.role_lock = asyncio.Lock()
         default_root = self.config_path.parent / "models" if self.config_path else Path.home() / ".sovereign" / "models"
         self.model_root = Path(os.environ.get("SOVEREIGN_AGENT_MODEL_ROOT", default_root)).resolve()
@@ -331,13 +337,18 @@ class Agent:
             if name == "generation" and self.config.slimserve_generation is not None:
                 continue
             self.roles[name] = self.start_role(name)
+        for deployment_id in self.config.deployments:
+            try:
+                self.deployments[deployment_id] = start_deployment(self, deployment_id)
+            except (OSError, ValueError) as exc:
+                logger.error("deployment %s did not start: %s", deployment_id, exc)
 
     async def wait_ready(self, timeout: float = 300) -> None:
         deadline = time.monotonic() + timeout
-        pending = set(self.roles)
+        pending = set(self.roles) | set(self.deployments)
         while pending and time.monotonic() < deadline:
             for name in list(pending):
-                role = self.roles.get(name)
+                role = self.roles.get(name) or self.deployments.get(name)
                 if role is None:
                     pending.discard(name)
                     continue
@@ -351,7 +362,7 @@ class Agent:
 
     def stop(self) -> None:
         error = None
-        for name, role in self.roles.items():
+        for name, role in [*self.roles.items(), *self.deployments.items()]:
             try:
                 role.stop()
             except Exception as exc:
@@ -817,6 +828,7 @@ def build_app(agent: Agent) -> FastAPI:
             ),
             "model_mapping": agent.generation_mapping if backend is not None else None,
             "available_engines": agent.available_engines,
+            "deployments": await observe_deployments(agent),
         }
         if agent.config.runtime_instance_id:
             result["runtime_instance_id"] = agent.config.runtime_instance_id
@@ -1014,6 +1026,8 @@ def build_app(agent: Agent) -> FastAPI:
                     "rollback_error": rollback_error,
                 })
             return {"status": "disabled", "role": "embedding"}
+
+    register_deployment_routes(app, agent)
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
     async def proxy(path: str, request: Request):
