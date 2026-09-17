@@ -755,6 +755,28 @@ class EmbeddingRoleRequest(BaseModel):
     context_length: int = Field(default=2048, ge=128, le=131072)
 
 
+class BearerAuth:
+    """Every request carries the agent's bearer token or is refused."""
+
+    def __init__(self, app, agent: Agent) -> None:
+        self.app = app
+        self.agent = agent
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        authorization = ""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                authorization = value.decode("latin-1")
+        if not self.agent.token or authorization != f"Bearer {self.agent.token}":
+            response = JSONResponse(status_code=401, content={"error": "invalid agent token"})
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 def build_app(agent: Agent) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -792,12 +814,10 @@ def build_app(agent: Agent) -> FastAPI:
                 logger.exception("agent cleanup failed after lifespan failure")
 
     app = FastAPI(title="Sovereign Runtime Agent", lifespan=lifespan)
-
-    @app.middleware("http")
-    async def auth(request: Request, call_next):
-        if not agent.token or request.headers.get("Authorization") != f"Bearer {agent.token}":
-            return JSONResponse(status_code=401, content={"error": "invalid agent token"})
-        return await call_next(request)
+    # A plain ASGI layer rather than Starlette's BaseHTTPMiddleware: the
+    # latter wraps receive in a way that hides a client's disconnect from the
+    # handlers, and a deployment transition must see its client go.
+    app.add_middleware(BearerAuth, agent=agent)
 
     @app.get("/agent/manifest")
     async def manifest():
