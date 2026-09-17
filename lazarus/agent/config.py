@@ -8,6 +8,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from lazarus.agent.deployments import AgentDeployment
 from lazarus.appliance.config import RuntimeConfig
 
 
@@ -69,6 +70,10 @@ class AgentConfig(BaseModel):
     token_env: str = "SOVEREIGN_AGENT_TOKEN"
     llama_server: str = "llama-server"
     roles: dict[str, AgentRole]
+    # Deployments Control creates while the appliance runs, persisted so a
+    # restarted agent serves them again. Roles are the installer's; these are
+    # the operator's.
+    deployments: dict[str, AgentDeployment] = {}
     hardware_profile: Literal["metal-arm64"] = "metal-arm64"
     # Generated managed configs name only the reviewed installed executables.
     # Their paths are private distribution-owned values, never API input.
