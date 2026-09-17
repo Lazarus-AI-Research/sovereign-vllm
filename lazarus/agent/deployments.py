@@ -263,10 +263,12 @@ def verify_deployment_files(deployment: AgentDeployment) -> None:
         raise ValueError(f"{deployment.mmproj_path} no longer matches its recorded checksum")
 
 
-def start_deployment(agent: Agent, deployment_id: str, verify: bool = False) -> RoleProcess:
+def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, record: AgentDeployment | None = None) -> RoleProcess:
+    """Starts the recorded deployment, or a candidate record not yet committed
+    to the configuration."""
     from lazarus.agent.server import RoleProcess
 
-    deployment = agent.config.deployments[deployment_id]
+    deployment = record or agent.config.deployments[deployment_id]
     agent.observed_model(deployment.model_path)
     # A request's files were checked as it arrived; a restart from agent.yaml
     # checks them again, since the disk may have changed meanwhile.
@@ -317,10 +319,13 @@ class Transition:
         self.abandoned = False
 
 
-async def run_transition(worker_coroutine, transition: Transition) -> dict:
+async def run_transition(agent: Agent, worker_coroutine, transition: Transition) -> dict:
     worker = asyncio.create_task(worker_coroutine)
-    # A worker abandoned by its request still finishes; its outcome is read so
-    # a failure there is never an unretrieved exception.
+    # A worker abandoned by its request still finishes and is joined at
+    # shutdown; its outcome is read so a failure there is never an
+    # unretrieved exception.
+    agent.transitions.add(worker)
+    worker.add_done_callback(agent.transitions.discard)
     worker.add_done_callback(lambda done: None if done.cancelled() else done.exception())
     try:
         return await asyncio.shield(worker)
@@ -337,7 +342,7 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     if request.mmproj:
         mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256)
     transition = Transition()
-    return await run_transition(replace_deployment(agent, deployment_id, request, model, mmproj, transition), transition)
+    return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, transition), transition)
 
 
 async def replace_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest, model, mmproj, transition: Transition) -> dict:
@@ -385,24 +390,24 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         # The drain may have taken minutes; the files are checked again
         # right before they are loaded, so what starts is what was pinned.
         await asyncio.to_thread(verify_deployment_files, candidate)
-        agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
-        process = start_deployment(agent, deployment_id)
+        # The candidate stays out of the configuration until it is confirmed:
+        # another deployment's save meanwhile persists only what was verified.
+        process = start_deployment(agent, deployment_id, record=candidate)
         agent.deployments[deployment_id] = process
         await wait_deployment_ready(agent, candidate, process)
-        if transition.abandoned:
-            raise RuntimeError("the request was cancelled before the deployment was confirmed")
         async with agent.role_lock:
+            # Checked again under the lock: the request may have gone while
+            # this waited for it.
+            if transition.abandoned:
+                raise RuntimeError("the request was cancelled before the deployment was confirmed")
+            agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
             agent.save_config()
     except Exception as exc:
-        # A cancelled request is a failed one. The record goes back before
-        # any cleanup: whatever stopping the candidate or verifying the
-        # previous files does next, the rejected candidate is never what
-        # is persisted. The previous process is already gone, so it is
-        # restored from files checked again against their checksums.
-        if previous is None:
-            agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
-        else:
-            agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
+        # A cancelled request is a failed one. The configuration never held
+        # the candidate, so whatever cleanup does next, the rejected
+        # candidate is never what is persisted. The previous process is
+        # already gone, so it is restored from files checked again against
+        # their checksums.
         rolled_back, rollback_error = False, None
         try:
             await stop_deployment(agent, deployment_id)
@@ -410,7 +415,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
                 agent.deployment_admission.pop(deployment_id, None)
             else:
                 await asyncio.to_thread(verify_deployment_files, previous)
-                restored = start_deployment(agent, deployment_id)
+                restored = start_deployment(agent, deployment_id, record=previous)
                 agent.deployments[deployment_id] = restored
                 await wait_deployment_ready(agent, previous, restored)
                 agent.deployment_admission[deployment_id].paused = False
@@ -435,7 +440,7 @@ class PersistenceError(RuntimeError):
 
 async def remove_deployment(agent: Agent, deployment_id: str) -> dict:
     transition = Transition()
-    return await run_transition(forget_deployment(agent, deployment_id, transition), transition)
+    return await run_transition(agent, forget_deployment(agent, deployment_id, transition), transition)
 
 
 async def forget_deployment(agent: Agent, deployment_id: str, transition: Transition) -> dict:

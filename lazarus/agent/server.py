@@ -255,6 +255,9 @@ class Agent:
         # role_lock guards only what they share: ports and the saved config.
         self.deployment_locks: dict[str, asyncio.Lock] = {}
         self.port_reservations: set[int] = set()
+        # Transition workers in flight, abandoned by their requests or not;
+        # the agent joins them before it stops its children.
+        self.transitions: set[asyncio.Task] = set()
         self.role_lock = asyncio.Lock()
         default_root = self.config_path.parent / "models" if self.config_path else Path.home() / ".sovereign" / "models"
         self.model_root = Path(os.environ.get("SOVEREIGN_AGENT_MODEL_ROOT", default_root)).resolve()
@@ -364,6 +367,13 @@ class Agent:
                 await asyncio.sleep(2)
         for name in pending:
             logger.error("role %s failed to become healthy", name)
+
+    async def join_transitions(self) -> None:
+        """A transition abandoned by its request still finishes; every one is
+        awaited before the children are stopped, or a worker could start a
+        child after the final sweep."""
+        while self.transitions:
+            await asyncio.gather(*list(self.transitions), return_exceptions=True)
 
     def stop(self) -> None:
         error = None
@@ -758,6 +768,7 @@ def build_app(agent: Agent) -> FastAPI:
             lifespan_error = exc
             raise
         finally:
+            await agent.join_transitions()
             try:
                 try:
                     if task is not None:
