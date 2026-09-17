@@ -823,3 +823,88 @@ def test_deployment_probes_do_not_add_to_the_manifest_time(harness, monkeypatch)
         elapsed = clock.monotonic() - started
         assert manifest.status_code == 200 and manifest.json()["deployments"]["assistant-second"]["status"] == "healthy"
         assert elapsed < 2.0
+
+
+# A candidate is never in the configuration before it is confirmed, so a save
+# another deployment makes meanwhile persists only what was verified.
+def test_a_candidate_is_never_persisted_before_it_is_confirmed(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        real_wait = deployments.wait_deployment_ready
+
+        async def slow_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await asyncio.sleep(0.4)
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
+        replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        async with harness.agent.role_lock:
+            harness.agent.save_config()
+        during = load_agent_config(harness.config_path).deployments["assistant-second"].revision
+        await replacement
+        after = load_agent_config(harness.config_path).deployments["assistant-second"].revision
+        return during, after
+
+    during, after = asyncio.run(scenario())
+    assert during == "c" * 40 and after == "d" * 40
+
+
+# A request that goes while its confirmed candidate waits for the shared lock
+# is still a cancelled request: the candidate is rolled back, not committed.
+def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        async with harness.agent.role_lock:
+            replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+            # The candidate becomes ready and waits for the lock; then the
+            # request goes.
+            await asyncio.sleep(0.3)
+            replacement.cancel()
+            try:
+                await replacement
+            except asyncio.CancelledError:
+                pass
+        await settled(harness.agent)
+        return harness.agent.config.deployments["assistant-second"].revision, harness.agent.deployment_admission["assistant-second"].paused, load_agent_config(harness.config_path).deployments["assistant-second"].revision
+
+    revision, paused, saved = asyncio.run(scenario())
+    assert revision == "c" * 40 and saved == "c" * 40 and paused is False
+
+
+# The agent joins every transition still in flight before it stops its
+# children, so a worker never starts one after the final sweep.
+def test_shutdown_joins_abandoned_transitions(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        real_wait = deployments.wait_deployment_ready
+
+        async def slow_wait(agent, deployment, process):
+            await asyncio.sleep(0.3)
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", slow_wait)
+        replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.05)
+        replacement.cancel()
+        try:
+            await replacement
+        except asyncio.CancelledError:
+            pass
+        assert harness.agent.transitions
+        await harness.agent.join_transitions()
+        harness.agent.stop()
+        return [child.alive for child in harness.children], len(harness.agent.transitions)
+
+    alive, remaining = asyncio.run(scenario())
+    assert not any(alive) and remaining == 0
