@@ -317,6 +317,9 @@ class Transition:
 
     def __init__(self) -> None:
         self.abandoned = False
+        # Set once the candidate is confirmed and the worker waits to commit
+        # it; a request cancelled after this point is still rolled back.
+        self.committing = False
 
 
 async def run_transition(agent: Agent, worker_coroutine, transition: Transition) -> dict:
@@ -395,6 +398,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         process = start_deployment(agent, deployment_id, record=candidate)
         agent.deployments[deployment_id] = process
         await wait_deployment_ready(agent, candidate, process)
+        transition.committing = True
         async with agent.role_lock:
             # Checked again under the lock: the request may have gone while
             # this waited for it.
