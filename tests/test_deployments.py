@@ -871,6 +871,7 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
 
     async def scenario():
         await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        seen.clear()
         async with harness.agent.role_lock:
             replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
             # The candidate becomes ready and waits for the lock; only then
@@ -879,6 +880,7 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
                 await asyncio.sleep(0.02)
                 if getattr(seen.get("transition"), "committing", False):
                     break
+            assert seen["transition"].committing
             replacement.cancel()
             try:
                 await replacement
