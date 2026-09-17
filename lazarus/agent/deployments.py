@@ -103,6 +103,11 @@ class DeploymentRequest(BaseModel):
         return self
 
 
+# The fixed roles keep their names whether or not they are configured now, so
+# enabling one later never collides with a deployment.
+RESERVED_DEPLOYMENT_IDS = frozenset({"generation", "embedding"})
+
+
 class Admission:
     """Per-deployment ingress gate: closed while the process is being replaced
     or removed, and a count of requests in flight so a replacement waits for
@@ -249,10 +254,13 @@ async def quiesce(agent: Agent, deployment_id: str) -> None:
 
 async def stop_deployment(agent: Agent, deployment_id: str) -> None:
     # Terminating a child can take up to ten seconds of blocking waits; that
-    # runs off the event loop so every other deployment keeps streaming.
+    # runs off the event loop so every other deployment keeps streaming. A
+    # cancellation arriving meanwhile is delivered once the child is gone, so
+    # a caller never has to reason about a half-stopped process.
     process = agent.deployments.pop(deployment_id, None)
     if process is not None:
-        await asyncio.to_thread(process.stop)
+        with CancelScope(shield=True):
+            await asyncio.to_thread(process.stop)
 
 
 async def apply_deployment(agent: Agent, deployment_id: str, request: DeploymentRequest) -> dict:
@@ -273,11 +281,14 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         )
         if previous is not None:
             await quiesce(agent, deployment_id)
-            await stop_deployment(agent, deployment_id)
-        agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
         agent.deployment_admission[deployment_id] = Admission()
         agent.deployment_admission[deployment_id].paused = True
         try:
+            # The previous process is stopped inside the guarded region: a
+            # cancellation delivered after it is gone still restores it.
+            if previous is not None:
+                await stop_deployment(agent, deployment_id)
+            agent.config.deployments = {**agent.config.deployments, deployment_id: candidate}
             process = start_deployment(agent, deployment_id)
             agent.deployments[deployment_id] = process
             await wait_deployment_ready(agent, candidate, process)
@@ -345,7 +356,7 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     async def put_deployment(deployment_id: str, request: DeploymentRequest):
         if not DEPLOYMENT_ID.match(deployment_id):
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
-        if deployment_id in agent.config.roles:
+        if deployment_id in RESERVED_DEPLOYMENT_IDS or deployment_id in agent.config.roles:
             return JSONResponse(status_code=409, content={"error": "a role owns that name"})
         try:
             result = await apply_deployment(agent, deployment_id, request)
@@ -365,13 +376,15 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     @app.api_route("/deployments/{deployment_id}/v1/{path:path}", methods=["GET", "POST"])
     async def proxy_deployment(deployment_id: str, path: str, request: Request):
         deployment = agent.config.deployments.get(deployment_id)
-        process = agent.deployments.get(deployment_id)
-        if deployment is None or process is None:
+        if deployment is None:
             return JSONResponse(status_code=404, content={"error": f"unknown deployment {deployment_id!r}"})
         if path not in ALLOWED_PATHS[deployment.kind]:
             return JSONResponse(status_code=404, content={"error": "unsupported deployment endpoint"})
         admission = agent.deployment_admission.setdefault(deployment_id, Admission())
-        if admission.paused:
+        process = agent.deployments.get(deployment_id)
+        # A configured deployment with no process is one being replaced or
+        # removed: a retryable pause, never an unknown name.
+        if admission.paused or process is None:
             return JSONResponse(status_code=503, content={"error": "deployment admission is paused"})
         body = await request.body()
         if admission.paused or agent.deployments.get(deployment_id) is not process:

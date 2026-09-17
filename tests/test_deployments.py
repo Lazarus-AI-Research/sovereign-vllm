@@ -363,3 +363,54 @@ def test_a_slow_child_shutdown_does_not_block_other_traffic(harness):
         return ticks
 
     assert asyncio.run(scenario()) >= 5
+
+
+# The fixed role names stay reserved whether or not the role is configured:
+# enabling the embedding role later must never collide with a deployment.
+def test_role_names_are_reserved_even_when_the_role_is_absent(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        assert "embedding" not in harness.agent.config.roles
+        refused = api.put("/agent/admin/deployments/embedding", headers=harness.headers, json=second_request(harness))
+        assert refused.status_code == 409
+
+
+# While a replacement waits for the old child to die, the deployment is still
+# configured: a request then is told to retry, not that the name is unknown.
+def test_a_deployment_between_processes_answers_503_not_404(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        harness.agent.deployment_admission["assistant-second"].paused = True
+        harness.agent.deployments.pop("assistant-second")
+        answer = api.post("/deployments/assistant-second/v1/chat/completions", headers=harness.headers, json={"messages": []})
+        assert answer.status_code == 503
+        assert api.post("/deployments/never-there/v1/chat/completions", headers=harness.headers, json={}).status_code == 404
+
+
+# A replacement cancelled while the previous child is still shutting down
+# restores that child and reopens admission, exactly as any other failure.
+def test_a_replacement_cancelled_during_the_old_shutdown_restores_it(harness):
+    import time as clock
+
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        first = harness.children[-1]
+        original = first.terminate
+
+        def slow_terminate():
+            clock.sleep(0.3)
+            original()
+
+        first.terminate = slow_terminate
+        replacement = asyncio.create_task(apply_deployment(
+            harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        replacement.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+        restored = harness.agent.deployments.get("assistant-second")
+        return restored is not None and restored.running(), harness.agent.deployment_admission["assistant-second"].paused, harness.agent.config.deployments["assistant-second"].revision
+
+    running, paused, revision = asyncio.run(scenario())
+    assert running and paused is False and revision == "c" * 40
