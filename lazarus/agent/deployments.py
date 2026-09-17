@@ -286,16 +286,21 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     )
 
 
-async def quiesce(agent: Agent, deployment_id: str) -> bool:
-    """Close the gate and wait for what is in flight; returns the gate's state
-    before, so a transition that changes nothing can put it back."""
+async def quiesce(agent: Agent, deployment_id: str, transition: "Transition | None" = None) -> bool:
+    """Close the gate and wait for what is in flight, or for the transition
+    to be abandoned, whichever comes first; returns the gate's state before,
+    so a transition that changes nothing can put it back."""
     admission = agent.deployment_admission.setdefault(deployment_id, Admission())
     was_paused = admission.paused
     admission.paused = True
+    waits = [asyncio.ensure_future(admission.idle.wait())]
+    if transition is not None:
+        waits.append(asyncio.ensure_future(transition.gone.wait()))
     try:
-        await asyncio.wait_for(admission.idle.wait(), timeout=IDLE_TIMEOUT)
-    except asyncio.TimeoutError:
-        pass
+        await asyncio.wait(waits, timeout=IDLE_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for wait in waits:
+            wait.cancel()
     return was_paused
 
 
@@ -322,6 +327,10 @@ class Transition:
 
     def __init__(self) -> None:
         self.abandoned = False
+        # Set with abandoned, so a drain waiting on in-flight requests wakes
+        # at once and puts the gate back instead of holding it for the
+        # whole idle timeout.
+        self.gone = asyncio.Event()
         # Set once the candidate is confirmed and the worker waits to commit
         # it; a request cancelled after this point is still rolled back.
         self.committing = False
@@ -339,6 +348,7 @@ async def run_transition(agent: Agent, worker_coroutine, transition: Transition)
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
         transition.abandoned = True
+        transition.gone.set()
         raise
 
 
@@ -385,7 +395,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         pooling=request.pooling, normalization=request.normalization,
     )
     if previous is not None:
-        was_paused = await quiesce(agent, deployment_id)
+        was_paused = await quiesce(agent, deployment_id, transition)
         if transition.abandoned:
             # Nothing has changed: the process that was serving keeps
             # serving, behind the gate it had before the drain.
@@ -479,7 +489,7 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
                 agent.deployment_admission.pop(deployment_id, None)
                 return {"status": "stopped", "id": deployment_id}
             return {"status": "absent", "id": deployment_id}
-        was_paused = await quiesce(agent, deployment_id)
+        was_paused = await quiesce(agent, deployment_id, transition)
         if transition.abandoned:
             agent.deployment_admission[deployment_id].paused = was_paused
             return {"status": "unchanged", "id": deployment_id}

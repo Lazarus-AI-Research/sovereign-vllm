@@ -1077,3 +1077,36 @@ def test_a_candidate_that_dies_before_the_commit_is_rolled_back(harness, monkeyp
     result, revision, running, saved = asyncio.run(scenario())
     assert result["status"] == "unhealthy" and result["rolled_back"] is True and "exited" in result["error"]
     assert revision == "c" * 40 and saved == "c" * 40 and running
+
+
+# A drain waiting on an in-flight request wakes the moment its transition is
+# abandoned, and the gate goes back at once.
+def test_an_abandoned_drain_wakes_at_once(harness, monkeypatch):
+    import time as clock
+
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    monkeypatch.setattr(deployments, "IDLE_TIMEOUT", 3)
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        admission = harness.agent.deployment_admission["assistant-second"]
+        admission.enter()
+        replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        assert admission.paused is True
+        replacement.cancel()
+        try:
+            await replacement
+        except asyncio.CancelledError:
+            pass
+        started = clock.monotonic()
+        await settled(harness.agent)
+        elapsed = clock.monotonic() - started
+        paused = admission.paused
+        admission.leave()
+        return paused, elapsed, harness.stopped
+
+    paused, elapsed, stopped = asyncio.run(scenario())
+    assert paused is False and stopped == [] and elapsed < 1.0
