@@ -163,6 +163,9 @@ def free_port(agent: Agent) -> int:
     transition that took it commits or gives it back."""
     taken = {role.port for role in agent.config.roles.values()}
     taken |= {deployment.port for deployment in agent.config.deployments.values()}
+    # A child kept registered without a record (a failed creation whose stop
+    # failed) still owns its port until its termination is confirmed.
+    taken |= {process.port for process in agent.deployments.values()}
     taken |= agent.port_reservations
     taken.add(agent.config.port)
     for port in DEPLOYMENT_PORTS:
@@ -268,6 +271,8 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     to the configuration."""
     from lazarus.agent.server import RoleProcess
 
+    if agent.stopping:
+        raise RuntimeError("the agent is shutting down")
     deployment = record or agent.config.deployments[deployment_id]
     agent.observed_model(deployment.model_path)
     # A request's files were checked as it arrived; a restart from agent.yaml
