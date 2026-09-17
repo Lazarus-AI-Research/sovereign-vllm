@@ -2,25 +2,14 @@
 # Models are GGUF files on the host; weights live in the deploy ./models
 # mount so container and host share one copy.
 #
-# The default agent is generation-only. The runtime manifest reports exactly
-# what is loaded; Control adds a constrained embedding role only when selected.
+# The agent serves deployments only. Sovereign Control creates them through
+# the authenticated admin API (the shipped assistant among them) and the agent
+# records each one here so a restart serves it again. Nothing is served until
+# Control asks.
 
 listen: 127.0.0.1
 port: 9100
 token_env: SOVEREIGN_AGENT_TOKEN
 llama_server: __AGENT_HOME__/runtime/bin/llama-server
 
-roles:
-  # Default generation via Google's official QAT release
-  # (source: google/gemma-4-E2B-it-qat-q4_0-gguf).
-  generation:
-    model_path: __AGENT_HOME__/models/metal/gemma-4-E2B_q4_0-it.gguf
-    mmproj_path: __AGENT_HOME__/models/metal/gemma-4-E2B-it-mmproj.gguf
-    revision: 69536a21d70340464240401ba38223d805f6a709
-    port: 9101
-    context_length: 8192
-    args: ["--jinja"]
-
-  # Embeddings are served by embeddinggemma.c by default. Sovereign Control
-  # adds this optional role through the authenticated agent admin API when an
-  # operator selects a custom Metal GGUF embedding model.
+deployments: {}

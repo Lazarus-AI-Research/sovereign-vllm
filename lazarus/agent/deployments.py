@@ -1,8 +1,7 @@
 """Deployments: one supervised llama.cpp process per served model, created and
 removed by Sovereign Control through the admin API and reached through
-``/deployments/{id}/v1``. Roles are the installer's fixed pair; deployments are
-what an operator adds and removes while the appliance runs, so each has its own
-port, admission gate and lifecycle and none restarts another."""
+``/deployments/{id}/v1``. Each has its own port, admission gate and lifecycle,
+so none restarts another."""
 
 from __future__ import annotations
 
@@ -19,19 +18,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from lazarus.agent.server import Agent, RoleProcess
+    from lazarus.agent.server import Agent, ServerProcess
 
 DEPLOYMENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-# Roles keep 9101 and 9102; deployments take the next block so a role and a
-# deployment can never collide on a port.
+# The agent listens on 9100 and the retired fixed roles held 9101 and 9102;
+# deployments take a block above both, so an agent upgraded in place never
+# collides with a role process still winding down.
 DEPLOYMENT_PORTS = range(9110, 9200)
-# Bounded like the generation role's quiesce: a request that has not finished
-# in this long is not worth keeping a replacement waiting for.
+# A request that has not finished in this long is not worth keeping a
+# replacement waiting for.
 IDLE_TIMEOUT = 600.0
 READY_TIMEOUT = 300.0
 # The manifest is read by clients with a five-second budget; every deployment
 # is probed at once and each probe is cut off well inside it, so a hung
-# deployment can never make the manifest fail for the roles beside it.
+# deployment can never make the manifest fail for the ones beside it.
 OBSERVE_TIMEOUT = 1.5
 
 ALLOWED_PATHS = {
@@ -104,11 +104,6 @@ class DeploymentRequest(BaseModel):
         return self
 
 
-# The fixed roles keep their names whether or not they are configured now, so
-# enabling one later never collides with a deployment.
-RESERVED_DEPLOYMENT_IDS = frozenset({"generation", "embedding"})
-
-
 class Admission:
     """Per-deployment ingress gate: closed while the process is being replaced
     or removed, and a count of requests in flight so a replacement waits for
@@ -159,10 +154,9 @@ def deployment_lock(agent: Agent, deployment_id: str) -> asyncio.Lock:
 
 
 def free_port(agent: Agent) -> int:
-    """Called with role_lock held; a port handed out is reserved until the
+    """Called with records_lock held; a port handed out is reserved until the
     transition that took it commits or gives it back."""
-    taken = {role.port for role in agent.config.roles.values()}
-    taken |= {deployment.port for deployment in agent.config.deployments.values()}
+    taken = {deployment.port for deployment in agent.config.deployments.values()}
     # A child kept registered without a record (a failed creation whose stop
     # failed) still owns its port until its termination is confirmed.
     taken |= {process.port for process in agent.deployments.values()}
@@ -234,10 +228,10 @@ async def observe_deployments(agent: Agent) -> dict[str, dict]:
     return result
 
 
-async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, process: RoleProcess) -> None:
+async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, process: ServerProcess) -> None:
     timeout = getattr(agent, "deployment_ready_timeout", READY_TIMEOUT)
     if deployment.kind == "embedding":
-        await agent.wait_role_ready(process, timeout=timeout)
+        await agent.wait_embedding_ready(process, timeout=timeout)
         return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -266,10 +260,10 @@ def verify_deployment_files(deployment: AgentDeployment) -> None:
         raise ValueError(f"{deployment.mmproj_path} no longer matches its recorded checksum")
 
 
-def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, record: AgentDeployment | None = None) -> RoleProcess:
+def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, record: AgentDeployment | None = None) -> ServerProcess:
     """Starts the recorded deployment, or a candidate record not yet committed
     to the configuration."""
-    from lazarus.agent.server import RoleProcess
+    from lazarus.agent.server import ServerProcess
 
     if agent.stopping:
         raise RuntimeError("the agent is shutting down")
@@ -279,7 +273,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     # checks them again, since the disk may have changed meanwhile.
     if verify:
         verify_deployment_files(deployment)
-    return RoleProcess(
+    return ServerProcess(
         deployment_id, deployment_command(agent, deployment), deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
         authenticated=deployment.kind == "generation",
@@ -388,7 +382,7 @@ async def replace_deployment(agent: Agent, deployment_id: str, request: Deployme
             # has been touched, and nothing will be.
             return {"status": "unchanged", "id": deployment_id}
         previous = agent.config.deployments.get(deployment_id)
-        async with agent.role_lock:
+        async with agent.records_lock:
             if transition.abandoned:
                 # The request went away while this waited for the shared
                 # lock; no drain, no process, nothing.
@@ -436,7 +430,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         agent.deployments[deployment_id] = process
         await wait_deployment_ready(agent, candidate, process)
         transition.committing = True
-        async with agent.role_lock:
+        async with agent.records_lock:
             # Checked again under the lock: the request may have gone while
             # this waited for it, and so may the candidate. Either is the
             # failure the rollback below handles, never a record.
@@ -470,7 +464,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
                 agent.deployments[deployment_id] = restored
                 await wait_deployment_ready(agent, previous, restored)
                 agent.deployment_admission[deployment_id].paused = False
-            async with agent.role_lock:
+            async with agent.records_lock:
                 agent.save_config()
             rolled_back = True
         except Exception as rollback_exc:
@@ -514,7 +508,7 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
         await stop_deployment(agent, deployment_id)
         # The record goes, is saved, or comes back, under one acquisition of
         # the shared lock: no creation can take the port in between.
-        async with agent.role_lock:
+        async with agent.records_lock:
             agent.config.deployments = {k: v for k, v in agent.config.deployments.items() if k != deployment_id}
             try:
                 agent.save_config()
@@ -534,8 +528,6 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     async def put_deployment(deployment_id: str, request: DeploymentRequest, http_request: Request):
         if not DEPLOYMENT_ID.match(deployment_id):
             return JSONResponse(status_code=422, content={"error": "deployment id must be a short lowercase slug"})
-        if deployment_id in RESERVED_DEPLOYMENT_IDS or deployment_id in agent.config.roles:
-            return JSONResponse(status_code=409, content={"error": "a role owns that name"})
         try:
             result = await apply_deployment(agent, deployment_id, request, http_request)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -610,9 +602,9 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             finally:
                 admission.leave()
 
-        from lazarus.agent.server import RoleStreamingResponse
+        from lazarus.agent.server import RelayedResponse
 
-        return RoleStreamingResponse(
+        return RelayedResponse(
             relay(), cleanup=cleanup, status_code=response.status_code,
             media_type=response.headers.get("content-type"),
         )
