@@ -860,13 +860,25 @@ def test_abandonment_is_rechecked_before_the_record_is_saved(harness, monkeypatc
     import lazarus.agent.deployments as deployments
     from lazarus.agent.deployments import DeploymentRequest, apply_deployment
 
+    seen = {}
+    real_run = deployments.run_transition
+
+    async def observed_run(agent, worker_coroutine, transition):
+        seen["transition"] = transition
+        return await real_run(agent, worker_coroutine, transition)
+
+    monkeypatch.setattr(deployments, "run_transition", observed_run)
+
     async def scenario():
         await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
         async with harness.agent.role_lock:
             replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
-            # The candidate becomes ready and waits for the lock; then the
-            # request goes.
-            await asyncio.sleep(0.3)
+            # The candidate becomes ready and waits for the lock; only then
+            # does the request go.
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if getattr(seen.get("transition"), "committing", False):
+                    break
             replacement.cancel()
             try:
                 await replacement
