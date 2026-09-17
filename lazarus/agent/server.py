@@ -250,6 +250,11 @@ class Agent:
         self.roles: dict[str, RoleProcess] = {}
         self.deployments: dict[str, RoleProcess] = {}
         self.deployment_admission: dict[str, Admission] = {}
+        # One lock per deployment for its transitions, so a long drain or
+        # readiness wait on one never holds up another or the fixed roles;
+        # role_lock guards only what they share: ports and the saved config.
+        self.deployment_locks: dict[str, asyncio.Lock] = {}
+        self.port_reservations: set[int] = set()
         self.role_lock = asyncio.Lock()
         default_root = self.config_path.parent / "models" if self.config_path else Path.home() / ".sovereign" / "models"
         self.model_root = Path(os.environ.get("SOVEREIGN_AGENT_MODEL_ROOT", default_root)).resolve()
@@ -778,6 +783,9 @@ def build_app(agent: Agent) -> FastAPI:
 
     @app.get("/agent/manifest")
     async def manifest():
+        # Deployments are probed beside the roles, not after them, so their
+        # bounded probes never add to the time the roles take.
+        deployments_observed = asyncio.create_task(observe_deployments(agent))
         roles = {}
         for name, role in list(agent.roles.items()):
             healthy = await role.healthy()
@@ -828,7 +836,7 @@ def build_app(agent: Agent) -> FastAPI:
             ),
             "model_mapping": agent.generation_mapping if backend is not None else None,
             "available_engines": agent.available_engines,
-            "deployments": await observe_deployments(agent),
+            "deployments": await deployments_observed,
         }
         if agent.config.runtime_instance_id:
             result["runtime_instance_id"] = agent.config.runtime_instance_id
