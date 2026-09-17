@@ -1031,3 +1031,49 @@ def test_a_retained_child_keeps_its_port(harness, monkeypatch):
         created = api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=second_request(harness, served_model_name="assistant-third"))
         assert created.status_code == 200
         assert harness.agent.config.deployments["assistant-third"].port != retained.port
+
+
+# A candidate that exits while its worker waits for the commit lock is a
+# failed candidate: the previous process comes back and the record stands.
+def test_a_candidate_that_dies_before_the_commit_is_rolled_back(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+    from lazarus.agent.deployments import DeploymentRequest, apply_deployment
+
+    seen = {}
+    real_run = deployments.run_transition
+
+    async def observed_run(agent, worker_coroutine, transition):
+        seen["transition"] = transition
+        return await real_run(agent, worker_coroutine, transition)
+
+    monkeypatch.setattr(deployments, "run_transition", observed_run)
+
+    async def scenario():
+        await apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness)))
+        seen.clear()
+        gate = asyncio.Event()
+        real_wait = deployments.wait_deployment_ready
+
+        async def gated_wait(agent, deployment, process):
+            if deployment.revision == "d" * 40:
+                await gate.wait()
+            return await real_wait(agent, deployment, process)
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", gated_wait)
+        replacement = asyncio.create_task(apply_deployment(harness.agent, "assistant-second", DeploymentRequest(**second_request(harness, revision="d" * 40))))
+        await asyncio.sleep(0.1)
+        async with harness.agent.role_lock:
+            gate.set()
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if getattr(seen.get("transition"), "committing", False):
+                    break
+            assert seen["transition"].committing
+            # The confirmed candidate dies while it waits to be recorded.
+            harness.children[-1].alive = False
+        result = await replacement
+        return result, harness.agent.config.deployments["assistant-second"].revision, harness.agent.deployments["assistant-second"].running(), load_agent_config(harness.config_path).deployments["assistant-second"].revision
+
+    result, revision, running, saved = asyncio.run(scenario())
+    assert result["status"] == "unhealthy" and result["rolled_back"] is True and "exited" in result["error"]
+    assert revision == "c" * 40 and saved == "c" * 40 and running
