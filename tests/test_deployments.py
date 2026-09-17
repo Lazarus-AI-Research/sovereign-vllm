@@ -990,3 +990,44 @@ def test_a_transition_abandoned_while_waiting_for_the_shared_lock_touches_nothin
 
     paused, spawned, stopped, elapsed = asyncio.run(scenario())
     assert paused is False and spawned == 0 and stopped == [] and elapsed < 1.0
+
+
+# Once the agent begins to stop, no transition starts a child: the final
+# sweep never races a worker.
+def test_no_child_starts_once_the_agent_is_stopping(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        harness.agent.stopping = True
+        spawned = len(harness.children)
+        answer = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        assert answer.status_code == 422 and "shutting down" in answer.json()["error"]
+        assert len(harness.children) == spawned
+        harness.agent.stopping = False
+
+
+# A child kept registered without a record still owns its port: no new
+# deployment is handed it until the child is confirmed gone.
+def test_a_retained_child_keeps_its_port(harness, monkeypatch):
+    import lazarus.agent.deployments as deployments
+
+    with TestClient(build_app(harness.agent), raise_server_exceptions=False) as api:
+        real_wait = deployments.wait_deployment_ready
+
+        async def fail_and_break_stop(agent, deployment, process):
+            original = process.process.terminate
+
+            def flaky():
+                process.process.terminate = original
+                raise RuntimeError("wait timed out")
+
+            process.process.terminate = flaky
+            raise RuntimeError("did not become ready")
+
+        monkeypatch.setattr(deployments, "wait_deployment_ready", fail_and_break_stop)
+        failed = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness))
+        assert failed.status_code == 422
+        retained = harness.agent.deployments["assistant-second"]
+        assert "assistant-second" not in harness.agent.config.deployments
+        monkeypatch.setattr(deployments, "wait_deployment_ready", real_wait)
+        created = api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=second_request(harness, served_model_name="assistant-third"))
+        assert created.status_code == 200
+        assert harness.agent.config.deployments["assistant-third"].port != retained.port

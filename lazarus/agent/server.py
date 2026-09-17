@@ -258,6 +258,9 @@ class Agent:
         # Transition workers in flight, abandoned by their requests or not;
         # the agent joins them before it stops its children.
         self.transitions: set[asyncio.Task] = set()
+        # Set once the agent begins to stop: no transition starts a child
+        # after it, whatever the join does.
+        self.stopping = False
         self.role_lock = asyncio.Lock()
         default_root = self.config_path.parent / "models" if self.config_path else Path.home() / ".sovereign" / "models"
         self.model_root = Path(os.environ.get("SOVEREIGN_AGENT_MODEL_ROOT", default_root)).resolve()
@@ -768,9 +771,13 @@ def build_app(agent: Agent) -> FastAPI:
             lifespan_error = exc
             raise
         finally:
-            await agent.join_transitions()
             try:
                 try:
+                    # From here no transition starts a child; those in flight
+                    # are joined inside the guarded region, so the final
+                    # sweep below runs whatever cuts the join short.
+                    agent.stopping = True
+                    await agent.join_transitions()
                     if task is not None:
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
