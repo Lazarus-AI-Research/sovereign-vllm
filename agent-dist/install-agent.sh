@@ -74,8 +74,13 @@ plutil -lint "$PLIST_DST" >/dev/null
 
 if [[ "${SOVEREIGN_SKIP_AGENT_START:-0}" != 1 ]]; then
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  # launchd can briefly retain a just-removed label. Retry the registration so
-  # an in-place upgrade does not fail with Bootstrap error 5.
+  # launchd retains a just-removed label for a moment, and a registration in
+  # that moment fails with Bootstrap error 5: the label is waited out, and
+  # the registration retried a few times besides.
+  for attempt in $(seq 1 40); do
+    launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
   for attempt in 1 2 3 4 5; do
     if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"; then
       break

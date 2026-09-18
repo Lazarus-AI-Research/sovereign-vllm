@@ -1364,3 +1364,35 @@ def test_a_speech_deployment_is_a_piper_server_child(harness):
 
     saved = load_agent_config(harness.config_path).deployments["mouth"]
     assert saved.kind == "speech" and saved.components["config"].path == str(harness.voice) + ".json"
+
+
+# A language model's thinking is the deployment's to set: off answers within
+# the caller's token limit, on with a budget bounds the thinking; both reach
+# the server through its environment, and neither applies to another kind.
+def test_thinking_is_set_through_the_servers_environment(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers,
+                          json=second_request(harness, thinking="off"))
+        assert created.status_code == 200, created.text
+        child = harness.children[-1]
+        assert child.env["LLAMA_ARG_REASONING"] == "off" and "LLAMA_ARG_THINK_BUDGET" not in child.env
+        assert child.env["LLAMA_API_KEY"].endswith("-agent")
+        assert not any(arg.startswith("--reasoning") for arg in child.command)
+        listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]
+        assert listed["assistant-second"]["thinking"] == "off" and listed["assistant-second"]["thinking_budget"] is None
+
+        budgeted = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers,
+                           json=second_request(harness, thinking="on", thinking_budget=256))
+        assert budgeted.status_code == 200, budgeted.text
+        child = harness.children[-1]
+        assert child.env["LLAMA_ARG_REASONING"] == "on" and child.env["LLAMA_ARG_THINK_BUDGET"] == "256"
+
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers,
+                          json=second_request(harness, thinking_budget=256))
+        assert refused.status_code == 422 and "when thinking is on" in refused.text
+
+        embedding = api.put("/agent/admin/deployments/embed-two", headers=harness.headers, json={
+            "kind": "embedding", "artifact": "metal/second.gguf", "sha256": digest(harness.weights),
+            "revision": "c" * 40, "served_model_name": "embed-two", "context_length": 2048, "thinking": "off",
+        })
+        assert embedding.status_code == 422 and "generation deployments only" in embedding.text

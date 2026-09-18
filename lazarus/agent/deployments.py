@@ -126,6 +126,12 @@ class AgentDeployment(BaseModel):
     context_length: int = Field(default=0, ge=0, le=131072)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
+    # Whether a language model thinks before it answers, and for how many
+    # tokens at most when it does; unset leaves the model's template to
+    # decide. Thinking counts against a caller's token limit, so a model
+    # that thinks on can answer nothing within a tight one.
+    thinking: Literal["on", "off"] | None = None
+    thinking_budget: int | None = Field(default=None, ge=1, le=65536)
     # An image deployment's companions and the sampling it was pinned with;
     # a speech deployment's one companion is its voice configuration.
     components: dict[str, Component] = {}
@@ -156,6 +162,7 @@ class AgentDeployment(BaseModel):
             raise ValueError("pooling and normalization apply to embedding deployments only")
         if self.kind != "generation" and self.mmproj_path is not None:
             raise ValueError(f"a {self.kind} deployment has no projector")
+        thinking_options(self.kind, self.thinking, self.thinking_budget)
         if self.kind == "image":
             unknown = set(self.components) - set(IMAGE_COMPONENTS)
             if unknown:
@@ -177,6 +184,13 @@ class AgentDeployment(BaseModel):
         if self.kind not in NO_CONTEXT and self.context_length < 128:
             raise ValueError("a language model deployment needs a context length of at least 128")
         return self
+
+
+def thinking_options(kind: str, thinking: str | None, budget: int | None) -> None:
+    if kind != "generation" and (thinking is not None or budget is not None):
+        raise ValueError("thinking applies to generation deployments only")
+    if budget is not None and thinking != "on":
+        raise ValueError("a thinking budget applies when thinking is on")
 
 
 # piper finds a voice's configuration by the weights' own name with .json
@@ -210,6 +224,8 @@ class DeploymentRequest(BaseModel):
     context_length: int = Field(default=8192, ge=128, le=131072)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
+    thinking: Literal["on", "off"] | None = None
+    thinking_budget: int | None = Field(default=None, ge=1, le=65536)
     components: dict[str, ComponentRequest] = {}
     steps: int | None = Field(default=None, ge=1, le=150)
     cfg_scale: float | None = Field(default=None, ge=0, le=30)
@@ -222,6 +238,7 @@ class DeploymentRequest(BaseModel):
             raise ValueError("a projector is named together with its sha256")
         if self.kind != "image" and (self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
             raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
+        thinking_options(self.kind, self.thinking, self.thinking_budget)
         if self.kind == "image":
             unknown = set(self.components) - set(IMAGE_COMPONENTS)
             if unknown:
@@ -285,6 +302,18 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         command += ["--mmproj", deployment.mmproj_path]
     command += ["-c", str(deployment.context_length)]
     return command
+
+
+# What a language model server takes through its environment: the server's
+# reasoning switches are read from it (LLAMA_ARG_REASONING, the budget as
+# LLAMA_ARG_THINK_BUDGET) rather than from its arguments.
+def deployment_environment(deployment: AgentDeployment) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    if deployment.thinking is not None:
+        environment["LLAMA_ARG_REASONING"] = deployment.thinking
+    if deployment.thinking_budget is not None:
+        environment["LLAMA_ARG_THINK_BUDGET"] = str(deployment.thinking_budget)
+    return environment
 
 
 # The server has no API key of its own; it listens on loopback and is
@@ -386,6 +415,8 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "port": deployment.port,
         "served_model_name": deployment.served_model_name,
         "context_length": deployment.context_length,
+        "thinking": deployment.thinking,
+        "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
         "engine": ENGINES[deployment.kind],
     }
@@ -464,7 +495,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     return ServerProcess(
         deployment_id, deployment_command(agent, deployment), deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
-        authenticated=deployment.kind == "generation",
+        authenticated=deployment.kind == "generation", environment=deployment_environment(deployment),
         health_path=HEALTH_PATHS[deployment.kind], engine=ENGINES[deployment.kind],
     )
 
@@ -603,6 +634,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         served_model_name=request.served_model_name,
         context_length=0 if request.kind in NO_CONTEXT else request.context_length,
         pooling=request.pooling, normalization=request.normalization,
+        thinking=request.thinking, thinking_budget=request.thinking_budget,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         language=request.language,
     )
