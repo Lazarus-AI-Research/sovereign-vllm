@@ -719,6 +719,28 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
         return {"status": "stopped", "id": deployment_id}
 
 
+# The containers whisper-server cannot open: it decodes uploads in memory
+# with miniaudio, which reads WAV, MP3, FLAC and Ogg Vorbis and nothing a
+# browser records. The workspace converts its recordings to WAV before they
+# arrive; an API client sending one of these is told what to send instead of
+# a bare decode failure.
+UNSUPPORTED_CONTAINERS = ((b"\x1a\x45\xdf\xa3", "WebM"), (b"ftyp", "MP4"))
+
+
+def unsupported_container(body: bytes) -> str | None:
+    marker = body.find(b'name="file"')
+    if marker < 0:
+        return None
+    start = body.find(b"\r\n\r\n", marker)
+    if start < 0:
+        return None
+    head = body[start + 4 : start + 16]
+    for magic, name in UNSUPPORTED_CONTAINERS:
+        if head.startswith(magic) or (name == "MP4" and head[4:8] == magic):
+            return name
+    return None
+
+
 # The OpenAI speech request as piper takes it: the text, and the speed as a
 # length scale. The voice named is the deployment's; the answer is WAV,
 # whatever format was asked for, since that is what the voice produces.
@@ -804,6 +826,8 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             return JSONResponse(status_code=503, content={"error": "deployment process is not running"})
         if deployment.kind == "speech":
             return await synthesize(process, admission, body)
+        if deployment.kind == "transcription" and (container := unsupported_container(body)):
+            return JSONResponse(status_code=415, content={"error": f"{container} audio is not decoded here; send WAV, MP3, FLAC or Ogg Vorbis"})
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)
         # The request is built before admission is taken, so a request that
         # cannot be built never leaves a count behind.
