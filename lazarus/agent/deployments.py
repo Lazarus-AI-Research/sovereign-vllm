@@ -741,9 +741,39 @@ def unsupported_container(body: bytes) -> str | None:
     return None
 
 
-# The OpenAI speech request as piper takes it: the text, and the speed as a
-# length scale. The voice named is the deployment's; the answer is WAV,
-# whatever format was asked for, since that is what the voice produces.
+# What a voice reads aloud is the visible answer: a model's thinking, which
+# Chat folds away, and the markdown that shapes text on a screen are not
+# speech. Thinking blocks go; fences, headings, emphasis, links and list
+# markers leave their words behind.
+THINKING = re.compile(r"<(think|thought|reasoning)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+UNFINISHED_THINKING = re.compile(r"<(think|thought|reasoning)>.*$", re.DOTALL | re.IGNORECASE)
+MARKDOWN = (
+    (re.compile(r"```.*?```", re.DOTALL), " "),
+    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),
+    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),
+    (re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE), ""),
+    (re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", re.MULTILINE), ""),
+    (re.compile(r"^[ \t]*>[ \t]?", re.MULTILINE), ""),
+    (re.compile(r"(\*\*|__|~~)(.+?)\1", re.DOTALL), r"\2"),
+    (re.compile(r"(?<!\w)[*_](.+?)[*_](?!\w)", re.DOTALL), r"\1"),
+    (re.compile(r"^[ \t]*[-*_]{3,}[ \t]*$", re.MULTILINE), ""),
+    (re.compile(r"[ \t]+"), " "),
+    (re.compile(r"\n{3,}"), "\n\n"),
+)
+
+
+def spoken_text(text: str) -> str:
+    text = UNFINISHED_THINKING.sub("", THINKING.sub("", text))
+    for pattern, replacement in MARKDOWN:
+        text = pattern.sub(replacement, text)
+    return text.strip()
+
+
+# The OpenAI speech request as piper takes it: the visible answer as text,
+# and the speed as a length scale. The voice named is the deployment's; the
+# answer is WAV, whatever format was asked for, since that is what the
+# voice produces.
 def speech_request(body: bytes) -> dict:
     try:
         request = json.loads(body or b"{}")
@@ -754,6 +784,9 @@ def speech_request(body: bytes) -> dict:
         raise ValueError("input is required")
     if len(text) > 4096:
         raise ValueError("input is at most 4096 characters")
+    text = spoken_text(text)
+    if not text:
+        raise ValueError("input holds nothing to say once thinking and markup are set aside")
     speed = request.get("speed", 1.0)
     if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 0.25 <= speed <= 4.0:
         raise ValueError("speed is between 0.25 and 4.0")

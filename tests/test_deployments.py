@@ -1337,6 +1337,11 @@ def test_a_speech_deployment_is_a_piper_server_child(harness):
         port, path, _, content = harness.inference[-1]
         assert (port, path) == (9110, "/synthesize") and json.loads(content) == {"text": "Hello there.", "length_scale": 0.8}
 
+        # What is spoken is the visible answer: thinking and markup are set aside.
+        answer = "<thought>Five words. Formulate.</thought>\n## Greeting\n\n**Hello**, how are *you* today?\n\n- one `item`\n- [two](http://x)\n\n```python\nprint(1)\n```\n"
+        assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": answer}).status_code == 200
+        assert json.loads(harness.inference[-1][3])["text"] == "Greeting\n\nHello, how are you today?\n\none item\ntwo"
+        assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "<think>still thinking"}).status_code == 400
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "   "}).status_code == 400
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "x", "speed": 9}).status_code == 400
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, content=b"not json").status_code == 400
