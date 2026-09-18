@@ -20,7 +20,8 @@ UV_BIN="$DIST_DIR/bin/uv"
 PYTHON_BIN="$DIST_DIR/python/bin/python3"
 LLAMA_BIN="$DIST_DIR/bin/llama-server"
 SD_BIN="$DIST_DIR/bin/sd-server"
-for required in "$UV_BIN" "$PYTHON_BIN" "$LLAMA_BIN" "$SD_BIN"; do
+WHISPER_BIN="$DIST_DIR/bin/whisper-server"
+for required in "$UV_BIN" "$PYTHON_BIN" "$LLAMA_BIN" "$SD_BIN" "$WHISPER_BIN"; do
   [[ -x "$required" ]] || { echo "error: Metal distribution is missing $required" >&2; exit 1; }
 done
 LLAMA_LIBS=("$DIST_DIR"/bin/*.dylib)
@@ -37,6 +38,7 @@ mkdir -p "$RUNTIME_HOME/bin" "$LOG_DIR" "$AGENT_HOME/models/metal" "$HOME/Librar
 "$UV_BIN" pip install --python "$VENV/bin/python" --no-index --find-links "$DIST_DIR/wheels" "$WHEEL"
 install -m 755 "$LLAMA_BIN" "$RUNTIME_HOME/bin/llama-server"
 install -m 755 "$SD_BIN" "$RUNTIME_HOME/bin/sd-server"
+install -m 755 "$WHISPER_BIN" "$RUNTIME_HOME/bin/whisper-server"
 cp -pPR "${LLAMA_LIBS[@]}" "$RUNTIME_HOME/bin/"
 
 if [[ ! -f "$CONFIG" ]]; then
@@ -47,6 +49,10 @@ fi
 # touching anything the file already says.
 if ! grep -q '^sd_server:' "$CONFIG"; then
   printf 'sd_server: %s\n' "$RUNTIME_HOME/bin/sd-server" >> "$CONFIG"
+fi
+# Likewise the transcription server, which arrived with speech deployments.
+if ! grep -q '^whisper_server:' "$CONFIG"; then
+  printf 'whisper_server: %s\n' "$RUNTIME_HOME/bin/whisper-server" >> "$CONFIG"
 fi
 chmod 600 "$CONFIG"
 if [[ ! -f "$TOKEN_FILE" ]]; then

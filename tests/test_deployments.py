@@ -5,6 +5,7 @@ wire are replaced."""
 import asyncio
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 
 import httpx
@@ -42,6 +43,11 @@ def harness(tmp_path, monkeypatch):
     diffusion.write_bytes(b"diffusion")
     for name in ("clip_l-Q8_0.gguf", "t5xxl-Q8_0.gguf", "ae.safetensors"):
         (models / name).write_bytes(name.encode())
+    ears = models / "ggml-small.bin"
+    ears.write_bytes(b"whisper weights")
+    voice = models / "en_US-ljspeech-medium.onnx"
+    voice.write_bytes(b"voice weights")
+    (models / "en_US-ljspeech-medium.onnx.json").write_bytes(b'{"audio": {"sample_rate": 22050}}')
     children, stopped = [], []
     healthy_ports = set()
     inference = []
@@ -92,9 +98,15 @@ def harness(tmp_path, monkeypatch):
             return answer({"status": "ok"})
         if request.url.path == "/v1/models" and request.method == "GET":
             return answer({"data": [{"id": "served", "object": "model"}]})
+        if request.url.path == "/voices" and request.method == "GET":
+            return answer({"en_US-ljspeech-medium": {}})
         inference.append((port, request.url.path, request.headers.get("Authorization"), request.content))
         if request.url.path == "/v1/embeddings":
             return answer({"data": [{"embedding": [0.1, 0.2]}]})
+        if request.url.path == "/v1/audio/transcriptions":
+            return answer({"text": f"heard on {port}"})
+        if request.url.path == "/synthesize":
+            return httpx.Response(200, content=b"RIFF....WAVEfake", headers={"content-type": "audio/wav"})
         return answer({"choices": [{"message": {"content": f"from {port}"}}]})
 
     real_client = httpx.AsyncClient
@@ -110,7 +122,7 @@ def harness(tmp_path, monkeypatch):
     agent.save_config()
     return SimpleNamespace(
         agent=agent, children=children, stopped=stopped, inference=inference, control=control,
-        weights=weights, projector=projector, diffusion=diffusion, models=models, config_path=tmp_path / "agent.yaml",
+        weights=weights, projector=projector, diffusion=diffusion, ears=ears, voice=voice, models=models, config_path=tmp_path / "agent.yaml",
         headers={"Authorization": "Bearer agent-secret"},
     )
 
@@ -1246,3 +1258,85 @@ def test_a_single_file_checkpoint_loads_as_a_full_model(harness):
         command = harness.children[-1].command
         assert command[command.index("--model") + 1] == str(checkpoint) and "--diffusion-model" not in command
         assert command[command.index("--steps") + 1] == "20" and command[command.index("--cfg-scale") + 1] == "7.0"
+
+
+# A transcription deployment is a whisper-server child: ggml weights, the
+# OpenAI transcription path as its inference route, the language it was
+# pinned with, and the multipart request forwarded as it came.
+def test_a_transcription_deployment_is_a_whisper_server_child(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        request = {
+            "kind": "transcription", "artifact": "metal/ggml-small.bin", "sha256": digest(harness.ears),
+            "revision": "c" * 40, "served_model_name": "assistant-transcribe", "language": "en",
+        }
+        created = api.put("/agent/admin/deployments/ears", headers=harness.headers, json=request)
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert body["status"] == "healthy" and body["engine"] == "whisper.cpp" and body["context_length"] == 0
+        command = harness.children[-1].command
+        assert command[0] == "whisper-server" and command[command.index("-m") + 1] == str(harness.ears)
+        assert command[command.index("--inference-path") + 1] == "/v1/audio/transcriptions"
+        assert command[command.index("--language") + 1] == "en" and "--no-timestamps" in command
+        assert command[command.index("--port") + 1] == "9110" and harness.children[-1].env is None
+
+        heard = api.post(
+            "/deployments/ears/v1/audio/transcriptions", headers=harness.headers,
+            files={"file": ("audio.wav", b"RIFFwav", "audio/wav")}, data={"model": "assistant-transcribe"},
+        )
+        assert heard.status_code == 200 and heard.json()["text"] == "heard on 9110"
+        port, path, _, content = harness.inference[-1]
+        assert (port, path) == (9110, "/v1/audio/transcriptions") and b"RIFFwav" in content
+        assert api.post("/deployments/ears/v1/chat/completions", headers=harness.headers, json={}).status_code == 404
+
+        # GGUF is not what whisper-server loads; a language pinned on a
+        # language model means nothing.
+        wrong = dict(request, artifact="metal/second.gguf", sha256=digest(harness.weights))
+        refused = api.put("/agent/admin/deployments/ears-two", headers=harness.headers, json=wrong)
+        assert refused.status_code == 422 and ".bin" in refused.text
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, language="en")).status_code == 422
+
+    saved = load_agent_config(harness.config_path).deployments["ears"]
+    assert saved.kind == "transcription" and saved.language == "en" and saved.context_length == 0
+
+
+def voice_request(harness, **overrides):
+    request = {
+        "kind": "speech", "artifact": "metal/en_US-ljspeech-medium.onnx", "sha256": digest(harness.voice),
+        "revision": "c" * 40, "served_model_name": "assistant-speech",
+        "components": {"config": {"artifact": "metal/en_US-ljspeech-medium.onnx.json", "sha256": digest(harness.models / "en_US-ljspeech-medium.onnx.json")}},
+    }
+    request.update(overrides)
+    return request
+
+
+# A speech deployment is piper's HTTP server run by the agent's own
+# interpreter: the voice by path with its configuration beside it, probed on
+# its voices listing, and the OpenAI speech request translated to piper's
+# synthesis call with the answer returned as WAV.
+def test_a_speech_deployment_is_a_piper_server_child(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/mouth", headers=harness.headers, json=voice_request(harness))
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "piper"
+        command = harness.children[-1].command
+        assert command[:3] == [sys.executable, "-m", "piper.http_server"]
+        assert command[-2:] == ["-m", str(harness.voice)] and command[command.index("--port") + 1] == "9110"
+
+        spoken = api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"model": "assistant-speech", "input": "Hello there.", "voice": "alloy", "speed": 1.25})
+        assert spoken.status_code == 200 and spoken.headers["content-type"] == "audio/wav" and spoken.content.startswith(b"RIFF")
+        port, path, _, content = harness.inference[-1]
+        assert (port, path) == (9110, "/synthesize") and json.loads(content) == {"text": "Hello there.", "length_scale": 0.8}
+
+        assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "   "}).status_code == 400
+        assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "x", "speed": 9}).status_code == 400
+        assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, content=b"not json").status_code == 400
+        assert api.post("/deployments/mouth/v1/images/generations", headers=harness.headers, json={}).status_code == 404
+
+        # The configuration is the one component, and it is the file piper
+        # finds by the weights' name.
+        assert api.put("/agent/admin/deployments/mouth-two", headers=harness.headers, json=voice_request(harness, components={})).status_code == 422
+        stray = voice_request(harness, components={"config": {"artifact": "metal/clip_l-Q8_0.gguf", "sha256": digest(harness.models / "clip_l-Q8_0.gguf")}})
+        assert api.put("/agent/admin/deployments/mouth-two", headers=harness.headers, json=stray).status_code == 422
+
+    saved = load_agent_config(harness.config_path).deployments["mouth"]
+    assert saved.kind == "speech" and saved.components["config"].path == str(harness.voice) + ".json"

@@ -5,6 +5,13 @@ third-party components. Their own license terms continue to apply.
 
 - vLLM — Apache License 2.0 — <https://github.com/vllm-project/vllm>
 - llama.cpp — MIT License — <https://github.com/ggml-org/llama.cpp>
+- stable-diffusion.cpp — MIT License — <https://github.com/leejet/stable-diffusion.cpp>
+- whisper.cpp — MIT License — <https://github.com/ggml-org/whisper.cpp> (the Metal
+  distribution builds `whisper-server` from the pinned source tarball)
+- Piper — GPL-3.0-or-later — <https://github.com/OHF-Voice/piper1-gpl> (installed
+  as its own program in the Metal distribution's environment and run as a
+  separate process for speech deployments; it bundles espeak-ng, GPL-3.0)
+- ONNX Runtime — MIT License — <https://github.com/microsoft/onnxruntime>
 - CPython — Python Software Foundation License — <https://www.python.org/psf/license/>
 - uv — Apache License 2.0 or MIT License — <https://github.com/astral-sh/uv>
 

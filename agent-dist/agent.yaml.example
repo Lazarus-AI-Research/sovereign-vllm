@@ -12,5 +12,6 @@ port: 9100
 token_env: SOVEREIGN_AGENT_TOKEN
 llama_server: __AGENT_HOME__/runtime/bin/llama-server
 sd_server: __AGENT_HOME__/runtime/bin/sd-server
+whisper_server: __AGENT_HOME__/runtime/bin/whisper-server
 
 deployments: {}

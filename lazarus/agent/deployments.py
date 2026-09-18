@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
+import shlex
 import socket
+import sys
 import time
 from typing import TYPE_CHECKING, Literal
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
@@ -39,7 +42,13 @@ ALLOWED_PATHS = {
     "generation": {"chat/completions", "completions", "models"},
     "embedding": {"embeddings", "models"},
     "image": {"images/generations", "models"},
+    "transcription": {"audio/transcriptions"},
+    "speech": {"audio/speech"},
 }
+KINDS = tuple(ALLOWED_PATHS)
+# The kinds served without a context window: a diffusion, transcription or
+# speech model has no prompt to size.
+NO_CONTEXT = ("image", "transcription", "speech")
 
 # The files an image model is served with beside its diffusion weights, by
 # the flag stable-diffusion.cpp takes them under. A model that needs none of
@@ -50,11 +59,36 @@ IMAGE_SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpm++2m", "lcm")
 # stable-diffusion.cpp, whose text encoders and autoencoder ship as either.
 WEIGHT_SUFFIXES = (".gguf", ".safetensors")
 
+# The voice configuration piper reads beside a speech model's weights: the
+# one component a speech deployment names, and it must be the file piper
+# finds by name.
+SPEECH_COMPONENTS = {"config"}
+# The language a transcription deployment listens for; "auto" lets the
+# model detect it.
+LANGUAGE = r"^(auto|[a-z]{2,3})$"
+
 # Where each kind's server says it is up. llama-server answers /health once
 # its model is loaded; sd-server listens only once its model is loaded and
-# answers the models listing.
-HEALTH_PATHS = {"generation": "/health", "embedding": "/health", "image": "/v1/models"}
-ENGINES = {"generation": "llama.cpp", "embedding": "llama.cpp", "image": "stable-diffusion.cpp"}
+# answers the models listing; whisper-server answers /health with 503 while
+# it loads; piper's server listens only once its voice is loaded.
+HEALTH_PATHS = {
+    "generation": "/health", "embedding": "/health", "image": "/v1/models",
+    "transcription": "/health", "speech": "/voices",
+}
+ENGINES = {
+    "generation": "llama.cpp", "embedding": "llama.cpp", "image": "stable-diffusion.cpp",
+    "transcription": "whisper.cpp", "speech": "piper",
+}
+
+
+# What each kind's loader accepts: GGUF for llama-server, GGUF or safetensors
+# for stable-diffusion.cpp, ggml for whisper-server, ONNX for piper.
+def weight_suffixes(kind: str) -> tuple[str, ...]:
+    return {"image": WEIGHT_SUFFIXES, "transcription": (".bin",), "speech": (".onnx",)}.get(kind, (".gguf",))
+
+
+def component_suffixes(kind: str) -> tuple[str, ...]:
+    return (".json",) if kind == "speech" else weight_suffixes(kind)
 
 
 class Component(BaseModel):
@@ -81,7 +115,7 @@ class AgentDeployment(BaseModel):
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
-    kind: Literal["generation", "embedding", "image"]
+    kind: Literal[KINDS]
     model_path: str
     mmproj_path: str | None = None
     mmproj_sha256: str | None = None
@@ -92,11 +126,14 @@ class AgentDeployment(BaseModel):
     context_length: int = Field(default=0, ge=0, le=131072)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
-    # An image deployment's companions and the sampling it was pinned with.
+    # An image deployment's companions and the sampling it was pinned with;
+    # a speech deployment's one companion is its voice configuration.
     components: dict[str, Component] = {}
     steps: int | None = Field(default=None, ge=1, le=150)
     cfg_scale: float | None = Field(default=None, ge=0, le=30)
     sampler: Literal[IMAGE_SAMPLERS] | None = None
+    # A transcription deployment's spoken language.
+    language: str | None = Field(default=None, pattern=LANGUAGE)
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -113,15 +150,13 @@ class AgentDeployment(BaseModel):
     @model_validator(mode="after")
     def kind_options(self):
         if self.kind == "embedding":
-            if self.mmproj_path is not None:
-                raise ValueError("an embedding deployment has no projector")
             self.pooling = self.pooling or "mean"
             self.normalization = self.normalization or "l2"
         elif self.pooling is not None or self.normalization is not None:
             raise ValueError("pooling and normalization apply to embedding deployments only")
+        if self.kind != "generation" and self.mmproj_path is not None:
+            raise ValueError(f"a {self.kind} deployment has no projector")
         if self.kind == "image":
-            if self.mmproj_path is not None:
-                raise ValueError("an image deployment has no projector")
             unknown = set(self.components) - set(IMAGE_COMPONENTS)
             if unknown:
                 raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
@@ -129,13 +164,28 @@ class AgentDeployment(BaseModel):
             self.cfg_scale = 7.0 if self.cfg_scale is None else self.cfg_scale
             self.sampler = self.sampler or "euler"
         else:
-            if self.components:
-                raise ValueError("components apply to image deployments only")
             if self.steps is not None or self.cfg_scale is not None or self.sampler is not None:
                 raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
-            if self.context_length < 128:
-                raise ValueError("a language model deployment needs a context length of at least 128")
+            if self.kind == "speech":
+                speech_components(self.components, self.model_path)
+            elif self.components:
+                raise ValueError("components apply to image and speech deployments only")
+        if self.kind == "transcription":
+            self.language = self.language or "auto"
+        elif self.language is not None:
+            raise ValueError("language applies to transcription deployments only")
+        if self.kind not in NO_CONTEXT and self.context_length < 128:
+            raise ValueError("a language model deployment needs a context length of at least 128")
         return self
+
+
+# piper finds a voice's configuration by the weights' own name with .json
+# appended; the one component a speech deployment names must be that file.
+def speech_components(components: dict, model_path: str) -> None:
+    if set(components) != SPEECH_COMPONENTS:
+        raise ValueError("a speech deployment names its voice configuration as its one component, config")
+    if components["config"].path != model_path + ".json":
+        raise ValueError("a voice's configuration is the weights' name with .json appended")
 
 
 class ComponentRequest(BaseModel):
@@ -150,7 +200,7 @@ class DeploymentRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["generation", "embedding", "image"]
+    kind: Literal[KINDS]
     artifact: str
     mmproj: str | None = None
     revision: str = Field(pattern=r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -164,17 +214,25 @@ class DeploymentRequest(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=150)
     cfg_scale: float | None = Field(default=None, ge=0, le=30)
     sampler: Literal[IMAGE_SAMPLERS] | None = None
+    language: str | None = Field(default=None, pattern=LANGUAGE)
 
     @model_validator(mode="after")
     def projector_checksum(self):
         if (self.mmproj is None) != (self.mmproj_sha256 is None):
             raise ValueError("a projector is named together with its sha256")
-        if self.kind != "image" and (self.components or self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
-            raise ValueError("components, steps, cfg_scale and sampler apply to image deployments only")
+        if self.kind != "image" and (self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
+            raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
         if self.kind == "image":
             unknown = set(self.components) - set(IMAGE_COMPONENTS)
             if unknown:
                 raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
+        elif self.kind == "speech":
+            if set(self.components) != SPEECH_COMPONENTS:
+                raise ValueError("a speech deployment names its voice configuration as its one component, config")
+        elif self.components:
+            raise ValueError("components apply to image and speech deployments only")
+        if self.kind != "transcription" and self.language is not None:
+            raise ValueError("language applies to transcription deployments only")
         return self
 
 
@@ -202,6 +260,10 @@ class Admission:
 def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     if deployment.kind == "image":
         return image_command(agent, deployment)
+    if deployment.kind == "transcription":
+        return transcription_command(agent, deployment)
+    if deployment.kind == "speech":
+        return speech_command(agent, deployment)
     command = [agent.config.llama_server]
     if deployment.kind == "embedding":
         command += [
@@ -247,6 +309,29 @@ def image_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--sampling-method", deployment.sampler,
     ]
     return command
+
+
+# whisper-server answers its inference route under the OpenAI transcription
+# path, as the gateway and the workspace call it; timestamps are left out of
+# the text it returns.
+def transcription_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    return [
+        agent.config.whisper_server,
+        "--host", "127.0.0.1",
+        "--port", str(deployment.port),
+        "-m", deployment.model_path,
+        "--inference-path", "/v1/audio/transcriptions",
+        "--no-timestamps",
+        "--language", deployment.language or "auto",
+    ]
+
+
+# piper's own HTTP server, run by the agent's interpreter unless the
+# configuration names another; it loads the voice named by path and finds
+# the configuration beside it.
+def speech_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    server = shlex.split(agent.config.piper_server) or [sys.executable, "-m", "piper.http_server"]
+    return [*server, "--host", "127.0.0.1", "--port", str(deployment.port), "-m", deployment.model_path]
 
 
 def deployment_lock(agent: Agent, deployment_id: str) -> asyncio.Lock:
@@ -474,14 +559,14 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     # llama-server loads GGUF alone; stable-diffusion.cpp takes its encoders
     # and autoencoder as safetensors too. A file the loader would refuse is
     # refused here, before a serving process is touched.
-    suffixes = WEIGHT_SUFFIXES if request.kind == "image" else (".gguf",)
+    suffixes = weight_suffixes(request.kind)
     model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
     if request.mmproj:
         mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256, suffixes)
     components = {}
     for name, component in request.components.items():
-        path = await asyncio.to_thread(agent.resolve_model, component.artifact, component.sha256, suffixes)
+        path = await asyncio.to_thread(agent.resolve_model, component.artifact, component.sha256, component_suffixes(request.kind))
         components[name] = Component(path=str(path), sha256=component.sha256.lower())
     transition = Transition()
     return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, mmproj, components, transition), transition, http_request)
@@ -516,9 +601,10 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         revision=request.revision.lower(), sha256=request.sha256.lower(),
         port=port,
         served_model_name=request.served_model_name,
-        context_length=0 if request.kind == "image" else request.context_length,
+        context_length=0 if request.kind in NO_CONTEXT else request.context_length,
         pooling=request.pooling, normalization=request.normalization,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
+        language=request.language,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)
@@ -633,6 +719,43 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
         return {"status": "stopped", "id": deployment_id}
 
 
+# The OpenAI speech request as piper takes it: the text, and the speed as a
+# length scale. The voice named is the deployment's; the answer is WAV,
+# whatever format was asked for, since that is what the voice produces.
+def speech_request(body: bytes) -> dict:
+    try:
+        request = json.loads(body or b"{}")
+    except ValueError:
+        raise ValueError("the request is not JSON")
+    text = request.get("input") if isinstance(request, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("input is required")
+    if len(text) > 4096:
+        raise ValueError("input is at most 4096 characters")
+    speed = request.get("speed", 1.0)
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 0.25 <= speed <= 4.0:
+        raise ValueError("speed is between 0.25 and 4.0")
+    return {"text": text, "length_scale": round(1.0 / float(speed), 4)}
+
+
+async def synthesize(process: "ServerProcess", admission: Admission, body: bytes):
+    try:
+        payload = speech_request(body)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    admission.enter()
+    try:
+        async with httpx.AsyncClient(timeout=600.0, trust_env=False) as client:
+            answer = await client.post(f"http://127.0.0.1:{process.port}/synthesize", json=payload)
+    except httpx.HTTPError:
+        return JSONResponse(status_code=503, content={"error": "deployment engine unavailable"})
+    finally:
+        admission.leave()
+    if answer.status_code != 200:
+        return JSONResponse(status_code=502, content={"error": f"the voice answered {answer.status_code}"})
+    return Response(content=answer.content, media_type="audio/wav")
+
+
 def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     @app.get("/agent/deployments")
     async def list_deployments():
@@ -679,6 +802,8 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         # port may meanwhile belong to something else, so nothing is forwarded.
         if not process.running():
             return JSONResponse(status_code=503, content={"error": "deployment process is not running"})
+        if deployment.kind == "speech":
+            return await synthesize(process, admission, body)
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)
         # The request is built before admission is taken, so a request that
         # cannot be built never leaves a count behind.

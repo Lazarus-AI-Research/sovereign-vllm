@@ -18,6 +18,10 @@ env:
   SD_VERSION: master-872-cc515a0
   SD_ASSET: sd-master-cc515a0-bin-Darwin-macOS-26.6.2-arm64.zip
   SD_SHA256: 39412a6abb2f19a18524903ccaa63ebbd21e4818540ce4a1d64ea5e55f474b6d
+  # whisper.cpp serves transcription deployments; no macOS binary is
+  # published, so its server is built from the pinned source tarball.
+  WHISPER_VERSION: v1.9.4
+  WHISPER_SHA256: 57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae
   UV_VERSION: 0.11.28
   PYTHON_VERSION: 3.12.11
 
@@ -133,6 +137,14 @@ jobs:
           test -n "$SD"
           cp "$SD" stage/bin/sd-server
           cp -pPR "$(dirname "$SD")"/libstable-diffusion.dylib stage/bin/
+          curl -fL -o whisper.tar.gz "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/$WHISPER_VERSION.tar.gz"
+          echo "$WHISPER_SHA256  whisper.tar.gz" | shasum -a 256 -c -
+          tar -xzf whisper.tar.gz
+          WHISPER_SRC="$(find . -maxdepth 1 -type d -name 'whisper.cpp-*' -print -quit)"
+          cmake -S "$WHISPER_SRC" -B whisper-build -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build whisper-build --target whisper-server -j "$(sysctl -n hw.ncpu)"
+          cp whisper-build/bin/whisper-server stage/bin/whisper-server
           TEST_HOME="$(mktemp -d)"
           HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
             stage/agent-dist/install-agent.sh
@@ -140,13 +152,17 @@ jobs:
             'import fastapi, lazarus.agent.server, yaml'
           "$TEST_HOME/.sovereign/runtime/bin/llama-server" --version
           "$TEST_HOME/.sovereign/runtime/bin/sd-server" -h >/dev/null
+          "$TEST_HOME/.sovereign/runtime/bin/whisper-server" -h >/dev/null
+          "$TEST_HOME/.sovereign/runtime/venv/bin/python" -c 'import piper.http_server, onnxruntime'
           grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
+          grep -q "^whisper_server: $TEST_HOME/.sovereign/runtime/bin/whisper-server" "$TEST_HOME/.sovereign/agent.yaml"
           # An agent.yaml from before image deployments gains the image server
           # at upgrade and keeps everything else.
           printf 'listen: 127.0.0.1\nport: 9100\ndeployments: {}\n' > "$TEST_HOME/.sovereign/agent.yaml"
           HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
             stage/agent-dist/install-agent.sh
           grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
+          grep -q "^whisper_server: $TEST_HOME/.sovereign/runtime/bin/whisper-server" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^port: 9100" "$TEST_HOME/.sovereign/agent.yaml"
           rm -rf "$TEST_HOME"
           tar -C stage -czf "sovereign-metal-agent-$VERSION-arm64.tar.gz" .
