@@ -1288,6 +1288,16 @@ def test_a_transcription_deployment_is_a_whisper_server_child(harness):
         assert (port, path) == (9110, "/v1/audio/transcriptions") and b"RIFFwav" in content
         assert api.post("/deployments/ears/v1/chat/completions", headers=harness.headers, json={}).status_code == 404
 
+        # A browser's own recording is not decoded by the server; the caller
+        # is told what to send. An MP3 or WAV upload is forwarded as it came.
+        webm = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 32
+        refused = api.post("/deployments/ears/v1/audio/transcriptions", headers=harness.headers, files={"file": ("clip.webm", webm, "audio/webm")})
+        assert refused.status_code == 415 and "WebM" in refused.text and harness.inference[-1][3] != webm
+        m4a = b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 24
+        assert api.post("/deployments/ears/v1/audio/transcriptions", headers=harness.headers, files={"file": ("clip.m4a", m4a, "audio/mp4")}).status_code == 415
+        mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\xff\xfb" * 16
+        assert api.post("/deployments/ears/v1/audio/transcriptions", headers=harness.headers, files={"file": ("clip.mp3", mp3, "audio/mpeg")}).status_code == 200
+
         # GGUF is not what whisper-server loads; a language pinned on a
         # language model means nothing.
         wrong = dict(request, artifact="metal/second.gguf", sha256=digest(harness.weights))
