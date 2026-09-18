@@ -10,7 +10,11 @@ FROM vllm/vllm-openai@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d1
 
 COPY pyproject.toml constraints.txt README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md /opt/sovereign/
 COPY lazarus /opt/sovereign/lazarus
-RUN pip install --no-cache-dir --constraint /opt/sovereign/constraints.txt "/opt/sovereign[audio]"
+# The base image carries Ubuntu's distutils-installed blinker, which pip can
+# neither measure nor remove; the speech server's Flask wants a newer one,
+# so it is laid over the old copy first rather than uninstalled.
+RUN pip install --no-cache-dir --ignore-installed "blinker>=1.9" && \
+    pip install --no-cache-dir --constraint /opt/sovereign/constraints.txt "/opt/sovereign[audio]"
 
 # §24: required binaries (provided as console scripts by the package)
 RUN test -x /usr/local/bin/run-sovereign-runtime && \
