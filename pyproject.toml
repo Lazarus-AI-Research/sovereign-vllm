@@ -1,6 +1,6 @@
 [project]
 name = "sovereign-runtime"
-version = "0.1.0rc7"
+version = "0.1.0rc8"
 description = "Lazarus Sovereign Runtime appliance layer over vLLM"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,6 +17,9 @@ dependencies = [
     "uvicorn==0.51.0",
     "httpx==0.28.1",
     "prometheus-client==0.24.1",
+    # The text-to-speech server a speech deployment runs on; its HTTP extra
+    # is the server itself.
+    "piper-tts[http]==1.8.0",
 ]
 
 [project.optional-dependencies]

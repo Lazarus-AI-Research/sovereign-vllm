@@ -45,6 +45,11 @@ class AgentConfig(BaseModel):
     llama_server: str = "llama-server"
     # The stable-diffusion.cpp server an image deployment runs on.
     sd_server: str = "sd-server"
+    # The whisper.cpp server a transcription deployment runs on.
+    whisper_server: str = "whisper-server"
+    # The command that runs piper's HTTP server for a speech deployment;
+    # empty means the agent's own interpreter with piper installed beside it.
+    piper_server: str = ""
     # Every served model: created by Control while the appliance runs and
     # persisted so a restarted agent serves them again.
     deployments: dict[str, AgentDeployment] = {}
