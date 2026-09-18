@@ -743,20 +743,24 @@ def unsupported_container(body: bytes) -> str | None:
 
 # What a voice reads aloud is the visible answer: a model's thinking, which
 # Chat folds away, and the markdown that shapes text on a screen are not
-# speech. Thinking blocks go; fences, headings, emphasis, links and list
-# markers leave their words behind.
-THINKING = re.compile(r"<(think|thought|reasoning)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
-UNFINISHED_THINKING = re.compile(r"<(think|thought|reasoning)>.*$", re.DOTALL | re.IGNORECASE)
+# speech. Thinking opens the answer and goes, closed or cut off; a tag named
+# later in prose is a word like any other. Fences go; inline code, headings,
+# emphasis, links and list markers leave their words behind. Emphasis is
+# recognised only where markdown would: an asterisk hugging its text on the
+# inside, so "2 * 3 * 4" stays arithmetic.
+THINKING = re.compile(r"^\s*<(think|thought|reasoning)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+UNFINISHED_THINKING = re.compile(r"^\s*<(think|thought|reasoning)>.*$", re.DOTALL | re.IGNORECASE)
 MARKDOWN = (
     (re.compile(r"```.*?```", re.DOTALL), " "),
-    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"`([^`\n]*)`"), r"\1"),
     (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),
     (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),
     (re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE), ""),
     (re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", re.MULTILINE), ""),
     (re.compile(r"^[ \t]*>[ \t]?", re.MULTILINE), ""),
-    (re.compile(r"(\*\*|__|~~)(.+?)\1", re.DOTALL), r"\2"),
-    (re.compile(r"(?<!\w)[*_](.+?)[*_](?!\w)", re.DOTALL), r"\1"),
+    (re.compile(r"(\*\*|__|~~)(?=\S)(.+?)(?<=\S)\1", re.DOTALL), r"\2"),
+    (re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])"), r"\1"),
+    (re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])"), r"\1"),
     (re.compile(r"^[ \t]*[-*_]{3,}[ \t]*$", re.MULTILINE), ""),
     (re.compile(r"[ \t]+"), " "),
     (re.compile(r"\n{3,}"), "\n\n"),
