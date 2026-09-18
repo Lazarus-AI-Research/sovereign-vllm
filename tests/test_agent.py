@@ -176,7 +176,7 @@ def test_manifest_shape(client):
     resp = client.get("/agent/manifest", headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.10"
+    assert body["agent_version"] == AGENT_VERSION == "0.1.0-rc.11"
     assert body["backend"] == "metal"
     assert body["deployments"] == {}
     assert set(body) == {"agent_version", "backend", "available_engines", "deployments"}

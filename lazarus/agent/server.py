@@ -55,6 +55,7 @@ class ServerProcess:
     def __init__(
         self, name: str, command: list[str], port: int, model_path: str,
         *, revision: str | None, context_length: int | None, authenticated: bool = False,
+        environment: dict[str, str] | None = None,
         health_path: str = "/health", engine: str = "llama.cpp",
     ):
         self.name = name
@@ -71,14 +72,17 @@ class ServerProcess:
         # random bits never enter argv or logs.
         self.api_key = secrets.token_urlsafe(32) + "-agent" if authenticated else None
         child_env = None
+        if self.api_key is not None or environment:
+            child_env = dict(os.environ)
         if self.api_key is not None:
             # b9960 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
             # Extra keys would create ingress outside the agent's admission gate.
             if any(arg.split("=", 1)[0].replace("_", "-") in {"--api-key", "--api-key-file"} for arg in command):
                 raise ValueError("generation authentication is agent-owned")
-            child_env = dict(os.environ)
             child_env.pop("LLAMA_ARG_API_KEY_FILE", None)
             child_env["LLAMA_API_KEY"] = self.api_key
+        if environment:
+            child_env.update(environment)
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"{name}.{engine}.log"
