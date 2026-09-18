@@ -1342,6 +1342,15 @@ def test_a_speech_deployment_is_a_piper_server_child(harness):
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": answer}).status_code == 200
         assert json.loads(harness.inference[-1][3])["text"] == "Greeting\n\nHello, how are you today?\n\none item\ntwo"
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "<think>still thinking"}).status_code == 400
+        # A tag named in prose or code is a word; arithmetic keeps its stars.
+        for spoken, heard in (
+            ("Use the `<think>` tag. The answer is 42.", "Use the <think> tag. The answer is 42."),
+            ("```\n<think>\n```\nThe prose after a fence stays.", "The prose after a fence stays."),
+            ("2 * 3 * 4 equals 24, and a_b_c is a name.", "2 * 3 * 4 equals 24, and a_b_c is a name."),
+            ("This is *really* **important**.", "This is really important."),
+        ):
+            assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": spoken}).status_code == 200
+            assert json.loads(harness.inference[-1][3])["text"] == heard, spoken
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "   "}).status_code == 400
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, json={"input": "x", "speed": 9}).status_code == 400
         assert api.post("/deployments/mouth/v1/audio/speech", headers=harness.headers, content=b"not json").status_code == 400
