@@ -72,6 +72,10 @@ class ServerProcess:
         # traces the final four key characters; those stay public while 256
         # random bits never enter argv or logs.
         self.api_key = secrets.token_urlsafe(32) + "-agent" if authenticated else None
+        # What this child's video ids are signed with beside the agent's
+        # secret: two engines numbering their jobs alike never sign the same
+        # id, and an id outlives neither the child nor its jobs.
+        self.instance = secrets.token_hex(16)
         child_env = None
         if self.api_key is not None or environment:
             child_env = dict(os.environ)

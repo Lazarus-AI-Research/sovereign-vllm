@@ -1040,7 +1040,7 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         if deployment.kind == "speech":
             return await synthesize(process, admission, body)
         if deployment.kind == "video":
-            return await video_request(agent.token, process, admission, deployment, path, request.method, body)
+            return await video_request(agent.token + process.instance, process, admission, deployment, path, request.method, body)
         if deployment.kind == "transcription" and (container := unsupported_container(body)):
             return JSONResponse(status_code=415, content={"error": f"{container} audio is not decoded here; send WAV, MP3, FLAC or Ogg Vorbis"})
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)

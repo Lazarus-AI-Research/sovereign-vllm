@@ -1439,11 +1439,15 @@ def video_request(harness, **overrides):
 # which carries the served name, and the video is asked after, fetched and
 # cancelled by that id.
 def test_a_video_deployment_answers_the_videos_api(harness):
-    from lazarus.agent.videos import video_id
+    from lazarus.agent.videos import video_id as signed
 
     with TestClient(build_app(harness.agent)) as api:
         created = api.put("/agent/admin/deployments/clips", headers=harness.headers, json=video_request(harness))
         assert created.status_code == 200, created.text
+        instance = harness.agent.deployments["clips"].instance
+
+        def video_id(secret, served, job):
+            return signed(secret + instance if secret == "agent-secret" else secret, served, job)
         assert created.json()["engine"] == "stable-diffusion.cpp"
         command = harness.children[-1].command
         assert command[0] == "sd-server" and command[command.index("--diffusion-model") + 1].endswith("wan-5b.gguf")
@@ -1477,19 +1481,26 @@ def test_a_video_deployment_answers_the_videos_api(harness):
         assert api.delete(f"/deployments/clips/v1/videos/{pending}", headers=harness.headers).status_code == 409
         gone = video_id("agent-secret", "assistant-video", "job_gone")
         assert api.delete(f"/deployments/clips/v1/videos/{gone}", headers=harness.headers).status_code == 404
-        # An id signed with another secret names no video here, though its
-        # job is one this engine made.
+        # An id signed with another secret, or by an earlier child of this
+        # deployment, names no video here, though its job is one this engine
+        # numbered.
         forged = video_id("another-secret", "assistant-video", "job_done")
         assert api.get(f"/deployments/clips/v1/videos/{forged}", headers=harness.headers).status_code == 404
+        earlier = signed("agent-secret", "assistant-video", "job_done")
+        assert api.get(f"/deployments/clips/v1/videos/{earlier}", headers=harness.headers).status_code == 404
 
 
 # A request the videos API cannot take is refused before the engine sees
 # it, and a video another deployment made is not this one's to answer for.
 def test_the_videos_api_refuses_what_it_cannot_make(harness):
-    from lazarus.agent.videos import video_id
+    from lazarus.agent.videos import video_id as signed
 
     with TestClient(build_app(harness.agent)) as api:
         assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=video_request(harness)).status_code == 200
+        instance = harness.agent.deployments["clips"].instance
+
+        def video_id(secret, served, job):
+            return signed(secret + instance, served, job)
         before = len(harness.inference)
         for body in (
             {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": "a", "seconds": "3"}, {"prompt": "a", "seconds": "2.5"}, {"prompt": "a", "seconds": "²"},
