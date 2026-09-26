@@ -58,6 +58,11 @@ NO_CONTEXT = ("image", "transcription", "speech", "video")
 # them (a single-file checkpoint) names none.
 IMAGE_COMPONENTS = {"clip_l": "--clip_l", "t5xxl": "--t5xxl", "vae": "--vae"}
 IMAGE_SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpm++2m", "lcm")
+# sd-server loads a LoRA a prompt names from its LoRA directory, which is its
+# working directory unless given; launchd starts the agent at the root of
+# the disk. An empty directory leaves a prompt nothing to load, and the
+# server nothing to scan when it lists what it has.
+LORA_DIRECTORY = "/var/empty"
 # The files a video model is served with beside its diffusion weights: an
 # autoencoder, a text encoder (a T5 for Wan, a language model for LTX-2 and
 # MiniMax-H3), and for models that make sound an audio autoencoder, and for
@@ -82,11 +87,12 @@ LANGUAGE = r"^(auto|[a-z]{2,3})$"
 
 # Where each kind's server says it is up. llama-server answers /health once
 # its model is loaded; sd-server listens only once its model is loaded and
-# answers the models listing; whisper-server answers /health with 503 while
+# answers the models listing (its capabilities route rescans directories on
+# every call); whisper-server answers /health with 503 while
 # it loads; piper's server listens only once its voice is loaded.
 HEALTH_PATHS = {
     "generation": "/health", "embedding": "/health", "image": "/v1/models",
-    "transcription": "/health", "speech": "/voices", "video": "/sdcpp/v1/capabilities",
+    "transcription": "/health", "speech": "/voices", "video": "/v1/models",
 }
 ENGINES = {
     "generation": "llama.cpp", "embedding": "llama.cpp", "image": "stable-diffusion.cpp",
@@ -364,6 +370,7 @@ def image_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--listen-ip", "127.0.0.1",
         "--listen-port", str(deployment.port),
         "--diffusion-model" if deployment.components else "--model", deployment.model_path,
+        "--lora-model-dir", LORA_DIRECTORY,
     ]
     for name, flag in IMAGE_COMPONENTS.items():
         component = deployment.components.get(name)
@@ -388,6 +395,7 @@ def video_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--listen-ip", "127.0.0.1",
         "--listen-port", str(deployment.port),
         "--diffusion-model", deployment.model_path,
+        "--lora-model-dir", LORA_DIRECTORY,
     ]
     for name, flag in VIDEO_COMPONENTS.items():
         component = deployment.components.get(name)

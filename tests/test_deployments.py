@@ -103,8 +103,6 @@ def harness(tmp_path, monkeypatch):
             return answer({"data": [{"id": "served", "object": "model"}]})
         if request.url.path == "/voices" and request.method == "GET":
             return answer({"en_US-ljspeech-medium": {}})
-        if request.url.path == "/sdcpp/v1/capabilities" and request.method == "GET":
-            return answer({"supported_modes": ["vid_gen"]})
         if request.url.path.startswith("/sdcpp/v1/jobs/") and request.method == "GET":
             job = request.url.path.rsplit("/", 1)[1]
             if job == "job_gone":
@@ -1227,6 +1225,7 @@ def test_an_image_deployment_is_an_sd_server_child(harness):
         assert command[command.index("--steps") + 1] == "4" and command[command.index("--cfg-scale") + 1] == "1.0"
         assert command[command.index("--sampling-method") + 1] == "euler" and "--port" not in command
         assert command[command.index("--listen-port") + 1] == "9110"
+        assert command[command.index("--lora-model-dir") + 1] == "/var/empty"
 
         pictured = api.post("/deployments/pictures/v1/images/generations", headers=harness.headers, json={"prompt": "a cat"})
         assert pictured.status_code == 200 and harness.inference[-1][0] == 9110 and harness.inference[-1][1] == "/v1/images/generations"
@@ -1445,6 +1444,7 @@ def test_a_video_deployment_answers_the_videos_api(harness):
         assert command[0] == "sd-server" and command[command.index("--diffusion-model") + 1].endswith("wan-5b.gguf")
         assert command[command.index("--t5xxl") + 1].endswith("umt5.gguf") and command[command.index("--vae") + 1].endswith("wan-vae.safetensors")
         assert command[-3:] == ["--diffusion-fa", "--backend", "vae=cpu"] and "--steps" not in command
+        assert command[command.index("--lora-model-dir") + 1] == "/var/empty"
 
         made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"model": "assistant-video", "prompt": "a kite", "seconds": "4", "size": "352x640"})
         assert made.status_code == 200, made.text
