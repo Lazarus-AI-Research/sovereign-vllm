@@ -5,6 +5,7 @@ wire are replaced."""
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from types import SimpleNamespace
 
@@ -55,7 +56,8 @@ def harness(tmp_path, monkeypatch):
     def spawn(command, **kwargs):
         port_flag = "--port" if "--port" in command else "--listen-port"
         port = int(command[command.index(port_flag) + 1])
-        child = SimpleNamespace(alive=True, command=command, port=port, env=kwargs.get("env"))
+        # The test process stands in for the child when its memory is read.
+        child = SimpleNamespace(alive=True, command=command, port=port, env=kwargs.get("env"), pid=os.getpid())
         child.poll = lambda: None if child.alive else 0
         child.wait = lambda timeout=None: 0
 
@@ -166,6 +168,7 @@ def test_deployment_is_its_own_process_on_its_own_port_and_is_persisted(harness)
         listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]
         assert listed["assistant-second"]["served_model_name"] == "assistant-second"
         assert listed["assistant-second"]["status"] == "healthy"
+        assert listed["assistant-second"]["memory_bytes"] > 0
         manifest = api.get("/agent/manifest", headers=harness.headers).json()
         assert "assistant-second" in manifest["deployments"] and "roles" not in manifest
 
