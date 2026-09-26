@@ -419,6 +419,7 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
         "engine": ENGINES[deployment.kind],
+        "memory_bytes": process.memory_bytes() if running else None,
     }
 
 
