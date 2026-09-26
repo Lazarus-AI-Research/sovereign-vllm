@@ -3,6 +3,7 @@ process with its own port and admission gate. Only the OS child and its HTTP
 wire are replaced."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ def harness(tmp_path, monkeypatch):
     projector.write_bytes(b"projector")
     diffusion = models / "flux1-schnell-Q4_0.gguf"
     diffusion.write_bytes(b"diffusion")
-    for name in ("clip_l-Q8_0.gguf", "t5xxl-Q8_0.gguf", "ae.safetensors"):
+    for name in ("clip_l-Q8_0.gguf", "t5xxl-Q8_0.gguf", "ae.safetensors", "wan-5b.gguf", "umt5.gguf", "wan-vae.safetensors"):
         (models / name).write_bytes(name.encode())
     ears = models / "ggml-small.bin"
     ears.write_bytes(b"whisper weights")
@@ -102,6 +103,15 @@ def harness(tmp_path, monkeypatch):
             return answer({"data": [{"id": "served", "object": "model"}]})
         if request.url.path == "/voices" and request.method == "GET":
             return answer({"en_US-ljspeech-medium": {}})
+        if request.url.path == "/sdcpp/v1/capabilities" and request.method == "GET":
+            return answer({"supported_modes": ["vid_gen"]})
+        if request.url.path.startswith("/sdcpp/v1/jobs/") and request.method == "GET":
+            job = request.url.path.rsplit("/", 1)[1]
+            if job == "job_gone":
+                return httpx.Response(410, json={"error": {"message": "gone"}})
+            done = job == "job_done"
+            return answer({"id": job, "kind": "vid_gen", "status": "completed" if done else "generating", "created": 1, "completed": 9 if done else None,
+                           "result": {"b64_json": base64.b64encode(b"\x1a\x45\xdf\xa3webm").decode(), "mime_type": "video/webm"} if done else None})
         inference.append((port, request.url.path, request.headers.get("Authorization"), request.content))
         if request.url.path == "/v1/embeddings":
             return answer({"data": [{"embedding": [0.1, 0.2]}]})
@@ -109,6 +119,10 @@ def harness(tmp_path, monkeypatch):
             return answer({"text": f"heard on {port}"})
         if request.url.path == "/synthesize":
             return httpx.Response(200, content=b"RIFF....WAVEfake", headers={"content-type": "audio/wav"})
+        if request.url.path == "/sdcpp/v1/vid_gen":
+            return httpx.Response(202, json={"id": "job_done", "kind": "vid_gen", "status": "queued", "created": 1})
+        if request.url.path.endswith("/cancel"):
+            return answer({"id": "job_done", "status": "cancelled"})
         return answer({"choices": [{"message": {"content": f"from {port}"}}]})
 
     real_client = httpx.AsyncClient
@@ -1399,3 +1413,102 @@ def test_thinking_is_set_through_the_servers_environment(harness):
             "revision": "c" * 40, "served_model_name": "embed-two", "context_length": 2048, "thinking": "off",
         })
         assert embedding.status_code == 422 and "generation deployments only" in embedding.text
+
+
+def video_request(harness, **overrides):
+    request = {
+        "kind": "video", "artifact": "metal/wan-5b.gguf", "sha256": digest(harness.models / "wan-5b.gguf"),
+        "revision": "d" * 40, "served_model_name": "assistant-video",
+        "components": {
+            "t5xxl": {"artifact": "metal/umt5.gguf", "sha256": digest(harness.models / "umt5.gguf")},
+            "vae": {"artifact": "metal/wan-vae.safetensors", "sha256": digest(harness.models / "wan-vae.safetensors")},
+        },
+        "steps": 20, "cfg_scale": 5.0, "sampler": "euler", "flow_shift": 3.0, "fps": 16, "seconds": 2, "size": "640x352",
+    }
+    request.update(overrides)
+    return request
+
+
+# A video deployment is an sd-server child with its components and its
+# autoencoder on the processors; it answers the OpenAI videos API: a create
+# starts an engine job with the pinned sampling and returns the video's id,
+# which carries the served name, and the video is asked after, fetched and
+# cancelled by that id.
+def test_a_video_deployment_answers_the_videos_api(harness):
+    from lazarus.agent.videos import video_id
+
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/clips", headers=harness.headers, json=video_request(harness))
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "stable-diffusion.cpp"
+        command = harness.children[-1].command
+        assert command[0] == "sd-server" and command[command.index("--diffusion-model") + 1].endswith("wan-5b.gguf")
+        assert command[command.index("--t5xxl") + 1].endswith("umt5.gguf") and command[command.index("--vae") + 1].endswith("wan-vae.safetensors")
+        assert command[-3:] == ["--diffusion-fa", "--backend", "vae=cpu"] and "--steps" not in command
+
+        made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"model": "assistant-video", "prompt": "a kite", "seconds": "4", "size": "352x640"})
+        assert made.status_code == 200, made.text
+        video = made.json()
+        assert video["id"] == video_id("assistant-video", "job_done") and video["status"] == "queued"
+        assert video["size"] == "352x640" and video["seconds"] == "4" and video["object"] == "video"
+        job = json.loads(harness.inference[-1][3])
+        assert harness.inference[-1][1] == "/sdcpp/v1/vid_gen"
+        assert (job["width"], job["height"], job["video_frames"], job["fps"], job["output_format"]) == (352, 640, 61, 16, "webm")
+        assert job["sample_params"] == {"sample_method": "euler", "sample_steps": 20, "flow_shift": 3.0, "guidance": {"txt_cfg": 5.0}}
+
+        asked = api.get(f"/deployments/clips/v1/videos/{video['id']}", headers=harness.headers).json()
+        assert asked["status"] == "completed" and asked["progress"] == 100 and asked["completed_at"] == 9
+        content = api.get(f"/deployments/clips/v1/videos/{video['id']}/content", headers=harness.headers)
+        assert content.status_code == 200 and content.headers["content-type"] == "video/webm" and content.content.startswith(b"\x1a\x45\xdf\xa3")
+
+        pending = video_id("assistant-video", "job_pending")
+        assert api.get(f"/deployments/clips/v1/videos/{pending}", headers=harness.headers).json()["status"] == "in_progress"
+        assert api.get(f"/deployments/clips/v1/videos/{pending}/content", headers=harness.headers).status_code == 409
+        assert api.get(f"/deployments/clips/v1/videos/{video_id('assistant-video', 'job_gone')}", headers=harness.headers).status_code == 404
+        deleted = api.delete(f"/deployments/clips/v1/videos/{video['id']}", headers=harness.headers)
+        assert deleted.json() == {"id": video["id"], "object": "video.deleted", "deleted": True}
+        assert harness.inference[-1][1] == "/sdcpp/v1/jobs/job_done/cancel"
+
+
+# A request the videos API cannot take is refused before the engine sees
+# it, and a video another deployment made is not this one's to answer for.
+def test_the_videos_api_refuses_what_it_cannot_make(harness):
+    from lazarus.agent.videos import video_id
+
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=video_request(harness)).status_code == 200
+        before = len(harness.inference)
+        for body in (
+            {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": "a", "seconds": "11"}, {"prompt": "a", "seconds": "2.5"},
+            {"prompt": "a", "seconds": True}, {"prompt": "a", "size": "641x352"}, {"prompt": "a", "size": "1280x704"}, {"prompt": "a", "size": 640},
+        ):
+            assert api.post("/deployments/clips/v1/videos", headers=harness.headers, json=body).status_code == 400, body
+        assert api.post("/deployments/clips/v1/videos", headers=harness.headers, content=b"not json").status_code == 400
+        assert len(harness.inference) == before
+        other = video_id("someone-else", "job_done")
+        assert api.get(f"/deployments/clips/v1/videos/{other}", headers=harness.headers).status_code == 404
+        assert api.get("/deployments/clips/v1/videos/video_!!", headers=harness.headers).status_code == 404
+        assert api.get("/deployments/clips/v1/videos", headers=harness.headers).status_code == 405
+        assert api.delete("/deployments/clips/v1/videos", headers=harness.headers).status_code == 405
+        assert api.post("/deployments/clips/v1/images/generations", headers=harness.headers, json={}).status_code == 404
+
+
+# Video options and components belong to a video model; an image model's
+# components are not a video model's, nor the reverse.
+def test_video_options_belong_to_video_deployments(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        wrong = [
+            second_request(harness, fps=16),
+            image_request(harness, seconds=2),
+            video_request(harness, components={"clip_l": {"artifact": "metal/clip_l-Q8_0.gguf", "sha256": digest(harness.models / "clip_l-Q8_0.gguf")}}),
+            video_request(harness, size="640x"),
+            video_request(harness, fps=0),
+        ]
+        for request in wrong:
+            assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=request).status_code == 422, request
+        defaults = video_request(harness)
+        for key in ("steps", "cfg_scale", "sampler", "flow_shift", "fps", "seconds", "size"):
+            defaults.pop(key)
+        assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=defaults).status_code == 200
+    saved = load_agent_config(harness.config_path).deployments["clips"]
+    assert (saved.steps, saved.cfg_scale, saved.fps, saved.seconds, saved.size, saved.flow_shift) == (20, 5.0, 16, 2, "640x352", None)

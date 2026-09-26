@@ -44,17 +44,30 @@ ALLOWED_PATHS = {
     "image": {"images/generations", "models"},
     "transcription": {"audio/transcriptions"},
     "speech": {"audio/speech"},
+    # A video is made as a job, asked after by its id, and fetched when done.
+    "video": {"videos"},
 }
+VIDEO_PATH = re.compile(r"^videos/(video_[A-Za-z0-9_-]{1,256})(/content)?$")
 KINDS = tuple(ALLOWED_PATHS)
 # The kinds served without a context window: a diffusion, transcription or
 # speech model has no prompt to size.
-NO_CONTEXT = ("image", "transcription", "speech")
+NO_CONTEXT = ("image", "transcription", "speech", "video")
 
 # The files an image model is served with beside its diffusion weights, by
 # the flag stable-diffusion.cpp takes them under. A model that needs none of
 # them (a single-file checkpoint) names none.
 IMAGE_COMPONENTS = {"clip_l": "--clip_l", "t5xxl": "--t5xxl", "vae": "--vae"}
 IMAGE_SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpm++2m", "lcm")
+# The files a video model is served with beside its diffusion weights: an
+# autoencoder, a text encoder (a T5 for Wan, a language model for LTX-2 and
+# MiniMax-H3), and for models that make sound an audio autoencoder, and for
+# LTX-2 the connectors between its text encoder and its transformer.
+VIDEO_COMPONENTS = {
+    "vae": "--vae", "t5xxl": "--t5xxl", "llm": "--llm", "audio_vae": "--audio-vae",
+    "embeddings_connectors": "--embeddings-connectors",
+}
+DIFFUSION = ("image", "video")
+VIDEO_SIZE = r"^[1-9][0-9]{2,3}x[1-9][0-9]{2,3}$"
 # A weight file the agent loads: GGUF for llama.cpp, GGUF or safetensors for
 # stable-diffusion.cpp, whose text encoders and autoencoder ship as either.
 WEIGHT_SUFFIXES = (".gguf", ".safetensors")
@@ -73,18 +86,18 @@ LANGUAGE = r"^(auto|[a-z]{2,3})$"
 # it loads; piper's server listens only once its voice is loaded.
 HEALTH_PATHS = {
     "generation": "/health", "embedding": "/health", "image": "/v1/models",
-    "transcription": "/health", "speech": "/voices",
+    "transcription": "/health", "speech": "/voices", "video": "/sdcpp/v1/capabilities",
 }
 ENGINES = {
     "generation": "llama.cpp", "embedding": "llama.cpp", "image": "stable-diffusion.cpp",
-    "transcription": "whisper.cpp", "speech": "piper",
+    "transcription": "whisper.cpp", "speech": "piper", "video": "stable-diffusion.cpp",
 }
 
 
 # What each kind's loader accepts: GGUF for llama-server, GGUF or safetensors
 # for stable-diffusion.cpp, ggml for whisper-server, ONNX for piper.
 def weight_suffixes(kind: str) -> tuple[str, ...]:
-    return {"image": WEIGHT_SUFFIXES, "transcription": (".bin",), "speech": (".onnx",)}.get(kind, (".gguf",))
+    return {"image": WEIGHT_SUFFIXES, "video": WEIGHT_SUFFIXES, "transcription": (".bin",), "speech": (".onnx",)}.get(kind, (".gguf",))
 
 
 def component_suffixes(kind: str) -> tuple[str, ...]:
@@ -138,6 +151,12 @@ class AgentDeployment(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=150)
     cfg_scale: float | None = Field(default=None, ge=0, le=30)
     sampler: Literal[IMAGE_SAMPLERS] | None = None
+    # A video deployment's pinned sampling beyond an image's, and the clip a
+    # request gets unless it asks for another: its length and size.
+    flow_shift: float | None = Field(default=None, ge=0, le=20)
+    fps: int | None = Field(default=None, ge=1, le=60)
+    seconds: int | None = Field(default=None, ge=1, le=10)
+    size: str | None = Field(default=None, pattern=VIDEO_SIZE)
     # A transcription deployment's spoken language.
     language: str | None = Field(default=None, pattern=LANGUAGE)
 
@@ -163,20 +182,21 @@ class AgentDeployment(BaseModel):
         if self.kind != "generation" and self.mmproj_path is not None:
             raise ValueError(f"a {self.kind} deployment has no projector")
         thinking_options(self.kind, self.thinking, self.thinking_budget)
-        if self.kind == "image":
-            unknown = set(self.components) - set(IMAGE_COMPONENTS)
-            if unknown:
-                raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
+        video_options(self.kind, self.flow_shift, self.fps, self.seconds, self.size)
+        if self.kind in DIFFUSION:
+            diffusion_components(self.kind, self.components)
             self.steps = self.steps or 20
-            self.cfg_scale = 7.0 if self.cfg_scale is None else self.cfg_scale
+            self.cfg_scale = (7.0 if self.kind == "image" else 5.0) if self.cfg_scale is None else self.cfg_scale
             self.sampler = self.sampler or "euler"
+            if self.kind == "video":
+                self.fps, self.seconds, self.size = self.fps or 16, self.seconds or 2, self.size or "640x352"
         else:
             if self.steps is not None or self.cfg_scale is not None or self.sampler is not None:
-                raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
+                raise ValueError("steps, cfg_scale and sampler apply to image and video deployments only")
             if self.kind == "speech":
                 speech_components(self.components, self.model_path)
             elif self.components:
-                raise ValueError("components apply to image and speech deployments only")
+                raise ValueError("components apply to image, video and speech deployments only")
         if self.kind == "transcription":
             self.language = self.language or "auto"
         elif self.language is not None:
@@ -184,6 +204,18 @@ class AgentDeployment(BaseModel):
         if self.kind not in NO_CONTEXT and self.context_length < 128:
             raise ValueError("a language model deployment needs a context length of at least 128")
         return self
+
+
+def video_options(kind: str, flow_shift, fps, seconds, size) -> None:
+    if kind != "video" and any(value is not None for value in (flow_shift, fps, seconds, size)):
+        raise ValueError("flow_shift, fps, seconds and size apply to video deployments only")
+
+
+def diffusion_components(kind: str, components: dict) -> None:
+    known = IMAGE_COMPONENTS if kind == "image" else VIDEO_COMPONENTS
+    unknown = set(components) - set(known)
+    if unknown:
+        raise ValueError(f"unknown {kind} components: {', '.join(sorted(unknown))}")
 
 
 def thinking_options(kind: str, thinking: str | None, budget: int | None) -> None:
@@ -230,24 +262,27 @@ class DeploymentRequest(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=150)
     cfg_scale: float | None = Field(default=None, ge=0, le=30)
     sampler: Literal[IMAGE_SAMPLERS] | None = None
+    flow_shift: float | None = Field(default=None, ge=0, le=20)
+    fps: int | None = Field(default=None, ge=1, le=60)
+    seconds: int | None = Field(default=None, ge=1, le=10)
+    size: str | None = Field(default=None, pattern=VIDEO_SIZE)
     language: str | None = Field(default=None, pattern=LANGUAGE)
 
     @model_validator(mode="after")
     def projector_checksum(self):
         if (self.mmproj is None) != (self.mmproj_sha256 is None):
             raise ValueError("a projector is named together with its sha256")
-        if self.kind != "image" and (self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
-            raise ValueError("steps, cfg_scale and sampler apply to image deployments only")
+        if self.kind not in DIFFUSION and (self.steps is not None or self.cfg_scale is not None or self.sampler is not None):
+            raise ValueError("steps, cfg_scale and sampler apply to image and video deployments only")
         thinking_options(self.kind, self.thinking, self.thinking_budget)
-        if self.kind == "image":
-            unknown = set(self.components) - set(IMAGE_COMPONENTS)
-            if unknown:
-                raise ValueError(f"unknown image components: {', '.join(sorted(unknown))}")
+        video_options(self.kind, self.flow_shift, self.fps, self.seconds, self.size)
+        if self.kind in DIFFUSION:
+            diffusion_components(self.kind, self.components)
         elif self.kind == "speech":
             if set(self.components) != SPEECH_COMPONENTS:
                 raise ValueError("a speech deployment names its voice configuration as its one component, config")
         elif self.components:
-            raise ValueError("components apply to image and speech deployments only")
+            raise ValueError("components apply to image, video and speech deployments only")
         if self.kind != "transcription" and self.language is not None:
             raise ValueError("language applies to transcription deployments only")
         return self
@@ -277,6 +312,8 @@ class Admission:
 def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     if deployment.kind == "image":
         return image_command(agent, deployment)
+    if deployment.kind == "video":
+        return video_command(agent, deployment)
     if deployment.kind == "transcription":
         return transcription_command(agent, deployment)
     if deployment.kind == "speech":
@@ -338,6 +375,25 @@ def image_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--sampling-method", deployment.sampler,
     ]
     return command
+
+
+# A video model loads its diffusion weights with every component beside them,
+# its transformer with flash attention. Its autoencoder runs on the
+# processors: on Apple Silicon the video autoencoders decode three times as
+# fast there as on the GPU (Wan2.2's, measured on an M3 Max). Sampling is
+# per request, from the pinned values the videos API sends.
+def video_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    command = [
+        agent.config.sd_server,
+        "--listen-ip", "127.0.0.1",
+        "--listen-port", str(deployment.port),
+        "--diffusion-model", deployment.model_path,
+    ]
+    for name, flag in VIDEO_COMPONENTS.items():
+        component = deployment.components.get(name)
+        if component is not None:
+            command += [flag, component.path]
+    return command + ["--diffusion-fa", "--backend", "vae=cpu"]
 
 
 # whisper-server answers its inference route under the OpenAI transcription
@@ -637,6 +693,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         pooling=request.pooling, normalization=request.normalization,
         thinking=request.thinking, thinking_budget=request.thinking_budget,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
+        flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
         language=request.language,
     )
     if previous is not None:
@@ -848,6 +905,55 @@ async def synthesize(process: "ServerProcess", admission: Admission, body: bytes
     return Response(content=answer.content, media_type="audio/wav")
 
 
+# The videos API: a create starts an engine job and answers with the video
+# at once; the video is asked after, fetched when done, or cancelled by its
+# id. See lazarus.agent.videos.
+async def video_request(process: "ServerProcess", admission: Admission, deployment: AgentDeployment, path: str, method: str, body: bytes):
+    from lazarus.agent import videos
+
+    engine = f"http://127.0.0.1:{process.port}/sdcpp/v1"
+    admission.enter()
+    try:
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            if path == "videos":
+                if method != "POST":
+                    return JSONResponse(status_code=405, content={"error": "method not allowed"})
+                job, video = videos.job_request(body, deployment)
+                answer = await client.post(f"{engine}/vid_gen", json=job)
+                if answer.status_code != 202:
+                    return JSONResponse(status_code=502 if answer.status_code >= 500 else answer.status_code, content={"error": engine_error(answer)})
+                return JSONResponse(content={"id": videos.video_id(deployment.served_model_name, answer.json()["id"]), **video})
+            match = VIDEO_PATH.match(path)
+            if method == "POST":
+                return JSONResponse(status_code=405, content={"error": "method not allowed"})
+            job_id = videos.job_of(deployment.served_model_name, match.group(1))
+            if method == "DELETE":
+                await client.post(f"{engine}/jobs/{job_id}/cancel")
+                return JSONResponse(content={"id": match.group(1), "object": "video.deleted", "deleted": True})
+            answer = await client.get(f"{engine}/jobs/{job_id}")
+            if answer.status_code in (404, 410):
+                return JSONResponse(status_code=404, content={"error": "no such video"})
+            if answer.status_code != 200:
+                return JSONResponse(status_code=502, content={"error": engine_error(answer)})
+            if match.group(2):
+                data, media_type = videos.content_of(answer.json())
+                return Response(content=data, media_type=media_type)
+            return JSONResponse(content=videos.video_of(deployment.served_model_name, answer.json()))
+    except videos.VideoError as exc:
+        return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+    except (httpx.HTTPError, ValueError, KeyError):
+        return JSONResponse(status_code=503, content={"error": "deployment engine unavailable"})
+    finally:
+        admission.leave()
+
+
+def engine_error(answer) -> str:
+    try:
+        return answer.json()["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return f"the engine answered {answer.status_code}"
+
+
 def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
     @app.get("/agent/deployments")
     async def list_deployments():
@@ -874,13 +980,17 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             # stops it again.
             return JSONResponse(status_code=500, content={"error": str(exc), "id": deployment_id})
 
-    @app.api_route("/deployments/{deployment_id}/v1/{path:path}", methods=["GET", "POST"])
+    @app.api_route("/deployments/{deployment_id}/v1/{path:path}", methods=["GET", "POST", "DELETE"])
     async def proxy_deployment(deployment_id: str, path: str, request: Request):
         deployment = agent.config.deployments.get(deployment_id)
         if deployment is None:
             return JSONResponse(status_code=404, content={"error": f"unknown deployment {deployment_id!r}"})
-        if path not in ALLOWED_PATHS[deployment.kind]:
+        video = deployment.kind == "video" and VIDEO_PATH.match(path)
+        if path not in ALLOWED_PATHS[deployment.kind] and not video:
             return JSONResponse(status_code=404, content={"error": "unsupported deployment endpoint"})
+        # Only a video, not its file or anything else, is deleted.
+        if request.method == "DELETE" and not (video and not video.group(2)):
+            return JSONResponse(status_code=405, content={"error": "method not allowed"})
         admission = agent.deployment_admission.setdefault(deployment_id, Admission())
         process = agent.deployments.get(deployment_id)
         # A configured deployment with no process is one being replaced or
@@ -896,6 +1006,8 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
             return JSONResponse(status_code=503, content={"error": "deployment process is not running"})
         if deployment.kind == "speech":
             return await synthesize(process, admission, body)
+        if deployment.kind == "video":
+            return await video_request(process, admission, deployment, path, request.method, body)
         if deployment.kind == "transcription" and (container := unsupported_container(body)):
             return JSONResponse(status_code=415, content={"error": f"{container} audio is not decoded here; send WAV, MP3, FLAC or Ogg Vorbis"})
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)

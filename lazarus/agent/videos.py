@@ -1,0 +1,166 @@
+"""The OpenAI videos API over stable-diffusion.cpp's video jobs.
+
+A video takes minutes to make, so it is a job: a request starts it and
+answers at once with the video's id, the caller asks after it by that id,
+and fetches the finished file. sd-server runs such jobs itself
+(`/sdcpp/v1/vid_gen`, `/sdcpp/v1/jobs/{id}`); this module translates the
+OpenAI shape onto them, with the deployment's pinned sampling.
+
+A video's id carries the served model name beside the engine's job id, so a
+gateway can route a later request about the video to the deployment that
+made it without keeping any state of its own.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import re
+import time
+
+MAX_PROMPT = 4000
+MAX_SECONDS = 10
+# Every side a whole number of 32 pixels, which every video model the
+# engine serves accepts.
+SIZE = re.compile(r"^([1-9][0-9]{2,3})x([1-9][0-9]{2,3})$")
+JOB = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+STATUSES = {"queued": "queued", "generating": "in_progress", "completed": "completed"}
+
+
+class VideoError(ValueError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def video_id(served_model_name: str, job: str) -> str:
+    raw = f"{served_model_name}/{job}".encode()
+    return "video_" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def job_of(served_model_name: str, identifier: str) -> str:
+    """The engine's job id inside a video id this deployment made."""
+    encoded = identifier.removeprefix("video_")
+    if encoded == identifier:
+        raise VideoError(404, "no such video")
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        raise VideoError(404, "no such video")
+    name, _, job = raw.partition("/")
+    if name != served_model_name or not JOB.match(job):
+        raise VideoError(404, "no such video")
+    return job
+
+
+def seconds_of(value, default: int) -> int:
+    """OpenAI sends the length as a string of seconds; a number is taken too."""
+    if value is None:
+        return default
+    whole = isinstance(value, int) and not isinstance(value, bool)
+    if not whole and not (isinstance(value, str) and value.strip().isdigit()):
+        raise VideoError(400, "seconds is a whole number from 1 to 10")
+    seconds = int(value)
+    if not 1 <= seconds <= MAX_SECONDS:
+        raise VideoError(400, "seconds is a whole number from 1 to 10")
+    return seconds
+
+
+def size_of(value, default: str) -> tuple[int, int]:
+    """A size no larger in area than the one the model was reviewed at, each
+    side a multiple of 32."""
+    text = default if value is None else value
+    match = SIZE.match(text) if isinstance(text, str) else None
+    if match is None:
+        raise VideoError(400, "size is WIDTHxHEIGHT")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width % 32 or height % 32:
+        raise VideoError(400, "each side of size is a multiple of 32")
+    reviewed = SIZE.match(default)
+    if width * height > int(reviewed.group(1)) * int(reviewed.group(2)):
+        raise VideoError(400, f"size is at most {default} in area")
+    return width, height
+
+
+def frames_of(seconds: int, fps: int) -> int:
+    """The engine makes 4n + 1 frames; the nearest count not over the length."""
+    frames = seconds * fps
+    return max(frames - (frames - 1) % 4, 5)
+
+
+def job_request(body: bytes, deployment) -> tuple[dict, dict]:
+    """The engine's job for an OpenAI create request, and the video as the
+    caller will see it."""
+    try:
+        request = json.loads(body or b"{}")
+    except ValueError:
+        raise VideoError(400, "the request is not JSON")
+    if not isinstance(request, dict):
+        raise VideoError(400, "the request is a JSON object")
+    prompt = request.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise VideoError(400, "prompt is required")
+    if len(prompt) > MAX_PROMPT:
+        raise VideoError(400, f"prompt is at most {MAX_PROMPT} characters")
+    seconds = seconds_of(request.get("seconds"), deployment.seconds)
+    width, height = size_of(request.get("size"), deployment.size)
+    job = {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "video_frames": frames_of(seconds, deployment.fps),
+        "fps": deployment.fps,
+        "seed": -1,
+        "sample_params": {
+            "sample_method": deployment.sampler,
+            "sample_steps": deployment.steps,
+            "guidance": {"txt_cfg": deployment.cfg_scale},
+        },
+        "output_format": "webm",
+    }
+    if deployment.flow_shift is not None:
+        job["sample_params"]["flow_shift"] = deployment.flow_shift
+    video = {
+        "object": "video",
+        "model": deployment.served_model_name,
+        "status": "queued",
+        "progress": 0,
+        "created_at": int(time.time()),
+        "size": f"{width}x{height}",
+        "seconds": str(seconds),
+    }
+    return job, video
+
+
+def video_of(served_model_name: str, job: dict) -> dict:
+    """The OpenAI video for an engine job; a cancelled job is a failed one."""
+    status = STATUSES.get(job.get("status"), "failed")
+    video = {
+        "id": video_id(served_model_name, job.get("id", "")),
+        "object": "video",
+        "model": served_model_name,
+        "status": status,
+        "progress": 100 if status == "completed" else 0,
+        "created_at": job.get("created"),
+    }
+    if job.get("completed") and status == "completed":
+        video["completed_at"] = job["completed"]
+    if status == "failed":
+        error = job.get("error") or {}
+        video["error"] = {"code": error.get("code", "generation_failed"), "message": error.get("message", "the video was not made")}
+    return video
+
+
+def content_of(job: dict) -> tuple[bytes, str]:
+    """The finished file and its media type."""
+    if job.get("status") != "completed":
+        raise VideoError(409, "the video is not ready")
+    result = job.get("result") or {}
+    try:
+        data = base64.b64decode(result.get("b64_json") or "", validate=True)
+    except (binascii.Error, ValueError):
+        raise VideoError(502, "the engine returned an unreadable video")
+    if not data:
+        raise VideoError(502, "the engine returned no video")
+    return data, result.get("mime_type") or "video/webm"
