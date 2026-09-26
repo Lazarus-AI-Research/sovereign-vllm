@@ -8,13 +8,17 @@ OpenAI shape onto them, with the deployment's pinned sampling.
 
 A video's id carries the served model name beside the engine's job id, so a
 gateway can route a later request about the video to the deployment that
-made it without keeping any state of its own.
+made it without keeping any state of its own. The engine numbers its jobs in
+order, so the id is also signed with the deployment's secret: only whoever
+was given the id can ask after the video, fetch it or cancel it.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -34,36 +38,49 @@ class VideoError(ValueError):
         self.status = status
 
 
-def video_id(served_model_name: str, job: str) -> str:
-    raw = f"{served_model_name}/{job}".encode()
+def signature(secret: str, served_model_name: str, job: str) -> str:
+    return hmac.new(secret.encode(), f"{served_model_name}/{job}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def video_id(secret: str, served_model_name: str, job: str) -> str:
+    raw = f"{served_model_name}/{job}/{signature(secret, served_model_name, job)}".encode()
     return "video_" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def job_of(served_model_name: str, identifier: str) -> str:
-    """The engine's job id inside a video id this deployment made."""
+def job_of(secret: str, served_model_name: str, identifier: str) -> str:
+    """The engine's job id inside a video id this deployment made and
+    signed; the served name may itself hold a slash, the job and the
+    signature never do."""
     encoded = identifier.removeprefix("video_")
     if encoded == identifier:
         raise VideoError(404, "no such video")
     try:
         raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
-    except (binascii.Error, UnicodeDecodeError):
+    except (binascii.Error, UnicodeDecodeError, ValueError):
         raise VideoError(404, "no such video")
-    name, _, job = raw.partition("/")
-    if name != served_model_name or not JOB.match(job):
+    parts = raw.rsplit("/", 2)
+    if len(parts) != 3:
+        raise VideoError(404, "no such video")
+    name, job, signed = parts
+    if name != served_model_name or not JOB.match(job) or not hmac.compare_digest(signed, signature(secret, name, job)):
         raise VideoError(404, "no such video")
     return job
 
 
-def seconds_of(value, default: int) -> int:
-    """OpenAI sends the length as a string of seconds; a number is taken too."""
+def seconds_of(value, reviewed: int) -> int:
+    """OpenAI sends the length as a string of seconds; a number is taken too.
+    A clip is no longer than the model was reviewed making, as it is no
+    larger."""
     if value is None:
-        return default
+        return reviewed
+    refused = VideoError(400, f"seconds is a whole number from 1 to {reviewed}")
     whole = isinstance(value, int) and not isinstance(value, bool)
-    if not whole and not (isinstance(value, str) and value.strip().isdigit()):
-        raise VideoError(400, "seconds is a whole number from 1 to 10")
+    text = value.strip() if isinstance(value, str) else ""
+    if not whole and not (text.isascii() and text.isdigit() and len(text) <= 3):
+        raise refused
     seconds = int(value)
-    if not 1 <= seconds <= MAX_SECONDS:
-        raise VideoError(400, "seconds is a whole number from 1 to 10")
+    if not 1 <= seconds <= min(reviewed, MAX_SECONDS):
+        raise refused
     return seconds
 
 
@@ -126,6 +143,7 @@ def job_request(body: bytes, deployment) -> tuple[dict, dict]:
         "model": deployment.served_model_name,
         "status": "queued",
         "progress": 0,
+        # The engine's own time replaces this once it has taken the job.
         "created_at": int(time.time()),
         "size": f"{width}x{height}",
         "seconds": str(seconds),
@@ -133,11 +151,11 @@ def job_request(body: bytes, deployment) -> tuple[dict, dict]:
     return job, video
 
 
-def video_of(served_model_name: str, job: dict) -> dict:
+def video_of(secret: str, served_model_name: str, job: dict) -> dict:
     """The OpenAI video for an engine job; a cancelled job is a failed one."""
     status = STATUSES.get(job.get("status"), "failed")
     video = {
-        "id": video_id(served_model_name, job.get("id", "")),
+        "id": video_id(secret, served_model_name, job.get("id", "")),
         "object": "video",
         "model": served_model_name,
         "status": status,

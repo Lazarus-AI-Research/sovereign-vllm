@@ -120,7 +120,12 @@ def harness(tmp_path, monkeypatch):
         if request.url.path == "/sdcpp/v1/vid_gen":
             return httpx.Response(202, json={"id": "job_done", "kind": "vid_gen", "status": "queued", "created": 1})
         if request.url.path.endswith("/cancel"):
-            return answer({"id": "job_done", "status": "cancelled"})
+            job = request.url.path.split("/")[-2]
+            if job == "job_pending":
+                return httpx.Response(409, json={"error": "job is currently generating and cannot be interrupted yet"})
+            if job == "job_gone":
+                return httpx.Response(404, json={"error": "job not found"})
+            return answer({"id": job, "status": "cancelled"})
         return answer({"choices": [{"message": {"content": f"from {port}"}}]})
 
     real_client = httpx.AsyncClient
@@ -1446,14 +1451,14 @@ def test_a_video_deployment_answers_the_videos_api(harness):
         assert command[-3:] == ["--diffusion-fa", "--backend", "vae=cpu"] and "--steps" not in command
         assert command[command.index("--lora-model-dir") + 1] == "/var/empty"
 
-        made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"model": "assistant-video", "prompt": "a kite", "seconds": "4", "size": "352x640"})
+        made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"model": "assistant-video", "prompt": "a kite", "seconds": "2", "size": "352x640"})
         assert made.status_code == 200, made.text
         video = made.json()
-        assert video["id"] == video_id("assistant-video", "job_done") and video["status"] == "queued"
-        assert video["size"] == "352x640" and video["seconds"] == "4" and video["object"] == "video"
+        assert video["id"] == video_id("agent-secret", "assistant-video", "job_done") and video["status"] == "queued"
+        assert video["size"] == "352x640" and video["seconds"] == "2" and video["object"] == "video" and video["created_at"] == 1
         job = json.loads(harness.inference[-1][3])
         assert harness.inference[-1][1] == "/sdcpp/v1/vid_gen"
-        assert (job["width"], job["height"], job["video_frames"], job["fps"], job["output_format"]) == (352, 640, 61, 16, "webm")
+        assert (job["width"], job["height"], job["video_frames"], job["fps"], job["output_format"]) == (352, 640, 29, 16, "webm")
         assert job["sample_params"] == {"sample_method": "euler", "sample_steps": 20, "flow_shift": 3.0, "guidance": {"txt_cfg": 5.0}}
 
         asked = api.get(f"/deployments/clips/v1/videos/{video['id']}", headers=harness.headers).json()
@@ -1461,13 +1466,21 @@ def test_a_video_deployment_answers_the_videos_api(harness):
         content = api.get(f"/deployments/clips/v1/videos/{video['id']}/content", headers=harness.headers)
         assert content.status_code == 200 and content.headers["content-type"] == "video/webm" and content.content.startswith(b"\x1a\x45\xdf\xa3")
 
-        pending = video_id("assistant-video", "job_pending")
+        pending = video_id("agent-secret", "assistant-video", "job_pending")
         assert api.get(f"/deployments/clips/v1/videos/{pending}", headers=harness.headers).json()["status"] == "in_progress"
         assert api.get(f"/deployments/clips/v1/videos/{pending}/content", headers=harness.headers).status_code == 409
-        assert api.get(f"/deployments/clips/v1/videos/{video_id('assistant-video', 'job_gone')}", headers=harness.headers).status_code == 404
+        assert api.get(f"/deployments/clips/v1/videos/{video_id('agent-secret', 'assistant-video', 'job_gone')}", headers=harness.headers).status_code == 404
         deleted = api.delete(f"/deployments/clips/v1/videos/{video['id']}", headers=harness.headers)
         assert deleted.json() == {"id": video["id"], "object": "video.deleted", "deleted": True}
         assert harness.inference[-1][1] == "/sdcpp/v1/jobs/job_done/cancel"
+        # A video being made runs to its end, and one gone is no video.
+        assert api.delete(f"/deployments/clips/v1/videos/{pending}", headers=harness.headers).status_code == 409
+        gone = video_id("agent-secret", "assistant-video", "job_gone")
+        assert api.delete(f"/deployments/clips/v1/videos/{gone}", headers=harness.headers).status_code == 404
+        # An id signed with another secret names no video here, though its
+        # job is one this engine made.
+        forged = video_id("another-secret", "assistant-video", "job_done")
+        assert api.get(f"/deployments/clips/v1/videos/{forged}", headers=harness.headers).status_code == 404
 
 
 # A request the videos API cannot take is refused before the engine sees
@@ -1479,13 +1492,13 @@ def test_the_videos_api_refuses_what_it_cannot_make(harness):
         assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=video_request(harness)).status_code == 200
         before = len(harness.inference)
         for body in (
-            {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": "a", "seconds": "11"}, {"prompt": "a", "seconds": "2.5"},
+            {"prompt": ""}, {"prompt": "x" * 4001}, {"prompt": "a", "seconds": "3"}, {"prompt": "a", "seconds": "2.5"}, {"prompt": "a", "seconds": "²"},
             {"prompt": "a", "seconds": True}, {"prompt": "a", "size": "641x352"}, {"prompt": "a", "size": "1280x704"}, {"prompt": "a", "size": 640},
         ):
             assert api.post("/deployments/clips/v1/videos", headers=harness.headers, json=body).status_code == 400, body
         assert api.post("/deployments/clips/v1/videos", headers=harness.headers, content=b"not json").status_code == 400
         assert len(harness.inference) == before
-        other = video_id("someone-else", "job_done")
+        other = video_id("agent-secret", "someone-else", "job_done")
         assert api.get(f"/deployments/clips/v1/videos/{other}", headers=harness.headers).status_code == 404
         assert api.get("/deployments/clips/v1/videos/video_!!", headers=harness.headers).status_code == 404
         assert api.get("/deployments/clips/v1/videos", headers=harness.headers).status_code == 405
@@ -1502,7 +1515,9 @@ def test_video_options_belong_to_video_deployments(harness):
             image_request(harness, seconds=2),
             video_request(harness, components={"clip_l": {"artifact": "metal/clip_l-Q8_0.gguf", "sha256": digest(harness.models / "clip_l-Q8_0.gguf")}}),
             video_request(harness, size="640x"),
+            video_request(harness, size="1280x720"),
             video_request(harness, fps=0),
+            video_request(harness, components={}),
         ]
         for request in wrong:
             assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=request).status_code == 422, request

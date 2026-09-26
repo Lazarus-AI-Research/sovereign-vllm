@@ -215,6 +215,10 @@ class AgentDeployment(BaseModel):
 def video_options(kind: str, flow_shift, fps, seconds, size) -> None:
     if kind != "video" and any(value is not None for value in (flow_shift, fps, seconds, size)):
         raise ValueError("flow_shift, fps, seconds and size apply to video deployments only")
+    # Every video model the engine serves takes sides a multiple of 32; a
+    # size it could not make would refuse every request that asks for none.
+    if size is not None and any(int(side) % 32 for side in size.split("x")):
+        raise ValueError("each side of a video's size is a multiple of 32")
 
 
 def diffusion_components(kind: str, components: dict) -> None:
@@ -222,6 +226,10 @@ def diffusion_components(kind: str, components: dict) -> None:
     unknown = set(components) - set(known)
     if unknown:
         raise ValueError(f"unknown {kind} components: {', '.join(sorted(unknown))}")
+    # Every video model reads its prompt through a text encoder and decodes
+    # through an autoencoder published beside it.
+    if kind == "video" and ("vae" not in components or not {"t5xxl", "llm"} & set(components)):
+        raise ValueError("a video model names its autoencoder, vae, and its text encoder, t5xxl or llm")
 
 
 def thinking_options(kind: str, thinking: str | None, budget: int | None) -> None:
@@ -916,7 +924,7 @@ async def synthesize(process: "ServerProcess", admission: Admission, body: bytes
 # The videos API: a create starts an engine job and answers with the video
 # at once; the video is asked after, fetched when done, or cancelled by its
 # id. See lazarus.agent.videos.
-async def video_request(process: "ServerProcess", admission: Admission, deployment: AgentDeployment, path: str, method: str, body: bytes):
+async def video_request(secret: str, process: "ServerProcess", admission: Admission, deployment: AgentDeployment, path: str, method: str, body: bytes):
     from lazarus.agent import videos
 
     engine = f"http://127.0.0.1:{process.port}/sdcpp/v1"
@@ -930,14 +938,15 @@ async def video_request(process: "ServerProcess", admission: Admission, deployme
                 answer = await client.post(f"{engine}/vid_gen", json=job)
                 if answer.status_code != 202:
                     return JSONResponse(status_code=502 if answer.status_code >= 500 else answer.status_code, content={"error": engine_error(answer)})
-                return JSONResponse(content={"id": videos.video_id(deployment.served_model_name, answer.json()["id"]), **video})
+                started = answer.json()
+                video["created_at"] = started.get("created", video["created_at"])
+                return JSONResponse(content={"id": videos.video_id(secret, deployment.served_model_name, started["id"]), **video})
             match = VIDEO_PATH.match(path)
             if method == "POST":
                 return JSONResponse(status_code=405, content={"error": "method not allowed"})
-            job_id = videos.job_of(deployment.served_model_name, match.group(1))
+            job_id = videos.job_of(secret, deployment.served_model_name, match.group(1))
             if method == "DELETE":
-                await client.post(f"{engine}/jobs/{job_id}/cancel")
-                return JSONResponse(content={"id": match.group(1), "object": "video.deleted", "deleted": True})
+                return cancelled(match.group(1), await client.post(f"{engine}/jobs/{job_id}/cancel"))
             answer = await client.get(f"{engine}/jobs/{job_id}")
             if answer.status_code in (404, 410):
                 return JSONResponse(status_code=404, content={"error": "no such video"})
@@ -946,7 +955,7 @@ async def video_request(process: "ServerProcess", admission: Admission, deployme
             if match.group(2):
                 data, media_type = videos.content_of(answer.json())
                 return Response(content=data, media_type=media_type)
-            return JSONResponse(content=videos.video_of(deployment.served_model_name, answer.json()))
+            return JSONResponse(content=videos.video_of(secret, deployment.served_model_name, answer.json()))
     except videos.VideoError as exc:
         return JSONResponse(status_code=exc.status, content={"error": str(exc)})
     except (httpx.HTTPError, ValueError, KeyError):
@@ -955,11 +964,27 @@ async def video_request(process: "ServerProcess", admission: Admission, deployme
         admission.leave()
 
 
+# The engine cancels a job only before it starts: one being made runs to the
+# end, and one made already is kept until it expires.
+def cancelled(identifier: str, answer) -> JSONResponse:
+    if answer.status_code == 200:
+        return JSONResponse(content={"id": identifier, "object": "video.deleted", "deleted": True})
+    if answer.status_code in (404, 410):
+        return JSONResponse(status_code=404, content={"error": "no such video"})
+    if answer.status_code == 409:
+        return JSONResponse(status_code=409, content={"error": "the video is being made and cannot be cancelled"})
+    return JSONResponse(status_code=502, content={"error": engine_error(answer)})
+
+
+# sd-server says why it refused as a string, or as an object with a message.
 def engine_error(answer) -> str:
     try:
-        return answer.json()["error"]["message"]
+        error = answer.json()["error"]
     except (ValueError, KeyError, TypeError):
         return f"the engine answered {answer.status_code}"
+    if isinstance(error, dict):
+        error = error.get("message")
+    return error if isinstance(error, str) and error else f"the engine answered {answer.status_code}"
 
 
 def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
@@ -1015,7 +1040,7 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         if deployment.kind == "speech":
             return await synthesize(process, admission, body)
         if deployment.kind == "video":
-            return await video_request(process, admission, deployment, path, request.method, body)
+            return await video_request(agent.token, process, admission, deployment, path, request.method, body)
         if deployment.kind == "transcription" and (container := unsupported_container(body)):
             return JSONResponse(status_code=415, content={"error": f"{container} audio is not decoded here; send WAV, MP3, FLAC or Ogg Vorbis"})
         client = httpx.AsyncClient(timeout=600.0, trust_env=False)
