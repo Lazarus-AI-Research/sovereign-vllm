@@ -327,6 +327,9 @@ def build_app(agent: Agent) -> FastAPI:
     async def lifespan(app: FastAPI):
         task = None
         lifespan_error = None
+        # The web server set its own loggers' levels as it started; the
+        # level last kept is put back over them.
+        log_level.restore(agent.config_path)
         try:
             agent.start_deployments()
             await agent.discover_engines()
@@ -370,7 +373,10 @@ def build_app(agent: Agent) -> FastAPI:
 
     @app.put("/agent/log-level")
     async def set_log_level(request: Request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
         name = body.get("level") if isinstance(body, dict) else None
         if not isinstance(name, str) or not log_level.apply(name):
             return JSONResponse(status_code=400, content={"error": 'the body is {"level": "error" | "warn" | "info" | "debug"}'})

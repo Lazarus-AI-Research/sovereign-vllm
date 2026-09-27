@@ -262,7 +262,7 @@ def test_log_level_is_set_and_kept(monkeypatch, tmp_path):
     config_path.write_text("{}\n", encoding="utf-8")
     client = TestClient(build_app(Agent(AgentConfig(), config_path)))
     root = logging.getLogger()
-    before = root.level
+    before = {name: logging.getLogger(name).level for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access")}
     try:
         response = client.put("/agent/log-level", headers=HEADERS, json={"level": "warn"})
         assert response.status_code == 200 and response.json() == {"level": "warn"}
@@ -272,6 +272,11 @@ def test_log_level_is_set_and_kept(monkeypatch, tmp_path):
         log_level.restore(config_path)
         assert root.level == logging.WARNING
         assert client.put("/agent/log-level", headers=HEADERS, json={"level": "loud"}).status_code == 400
+        assert client.put("/agent/log-level", headers={**HEADERS, "Content-Type": "application/json"}, content=b"not json").status_code == 400
+        assert logging.getLogger("uvicorn.access").level == logging.WARNING
+        assert client.put("/agent/log-level", headers=HEADERS, json={"level": "debug"}).status_code == 200
+        assert logging.getLogger("uvicorn.access").level == logging.INFO
         assert client.put("/agent/log-level", json={"level": "debug"}).status_code == 401
     finally:
-        root.setLevel(before)
+        for name, level in before.items():
+            logging.getLogger(name).setLevel(level)

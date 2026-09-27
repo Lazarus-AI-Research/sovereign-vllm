@@ -19,11 +19,16 @@ def kept_path(config_path: Path | None) -> Path | None:
 
 
 def apply(name: str) -> bool:
-    """Sets the level for every logger the agent and its libraries write to."""
+    """Sets the level for the agent and its libraries (the root logger), and
+    for the web server's own loggers, which keep levels of their own: its
+    line for every request is said only at the detailed level."""
     level = LEVELS.get(name)
     if level is None:
         return False
     logging.getLogger().setLevel(level)
+    logging.getLogger("uvicorn").setLevel(level)
+    logging.getLogger("uvicorn.error").setLevel(level)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO if level <= logging.DEBUG else logging.WARNING)
     return True
 
 
