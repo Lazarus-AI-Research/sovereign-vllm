@@ -397,6 +397,9 @@ def main() -> int:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # The web server writes its request lines to standard output, which the
+    # service manager points at a file: each line goes out as it is written.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     arguments = parser.parse_args()
