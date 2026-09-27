@@ -22,9 +22,10 @@ from pathlib import Path
 import httpx
 import yaml
 from anyio import CancelScope
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from lazarus.agent import log_level
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
 from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.agent.memory import memory_bytes
@@ -326,6 +327,9 @@ def build_app(agent: Agent) -> FastAPI:
     async def lifespan(app: FastAPI):
         task = None
         lifespan_error = None
+        # The web server set its own loggers' levels as it started; the
+        # level last kept is put back over them.
+        log_level.restore(agent.config_path)
         try:
             agent.start_deployments()
             await agent.discover_engines()
@@ -367,6 +371,24 @@ def build_app(agent: Agent) -> FastAPI:
             "deployments": await observe_deployments(agent),
         }
 
+    @app.put("/agent/log-level")
+    async def set_log_level(request: Request):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        name = body.get("level") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not log_level.apply(name):
+            return JSONResponse(status_code=400, content={"error": 'the body is {"level": "error" | "warn" | "info" | "debug"}'})
+        try:
+            log_level.keep(agent.config_path, name)
+        except OSError as error:
+            # In force now, but forgotten at the next start: said so, so
+            # Control lists the agent as not reached.
+            return JSONResponse(status_code=500, content={"error": f"the level is set but could not be kept: {error}"})
+        logger.info("log level applied: %s", name)
+        return {"level": name}
+
     register_deployment_routes(app, agent)
     return app
 
@@ -375,6 +397,9 @@ def main() -> int:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # The web server writes its request lines to standard output, which the
+    # service manager points at a file: each line goes out as it is written.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     arguments = parser.parse_args()
@@ -386,6 +411,7 @@ def main() -> int:
         return 1
 
     agent = Agent(config, arguments.config)
+    log_level.restore(agent.config_path)
     uvicorn.run(build_app(agent), host=config.listen, port=config.port, log_level="warning")
     return 0
 
