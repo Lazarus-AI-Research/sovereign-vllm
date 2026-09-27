@@ -248,3 +248,30 @@ def test_generation_argv_defaults():
     joined = " ".join(backend._role_argv("generation", role))
     assert "--enable-auto-tool-choice" not in joined
     assert "--reasoning-parser" not in joined
+
+
+# The level an administrator sets is in force at once and kept beside the
+# configuration, so a restarted agent logs at it; any other is refused.
+def test_log_level_is_set_and_kept(monkeypatch, tmp_path):
+    import logging
+
+    from lazarus.agent import log_level
+
+    monkeypatch.setenv("SOVEREIGN_AGENT_TOKEN", "agent-secret")
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    client = TestClient(build_app(Agent(AgentConfig(), config_path)))
+    root = logging.getLogger()
+    before = root.level
+    try:
+        response = client.put("/agent/log-level", headers=HEADERS, json={"level": "warn"})
+        assert response.status_code == 200 and response.json() == {"level": "warn"}
+        assert root.level == logging.WARNING
+        assert (tmp_path / "agent-log-level").read_text(encoding="utf-8").strip() == "warn"
+        root.setLevel(logging.INFO)
+        log_level.restore(config_path)
+        assert root.level == logging.WARNING
+        assert client.put("/agent/log-level", headers=HEADERS, json={"level": "loud"}).status_code == 400
+        assert client.put("/agent/log-level", json={"level": "debug"}).status_code == 401
+    finally:
+        root.setLevel(before)
