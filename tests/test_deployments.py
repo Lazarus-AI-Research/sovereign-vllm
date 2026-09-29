@@ -1538,3 +1538,36 @@ def test_video_options_belong_to_video_deployments(harness):
         assert api.put("/agent/admin/deployments/clips", headers=harness.headers, json=defaults).status_code == 200
     saved = load_agent_config(harness.config_path).deployments["clips"]
     assert (saved.steps, saved.cfg_scale, saved.fps, saved.seconds, saved.size, saved.flow_shift) == (20, 5.0, 16, 2, "640x352", None)
+
+
+# Each server the agent starts takes the appliance's level in its own terms
+# as it starts: llama.cpp its verbosity, stable-diffusion.cpp its threshold,
+# which is never lowered below its own, and whisper.cpp its progress at the
+# detailed level alone; at the normal level, or none set, each keeps its own,
+# and piper always does.
+def test_each_server_starts_at_the_log_level(harness):
+    import logging
+
+    from lazarus.agent import log_level
+    from lazarus.agent.deployments import log_level_arguments
+
+    before = logging.getLogger().level
+    try:
+        with TestClient(build_app(harness.agent)) as api:
+            assert log_level.apply("debug")
+            assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
+            assert harness.children[-1].env["LLAMA_ARG_LOG_VERBOSITY"] == "4"
+            assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=image_request(harness)).status_code == 200
+            assert "--log-level" not in harness.children[-1].command
+            assert log_level.apply("warn")
+            assert api.put("/agent/admin/deployments/pictures", headers=harness.headers, json=image_request(harness, steps=5)).status_code == 200
+            assert harness.children[-1].command[-2:] == ["--log-level", "warn"]
+            assert log_level.apply("info")
+            assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness, context_length=4096)).status_code == 200
+            assert "LLAMA_ARG_LOG_VERBOSITY" not in harness.children[-1].env
+        assert log_level_arguments("transcription", "debug") == ["--print-progress"]
+        assert log_level_arguments("transcription", "warn") == []
+        assert log_level_arguments("speech", "debug") == []
+        assert log_level_arguments("video", "error") == ["--log-level", "error"]
+    finally:
+        logging.getLogger().setLevel(before)
