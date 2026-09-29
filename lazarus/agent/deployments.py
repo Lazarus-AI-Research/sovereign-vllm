@@ -21,6 +21,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from lazarus.agent import log_level
+
 if TYPE_CHECKING:
     from lazarus.agent.server import Agent, ServerProcess
 
@@ -324,6 +326,20 @@ class Admission:
 
 
 def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    return server_command(agent, deployment) + log_level_arguments(deployment.kind, log_level.current())
+
+
+# The appliance's log level as a server takes it on its command line, at the
+# server's start; a server started before a change keeps the level it had.
+def log_level_arguments(kind: str, level: str | None) -> list[str]:
+    if kind in DIFFUSION and level in log_level.DIFFUSION_LEVELS:
+        return ["--log-level", log_level.DIFFUSION_LEVELS[level]]
+    if kind == "transcription" and level == "debug":
+        return ["--print-progress"]
+    return []
+
+
+def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     if deployment.kind == "image":
         return image_command(agent, deployment)
     if deployment.kind == "video":
@@ -357,9 +373,13 @@ def deployment_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
 
 # What a language model server takes through its environment: the server's
 # reasoning switches are read from it (LLAMA_ARG_REASONING, the budget as
-# LLAMA_ARG_THINK_BUDGET) rather than from its arguments.
+# LLAMA_ARG_THINK_BUDGET) rather than from its arguments, and its verbosity
+# at the appliance's log level as it starts.
 def deployment_environment(deployment: AgentDeployment) -> dict[str, str]:
     environment: dict[str, str] = {}
+    verbosity = log_level.LLAMA_VERBOSITY.get(log_level.current() or "")
+    if deployment.kind in ("generation", "embedding") and verbosity is not None:
+        environment["LLAMA_ARG_LOG_VERBOSITY"] = verbosity
     if deployment.thinking is not None:
         environment["LLAMA_ARG_REASONING"] = deployment.thinking
     if deployment.thinking_budget is not None:

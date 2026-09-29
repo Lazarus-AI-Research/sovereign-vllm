@@ -103,3 +103,12 @@ def managed_cuda_config_file(tmp_path: Path) -> Path:
         """)
     )
     return path
+
+
+# A level one test sets would otherwise reach the servers a later one starts.
+@pytest.fixture(autouse=True)
+def no_log_level_kept():
+    from lazarus.agent import log_level
+
+    yield
+    log_level._applied = None
