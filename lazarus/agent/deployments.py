@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shlex
 import socket
@@ -68,10 +69,11 @@ LORA_DIRECTORY = "/var/empty"
 # The files a video model is served with beside its diffusion weights: an
 # autoencoder, a text encoder (a T5 for Wan, a language model for LTX-2 and
 # MiniMax-H3), and for models that make sound an audio autoencoder, and for
-# LTX-2 the connectors between its text encoder and its transformer.
+# LTX-2 the connectors between its text encoder and its transformer. LTX's
+# spatial upscaler is found by name in the directory the server is given.
 VIDEO_COMPONENTS = {
     "vae": "--vae", "t5xxl": "--t5xxl", "llm": "--llm", "audio_vae": "--audio-vae",
-    "embeddings_connectors": "--embeddings-connectors",
+    "embeddings_connectors": "--embeddings-connectors", "spatial_upscaler": "--hires-upscalers-dir",
 }
 DIFFUSION = ("image", "video")
 VIDEO_SIZE = r"^[1-9][0-9]{2,3}x[1-9][0-9]{2,3}$"
@@ -165,6 +167,10 @@ class AgentDeployment(BaseModel):
     fps: int | None = Field(default=None, ge=1, le=60)
     seconds: int | None = Field(default=None, ge=1, le=10)
     size: str | None = Field(default=None, pattern=VIDEO_SIZE)
+    # A video model with a spatial upscaler makes each clip at half its size
+    # and doubles it, then refines it through these noise levels, or the
+    # engine's own when none are given.
+    upscale_sigmas: list[float] | None = None
     # A transcription deployment's spoken language.
     language: str | None = Field(default=None, pattern=LANGUAGE)
 
@@ -191,6 +197,7 @@ class AgentDeployment(BaseModel):
             raise ValueError(f"a {self.kind} deployment has no projector")
         thinking_options(self.kind, self.thinking, self.thinking_budget)
         video_options(self.kind, self.flow_shift, self.fps, self.seconds, self.size)
+        upscale_options(self.kind, self.components, self.size, self.upscale_sigmas)
         if self.kind in DIFFUSION:
             diffusion_components(self.kind, self.components)
             self.steps = self.steps or 20
@@ -221,6 +228,18 @@ def video_options(kind: str, flow_shift, fps, seconds, size) -> None:
     # size it could not make would refuse every request that asks for none.
     if size is not None and any(int(side) % 32 for side in size.split("x")):
         raise ValueError("each side of a video's size is a multiple of 32")
+
+
+def upscale_options(kind: str, components: dict, size: str | None, sigmas: list[float] | None) -> None:
+    upscaled = kind == "video" and "spatial_upscaler" in components
+    if sigmas is not None and not upscaled:
+        raise ValueError("only a video model with a spatial upscaler refines after it")
+    if sigmas is not None and (len(sigmas) < 2 or any(not 0 <= sigma <= 1 for sigma in sigmas) or sigmas[-1] != 0):
+        raise ValueError("a refine pass's noise levels are 0 to 1 and fall to 0")
+    # The clip is made at half its size, which the engine takes in
+    # multiples of 32.
+    if upscaled and size is not None and any(int(side) % 64 for side in size.split("x")):
+        raise ValueError("each side of an upscaled video's size is a multiple of 64")
 
 
 def diffusion_components(kind: str, components: dict) -> None:
@@ -282,6 +301,7 @@ class DeploymentRequest(BaseModel):
     fps: int | None = Field(default=None, ge=1, le=60)
     seconds: int | None = Field(default=None, ge=1, le=10)
     size: str | None = Field(default=None, pattern=VIDEO_SIZE)
+    upscale_sigmas: list[float] | None = None
     language: str | None = Field(default=None, pattern=LANGUAGE)
 
     @model_validator(mode="after")
@@ -292,6 +312,7 @@ class DeploymentRequest(BaseModel):
             raise ValueError("steps, cfg_scale and sampler apply to image and video deployments only")
         thinking_options(self.kind, self.thinking, self.thinking_budget)
         video_options(self.kind, self.flow_shift, self.fps, self.seconds, self.size)
+        upscale_options(self.kind, self.components, self.size, self.upscale_sigmas)
         if self.kind in DIFFUSION:
             diffusion_components(self.kind, self.components)
         elif self.kind == "speech":
@@ -428,7 +449,7 @@ def video_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     for name, flag in VIDEO_COMPONENTS.items():
         component = deployment.components.get(name)
         if component is not None:
-            command += [flag, component.path]
+            command += [flag, os.path.dirname(component.path) if name == "spatial_upscaler" else component.path]
     return command + ["--diffusion-fa", "--backend", "vae=cpu"]
 
 
@@ -730,7 +751,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         thinking=request.thinking, thinking_budget=request.thinking_budget,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
-        language=request.language,
+        upscale_sigmas=request.upscale_sigmas, language=request.language,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)

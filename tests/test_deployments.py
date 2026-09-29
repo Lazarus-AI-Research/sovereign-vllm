@@ -1517,6 +1517,39 @@ def test_the_videos_api_refuses_what_it_cannot_make(harness):
         assert api.post("/deployments/clips/v1/images/generations", headers=harness.headers, json={}).status_code == 404
 
 
+# A video model with a spatial upscaler is served with the upscaler's
+# directory; each clip is asked of the engine at half its size, doubled by
+# the upscaler named as the engine knows it and refined through the pinned
+# noise levels, and the caller is told the size it asked for. Only such a
+# model refines, and at a size whose half the engine can make.
+def test_an_upscaled_video_is_made_at_half_its_size(harness):
+    upscalers = harness.models / "latent_upscale_models"
+    upscalers.mkdir()
+    (upscalers / "ltx-upscaler-x2.safetensors").write_bytes(b"upscaler")
+    upscaler = {"artifact": "metal/latent_upscale_models/ltx-upscaler-x2.safetensors", "sha256": digest(upscalers / "ltx-upscaler-x2.safetensors")}
+    components = {**video_request(harness)["components"], "spatial_upscaler": upscaler}
+    request = video_request(harness, components=components, size="1280x704", upscale_sigmas=[0.909375, 0.725, 0.421875, 0.0])
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/clips", headers=harness.headers, json=request)
+        assert created.status_code == 200, created.text
+        command = harness.children[-1].command
+        assert command[command.index("--hires-upscalers-dir") + 1] == str(upscalers)
+        assert api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"prompt": "a", "size": "1248x704"}).status_code == 400
+        made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"prompt": "a kite"})
+        assert made.status_code == 200 and made.json()["size"] == "1280x704", made.text
+        job = json.loads(harness.inference[-1][3])
+        assert (job["width"], job["height"]) == (640, 352)
+        assert job["hires"] == {"enabled": True, "upscaler": "ltx-upscaler-x2", "custom_sigmas": [0.909375, 0.725, 0.421875, 0.0]}
+        for wrong in (
+            video_request(harness, upscale_sigmas=[0.5, 0.0]),
+            {**request, "size": "1248x704"},
+            {**request, "upscale_sigmas": [0.5, 0.2]},
+            {**request, "upscale_sigmas": [1.5, 0.0]},
+        ):
+            assert api.put("/agent/admin/deployments/clips-two", headers=harness.headers, json=wrong).status_code == 422, wrong
+    assert load_agent_config(harness.config_path).deployments["clips"].upscale_sigmas == [0.909375, 0.725, 0.421875, 0.0]
+
+
 # Video options and components belong to a video model; an image model's
 # components are not a video model's, nor the reverse.
 def test_video_options_belong_to_video_deployments(harness):

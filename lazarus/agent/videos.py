@@ -20,6 +20,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import os
 import re
 import time
 
@@ -84,16 +85,16 @@ def seconds_of(value, reviewed: int) -> int:
     return seconds
 
 
-def size_of(value, default: str) -> tuple[int, int]:
+def size_of(value, default: str, multiple: int = 32) -> tuple[int, int]:
     """A size no larger in area than the one the model was reviewed at, each
-    side a multiple of 32."""
+    side a multiple of 32, or of 64 for a clip made at half its size."""
     text = default if value is None else value
     match = SIZE.match(text) if isinstance(text, str) else None
     if match is None:
         raise VideoError(400, "size is WIDTHxHEIGHT")
     width, height = int(match.group(1)), int(match.group(2))
-    if width % 32 or height % 32:
-        raise VideoError(400, "each side of size is a multiple of 32")
+    if width % multiple or height % multiple:
+        raise VideoError(400, f"each side of size is a multiple of {multiple}")
     reviewed = SIZE.match(default)
     if width * height > int(reviewed.group(1)) * int(reviewed.group(2)):
         raise VideoError(400, f"size is at most {default} in area")
@@ -121,7 +122,8 @@ def job_request(body: bytes, deployment) -> tuple[dict, dict]:
     if len(prompt) > MAX_PROMPT:
         raise VideoError(400, f"prompt is at most {MAX_PROMPT} characters")
     seconds = seconds_of(request.get("seconds"), deployment.seconds)
-    width, height = size_of(request.get("size"), deployment.size)
+    upscaler = deployment.components.get("spatial_upscaler")
+    width, height = size_of(request.get("size"), deployment.size, 64 if upscaler else 32)
     job = {
         "prompt": prompt,
         "width": width,
@@ -138,6 +140,14 @@ def job_request(body: bytes, deployment) -> tuple[dict, dict]:
     }
     if deployment.flow_shift is not None:
         job["sample_params"]["flow_shift"] = deployment.flow_shift
+    # A model with a spatial upscaler makes the clip at half its size, then
+    # doubles it and refines it: the upscaler is named as the engine knows
+    # it, by its file's name without the extension.
+    if upscaler is not None:
+        hires = {"enabled": True, "upscaler": os.path.splitext(os.path.basename(upscaler.path))[0]}
+        if deployment.upscale_sigmas:
+            hires["custom_sigmas"] = deployment.upscale_sigmas
+        job.update(width=width // 2, height=height // 2, hires=hires)
     video = {
         "object": "video",
         "model": deployment.served_model_name,
