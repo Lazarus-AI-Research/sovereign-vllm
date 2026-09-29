@@ -1452,7 +1452,7 @@ def test_a_video_deployment_answers_the_videos_api(harness):
         command = harness.children[-1].command
         assert command[0] == "sd-server" and command[command.index("--diffusion-model") + 1].endswith("wan-5b.gguf")
         assert command[command.index("--t5xxl") + 1].endswith("umt5.gguf") and command[command.index("--vae") + 1].endswith("wan-vae.safetensors")
-        assert command[-3:] == ["--diffusion-fa", "--backend", "vae=cpu"] and "--steps" not in command
+        assert command[-4:] == ["--diffusion-fa", "--backend", "vae=cpu", "--temporal-tiling"] and "--steps" not in command
         assert command[command.index("--lora-model-dir") + 1] == "/var/empty"
 
         made = api.post("/deployments/clips/v1/videos", headers=harness.headers, json={"model": "assistant-video", "prompt": "a kite", "seconds": "2", "size": "352x640"})
@@ -1548,6 +1548,25 @@ def test_an_upscaled_video_is_made_at_half_its_size(harness):
         ):
             assert api.put("/agent/admin/deployments/clips-two", headers=harness.headers, json=wrong).status_code == 422, wrong
     assert load_agent_config(harness.config_path).deployments["clips"].upscale_sigmas == [0.909375, 0.725, 0.421875, 0.0]
+
+
+# A video model whose text encoder is a language model published only in
+# bf16 has it converted as it loads, to the type the deployment names; a
+# model whose text encoder is a T5 has none to convert.
+def test_a_video_models_text_encoder_is_converted_as_it_loads(harness):
+    components = {
+        "llm": {"artifact": "metal/umt5.gguf", "sha256": digest(harness.models / "umt5.gguf")},
+        "vae": video_request(harness)["components"]["vae"],
+    }
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/clips", headers=harness.headers,
+                          json=video_request(harness, components=components, text_encoder_type="q8_0"))
+        assert created.status_code == 200, created.text
+        command = harness.children[-1].command
+        assert command[command.index("--tensor-type-rules") + 1] == r"^text_encoders\.llm\.=q8_0"
+        for wrong in (video_request(harness, text_encoder_type="q8_0"), video_request(harness, components=components, text_encoder_type="q3_K")):
+            assert api.put("/agent/admin/deployments/clips-two", headers=harness.headers, json=wrong).status_code == 422, wrong
+    assert load_agent_config(harness.config_path).deployments["clips"].text_encoder_type == "q8_0"
 
 
 # Video options and components belong to a video model; an image model's
