@@ -1545,6 +1545,8 @@ def test_an_upscaled_video_is_made_at_half_its_size(harness):
             {**request, "size": "1248x704"},
             {**request, "upscale_sigmas": [0.5, 0.2]},
             {**request, "upscale_sigmas": [1.5, 0.0]},
+            {**request, "upscale_sigmas": [0.2, 0.9, 0.0]},
+            {key: value for key, value in request.items() if key != "size"},
         ):
             assert api.put("/agent/admin/deployments/clips-two", headers=harness.headers, json=wrong).status_code == 422, wrong
     assert load_agent_config(harness.config_path).deployments["clips"].upscale_sigmas == [0.909375, 0.725, 0.421875, 0.0]

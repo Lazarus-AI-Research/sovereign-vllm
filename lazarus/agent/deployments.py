@@ -240,11 +240,14 @@ def upscale_options(kind: str, components: dict, size: str | None, sigmas: list[
     upscaled = kind == "video" and "spatial_upscaler" in components
     if sigmas is not None and not upscaled:
         raise ValueError("only a video model with a spatial upscaler refines after it")
-    if sigmas is not None and (len(sigmas) < 2 or any(not 0 <= sigma <= 1 for sigma in sigmas) or sigmas[-1] != 0):
+    falling = sigmas is not None and all(later < earlier for earlier, later in zip(sigmas, sigmas[1:]))
+    if sigmas is not None and (len(sigmas) < 2 or any(not 0 <= sigma <= 1 for sigma in sigmas) or sigmas[-1] != 0 or not falling):
         raise ValueError("a refine pass's noise levels are 0 to 1 and fall to 0")
     # The clip is made at half its size, which the engine takes in
-    # multiples of 32.
-    if upscaled and size is not None and any(int(side) % 64 for side in size.split("x")):
+    # multiples of 32; with no size given there is none it was reviewed at.
+    if upscaled and size is None:
+        raise ValueError("an upscaled video names its size")
+    if upscaled and any(int(side) % 64 for side in size.split("x")):
         raise ValueError("each side of an upscaled video's size is a multiple of 64")
 
 
