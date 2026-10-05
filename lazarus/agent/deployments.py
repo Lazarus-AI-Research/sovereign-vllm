@@ -168,6 +168,12 @@ class SlimServeProfile(BaseModel):
             parts = PurePosixPath(name).parts
             if not parts or name.startswith("/") or str(PurePosixPath(name)) != name or any(part in (".", "..") for part in parts):
                 raise ValueError("a SlimServe layout names each file by a canonical relative path")
+        # Every link has a place of its own: none inside another's path, and
+        # none differing only by case, which the Mac's disk takes as the same.
+        folded = sorted(name.casefold() for name in layout)
+        for name, following in zip(folded, folded[1:]):
+            if following == name or following.startswith(name + "/"):
+                raise ValueError("a SlimServe layout names each file at a place of its own")
         files = list(layout.values())
         if files.count("model") != 1 or any(files.count(file) > 1 for file in SLIMSERVE_FILES):
             raise ValueError("a SlimServe layout names the weights once, and the projector and drafter at most once each")
@@ -740,7 +746,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         verify_deployment_files(deployment)
     if deployment.slimserve is not None:
         if not agent.config.slimserve:
-            raise RuntimeError("SlimServe is not installed on this host")
+            raise ValueError("SlimServe is not installed on this host")
         command = slimserve_command(agent, deployment, lay_out_slimserve(agent, deployment_id, deployment))
     else:
         command = deployment_command(agent, deployment)

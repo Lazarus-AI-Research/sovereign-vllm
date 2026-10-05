@@ -1675,6 +1675,9 @@ def test_a_slimserve_deployment_runs_its_profile_over_links_to_its_verified_file
     {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"a.gguf": "model", "b.gguf": "model"}}},
     {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"../second.gguf": "model"}}},
     {"slimserve": {"profile": "Second Q2", "quant": "Q2", "layout": {"second.gguf": "model"}}},
+    # One link inside another's path, and two that differ only by case.
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"a.gguf": "model", "a.gguf/b.gguf": "projector", "D/d.gguf": "drafter"}}},
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"X/m.gguf": "model", "x/M.gguf": "projector", "D/d.gguf": "drafter"}}},
     # A drafter is a SlimServe deployment's alone.
     {"slimserve": None},
 ])
@@ -1691,3 +1694,17 @@ def test_a_slimserve_deployment_is_refused_where_slimserve_is_not_installed(harn
         response = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness))
         assert response.status_code == 422 and "not installed" in response.json()["error"]
         assert harness.children == []
+
+
+# A recorded SlimServe deployment on a host that no longer has SlimServe is
+# skipped at startup; the agent and its other deployments still start.
+def test_a_recorded_slimserve_deployment_without_slimserve_does_not_stop_the_agent(harness):
+    harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness)).status_code == 200
+        assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=second_request(harness, served_model_name="assistant-third")).status_code == 200
+    config = load_agent_config(harness.config_path)
+    config.slimserve = ""
+    restarted = Agent(config, harness.config_path)
+    restarted.start_deployments()
+    assert "assistant-third" in restarted.deployments and "assistant-second" not in restarted.deployments
