@@ -1,6 +1,8 @@
-"""How much memory a process holds, as the host counts it.
+"""How much memory a process holds, as the host counts it, with every
+process it started: SlimServe's server holds its model in an engine process
+of its own.
 
-On macOS this is the process's physical footprint, the figure Activity
+On macOS this is each process's physical footprint, the figure Activity
 Monitor shows: a Metal engine's weights sit in unified memory the resident
 set does not fully count. On Linux it is the resident set. None where the
 host cannot say.
@@ -41,6 +43,13 @@ class _RusageInfoV2(ctypes.Structure):
 
 
 def memory_bytes(pid: int) -> int | None:
+    own = _own_bytes(pid)
+    if own is None:
+        return None
+    return own + sum(_own_bytes(child) or 0 for child in _descendants(pid))
+
+
+def _own_bytes(pid: int) -> int | None:
     if sys.platform == "darwin":
         return _darwin_footprint(pid)
     if sys.platform.startswith("linux"):
@@ -48,11 +57,46 @@ def memory_bytes(pid: int) -> int | None:
     return None
 
 
-def _darwin_footprint(pid: int) -> int | None:
+def _descendants(pid: int) -> list[int]:
+    found, pending = [], [pid]
+    while pending:
+        children = _children(pending.pop())
+        found += children
+        pending += children
+    return found
+
+
+def _children(pid: int) -> list[int]:
+    if sys.platform == "darwin":
+        return _darwin_children(pid)
+    if sys.platform.startswith("linux"):
+        try:
+            return [int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+        except OSError:
+            return []
+    return []
+
+
+def _libproc():
     path = ctypes.util.find_library("proc") or "/usr/lib/libSystem.dylib"
     try:
-        library = ctypes.CDLL(path, use_errno=True)
+        return ctypes.CDLL(path, use_errno=True)
     except OSError:
+        return None
+
+
+def _darwin_children(pid: int) -> list[int]:
+    library = _libproc()
+    if library is None:
+        return []
+    buffer = (ctypes.c_int * 256)()
+    count = library.proc_listchildpids(ctypes.c_int(pid), buffer, ctypes.sizeof(buffer))
+    return [child for child in buffer[:max(count, 0)] if child > 0]
+
+
+def _darwin_footprint(pid: int) -> int | None:
+    library = _libproc()
+    if library is None:
         return None
     info = _RusageInfoV2()
     if library.proc_pid_rusage(ctypes.c_int(pid), ctypes.c_int(_RUSAGE_INFO_V2), ctypes.byref(info)) != 0:

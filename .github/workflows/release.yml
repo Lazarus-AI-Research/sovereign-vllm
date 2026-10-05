@@ -145,6 +145,8 @@ jobs:
             -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build whisper-build --target whisper-server -j "$(sysctl -n hw.ncpu)"
           cp whisper-build/bin/whisper-server stage/bin/whisper-server
+          agent-dist/slimserve/build-slimserve.sh "$PYTHON" stage/slimserve-wheels
+          test -n "$(find stage/slimserve-wheels -maxdepth 1 -name 'vllm-*.whl' -print -quit)"
           TEST_HOME="$(mktemp -d)"
           HOME="$TEST_HOME" SOVEREIGN_AGENT_HOME="$TEST_HOME/.sovereign" SOVEREIGN_SKIP_AGENT_START=1 \
             stage/agent-dist/install-agent.sh

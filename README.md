@@ -429,27 +429,32 @@ The tag above names the **local output**, not a published artifact. The image
 also updates the first-party Runtime wheel in the stock interpreter using
 `--no-deps`; it never installs SlimServe or replaces stock vLLM there.
 
-#### Native Apple Silicon source install
+#### SlimServe on the Metal agent
 
-Docker cannot expose Metal. The native path is
-`docker/metal/build-slimserve.sh`, run on Apple Silicon with the Metal-specific
-locked wheelhouse and Python 3.11–3.14. It additionally requires full Xcode,
-`xcrun metal` supporting **`-std=metal4.0`**, `install_name_tool`, the Metal /
-Foundation / QuartzCore SDK frameworks, and the matching MPS-enabled torch
-wheel. Command Line Tools or an older Metal SDK alone are insufficient. The
-script prepends `/opt/homebrew/bin` to `PATH`; set `SLIMSERVE_PYTHON` to the
-absolute native interpreter path when necessary. Arrange permission to create
-the fixed `/opt` installation before invoking it:
+The Metal distribution carries SlimServe, built at a pinned commit by
+`agent-dist/slimserve/build-slimserve.sh` (run by the release on its Apple
+Silicon runner, which has Xcode's Metal toolchain): SlimServe's wheel and
+every wheel it installs with, pinned by hash in
+`agent-dist/slimserve/requirements.lock` (`build-requirements.lock` for the
+build). `install-agent.sh` installs it into an environment of its own,
+`~/.sovereign/runtime/slimserve`, on a Mac of 48 GiB or more (the smallest
+SlimServe Metal profile's need), and names its command as `slimserve` in
+`agent.yaml`.
 
-```bash
-bash docker/metal/build-slimserve.sh "${SLIMSERVE_METAL_WHEELHOUSE}"
-```
+A language model deployment that names a SlimServe profile (`slimserve`:
+profile, quant and the layout of its files) is served by
+`slimserve <profile> --quant … --cache <directory>` instead of llama-server.
+The directory holds links to the deployment's verified files where
+SlimServe's profile list places them, so SlimServe downloads nothing; it is
+started offline, with the agent's key for the child.
 
-This compiles the actual `vllm._quixicore_C` ObjC++ extension and adjacent
-`vllm/quixicore_metal.metallib` using SlimServe's pinned CMake targets. It does
-not use QuixiCore's standalone JIT package, modify `install-agent.sh`, start a
-daemon, or represent a container-to-Metal bridge. Host-agent deployment and
-actual native serving still require their own configuration and qualification.
+`agent-dist/slimserve/patches/` builds SlimServe's kernels for Metal 3.2,
+which macOS 15 loads, instead of Metal 4, which only macOS 26 does, and has
+the speculative verify path use the simdgroup kernels in place of the M5
+tensor kernels Metal 3.2 cannot compile. Measured on an M3 Max on macOS 15:
+`qwen38-q2kxl-1` serves at 17 to 22 tokens a second with tool calls, holding
+about 39 GB. An M5 on macOS 26 runs without its tensor kernels until the
+patch is dropped.
 
 #### Provenance and qualification boundary
 

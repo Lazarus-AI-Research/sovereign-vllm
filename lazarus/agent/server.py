@@ -87,6 +87,8 @@ class ServerProcess:
                 raise ValueError("generation authentication is agent-owned")
             child_env.pop("LLAMA_ARG_API_KEY_FILE", None)
             child_env["LLAMA_API_KEY"] = self.api_key
+            # SlimServe's server, vLLM's, reads its key the same way.
+            child_env["VLLM_API_KEY"] = self.api_key
         if environment:
             child_env.update(environment)
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
