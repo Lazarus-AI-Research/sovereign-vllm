@@ -1625,3 +1625,86 @@ def test_each_server_starts_at_the_log_level(harness):
         assert log_level_arguments("video", "error") == ["--log-level", "error"]
     finally:
         logging.getLogger().setLevel(before)
+
+
+def slimserve_request(harness, **overrides):
+    drafter = harness.models / "second-drafter.gguf"
+    drafter.write_bytes(b"drafter")
+    request = second_request(
+        harness, components={"drafter": {"artifact": "metal/second-drafter.gguf", "sha256": digest(drafter)}},
+        slimserve={"profile": "second-q2-1", "quant": "Q2", "layout": {
+            "Second-GGUF/second.gguf": "model", "Second-GGUF/mmproj-F16.gguf": "projector", "Second-Drafter/drafter.gguf": "drafter",
+        }},
+    )
+    request.update(overrides)
+    return request
+
+
+def test_a_slimserve_deployment_runs_its_profile_over_links_to_its_verified_files(harness):
+    harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness))
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "slimserve"
+
+        child = harness.children[-1]
+        directory = harness.config_path.parent / "slimserve" / "assistant-second"
+        assert child.command == [
+            "/opt/slimserve/bin/slimserve", "second-q2-1", "--quant", "Q2", "--cache", str(directory),
+            "--host", "127.0.0.1", "--port", "9110", "--served-model-name", "assistant-second", "--ctx", "4096",
+        ]
+        assert (directory / "Second-GGUF" / "second.gguf").resolve() == harness.weights.resolve()
+        assert (directory / "Second-GGUF" / "mmproj-F16.gguf").resolve() == harness.projector.resolve()
+        assert (directory / "Second-Drafter" / "drafter.gguf").read_bytes() == b"drafter"
+        assert child.env["HF_HUB_OFFLINE"] == "1" and child.env["VLLM_API_KEY"] == child.env["LLAMA_API_KEY"]
+        listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]
+        assert listed["assistant-second"]["engine"] == "slimserve"
+
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    assert restarted.config.deployments["assistant-second"].slimserve.profile == "second-q2-1"
+    restarted.start_deployments()
+    assert harness.children[-1].command[0] == "/opt/slimserve/bin/slimserve"
+
+
+@pytest.mark.parametrize("bad", [
+    # The layout names a projector the deployment does not give.
+    {"mmproj": None, "mmproj_sha256": None},
+    # The profile's thinking is SlimServe's.
+    {"thinking": "off"},
+    # Weights named twice, a path climbing out of the directory.
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"a.gguf": "model", "b.gguf": "model"}}},
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"../second.gguf": "model"}}},
+    {"slimserve": {"profile": "Second Q2", "quant": "Q2", "layout": {"second.gguf": "model"}}},
+    # One link inside another's path, and two that differ only by case.
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"a.gguf": "model", "a.gguf/b.gguf": "projector", "D/d.gguf": "drafter"}}},
+    {"slimserve": {"profile": "second-q2-1", "quant": "Q2", "layout": {"X/m.gguf": "model", "x/M.gguf": "projector", "D/d.gguf": "drafter"}}},
+    # A drafter is a SlimServe deployment's alone.
+    {"slimserve": None},
+])
+def test_bad_slimserve_requests_are_refused_before_any_process_starts(harness, bad):
+    harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
+    with TestClient(build_app(harness.agent)) as api:
+        response = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness, **bad))
+        assert response.status_code == 422, response.text
+        assert harness.children == []
+
+
+def test_a_slimserve_deployment_is_refused_where_slimserve_is_not_installed(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        response = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness))
+        assert response.status_code == 422 and "not installed" in response.json()["error"]
+        assert harness.children == []
+
+
+# A recorded SlimServe deployment on a host that no longer has SlimServe is
+# skipped at startup; the agent and its other deployments still start.
+def test_a_recorded_slimserve_deployment_without_slimserve_does_not_stop_the_agent(harness):
+    harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=slimserve_request(harness)).status_code == 200
+        assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=second_request(harness, served_model_name="assistant-third")).status_code == 200
+    config = load_agent_config(harness.config_path)
+    config.slimserve = ""
+    restarted = Agent(config, harness.config_path)
+    restarted.start_deployments()
+    assert "assistant-third" in restarted.deployments and "assistant-second" not in restarted.deployments

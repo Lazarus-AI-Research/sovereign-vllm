@@ -50,6 +50,9 @@ class AgentConfig(BaseModel):
     # The command that runs piper's HTTP server for a speech deployment;
     # empty means the agent's own interpreter with piper installed beside it.
     piper_server: str = ""
+    # The SlimServe command a language model deployment served from a
+    # SlimServe profile runs; empty where SlimServe is not installed.
+    slimserve: str = ""
     # Every served model: created by Control while the appliance runs and
     # persisted so a restarted agent serves them again.
     deployments: dict[str, AgentDeployment] = {}

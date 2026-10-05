@@ -54,6 +54,20 @@ fi
 if ! grep -q '^whisper_server:' "$CONFIG"; then
   printf 'whisper_server: %s\n' "$RUNTIME_HOME/bin/whisper-server" >> "$CONFIG"
 fi
+# SlimServe serves the models it has a profile for, and the smallest of its
+# Metal profiles needs a Mac of 48 GiB: a smaller one is not given it. It
+# lives in an environment of its own, since its package is named vllm.
+SLIMSERVE_WHEELS="$DIST_DIR/slimserve-wheels"
+SLIMSERVE_MINIMUM_MEMORY=$((48 * 1024 * 1024 * 1024))
+if [[ -d "$SLIMSERVE_WHEELS" ]] && (( $(sysctl -n hw.memsize) >= SLIMSERVE_MINIMUM_MEMORY )); then
+  SLIMSERVE_WHEEL="$(find "$SLIMSERVE_WHEELS" -maxdepth 1 -name 'vllm-*.whl' -print -quit)"
+  [[ -n "$SLIMSERVE_WHEEL" ]] || { echo "error: SlimServe's wheel is missing" >&2; exit 1; }
+  "$UV_BIN" venv --clear --python "$PYTHON_BIN" "$RUNTIME_HOME/slimserve"
+  "$UV_BIN" pip install --python "$RUNTIME_HOME/slimserve/bin/python" --no-index --find-links "$SLIMSERVE_WHEELS" "$SLIMSERVE_WHEEL"
+  if ! grep -q '^slimserve:' "$CONFIG"; then
+    printf 'slimserve: %s\n' "$RUNTIME_HOME/slimserve/bin/slimserve" >> "$CONFIG"
+  fi
+fi
 chmod 600 "$CONFIG"
 if [[ ! -f "$TOKEN_FILE" ]]; then
   openssl rand -hex 32 > "$TOKEN_FILE"

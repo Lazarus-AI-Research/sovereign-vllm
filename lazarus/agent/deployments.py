@@ -15,6 +15,7 @@ import shlex
 import socket
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import httpx
@@ -105,6 +106,17 @@ ENGINES = {
     "transcription": "whisper.cpp", "speech": "piper", "video": "stable-diffusion.cpp",
 }
 
+# SlimServe serves a language model from one of its profiles: a model,
+# quantization and engine settings tuned and measured together for this
+# hardware, which it does not let a caller vary. It reads its files from a
+# directory laid out as its profile list names them, and opens its port only
+# once the model is loaded, which for a large model takes many minutes.
+SLIMSERVE = "slimserve"
+SLIMSERVE_FILES = ("model", "projector", "drafter")
+SLIMSERVE_READY_TIMEOUT = 1800.0
+PROFILE_ID = r"^[a-z0-9][a-z0-9.-]{0,63}$"
+PROFILE_QUANT = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
+
 
 # What each kind's loader accepts: GGUF for llama-server, GGUF or safetensors
 # for stable-diffusion.cpp, ggml for whisper-server, ONNX for piper.
@@ -133,6 +145,59 @@ class Component(BaseModel):
         if not path.is_absolute() or str(path) != value or value.startswith("//") or ".." in path.parts:
             raise ValueError("model paths must be canonical absolute paths")
         return value
+
+
+class SlimServeProfile(BaseModel):
+    """The SlimServe profile a language model deployment is served from, and
+    where SlimServe looks for each of the deployment's files: its path under
+    SlimServe's model directory, naming the weights, the projector or the
+    drafter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: str = Field(pattern=PROFILE_ID)
+    quant: str = Field(pattern=PROFILE_QUANT)
+    layout: dict[str, Literal[SLIMSERVE_FILES]]
+
+    @field_validator("layout")
+    @classmethod
+    def relative_paths(cls, layout: dict[str, str]) -> dict[str, str]:
+        from pathlib import PurePosixPath
+
+        for name in layout:
+            parts = PurePosixPath(name).parts
+            if not parts or name.startswith("/") or str(PurePosixPath(name)) != name or any(part in (".", "..") for part in parts):
+                raise ValueError("a SlimServe layout names each file by a canonical relative path")
+        # Every link has a place of its own: none inside another's path, and
+        # none differing only by case, which the Mac's disk takes as the same.
+        folded = sorted(name.casefold() for name in layout)
+        for name, following in zip(folded, folded[1:]):
+            if following == name or following.startswith(name + "/"):
+                raise ValueError("a SlimServe layout names each file at a place of its own")
+        files = list(layout.values())
+        if files.count("model") != 1 or any(files.count(file) > 1 for file in SLIMSERVE_FILES):
+            raise ValueError("a SlimServe layout names the weights once, and the projector and drafter at most once each")
+        return layout
+
+
+# A SlimServe deployment is a language model whose files are the weights, a
+# projector where the model reads images, and a drafter where the profile
+# speculates, each named in the layout exactly when it is given. Its thinking
+# is the profile's, which SlimServe does not let a launch change.
+def slimserve_options(kind: str, slimserve: SlimServeProfile | None, components: dict, projector: str | None, thinking: str | None, budget: int | None) -> None:
+    if slimserve is None:
+        if kind == "generation" and components:
+            raise ValueError("components apply to image, video, speech and SlimServe deployments only")
+        return
+    if kind != "generation":
+        raise ValueError("SlimServe serves language model deployments only")
+    if set(components) - {"drafter"}:
+        raise ValueError("a SlimServe deployment's one component is its drafter")
+    files = set(slimserve.layout.values())
+    if ("projector" in files) != (projector is not None) or ("drafter" in files) != ("drafter" in components):
+        raise ValueError("a SlimServe layout names exactly the files the deployment gives")
+    if thinking is not None or budget is not None:
+        raise ValueError("a SlimServe deployment thinks as its profile does")
 
 
 class AgentDeployment(BaseModel):
@@ -178,6 +243,8 @@ class AgentDeployment(BaseModel):
     text_encoder_type: Literal[TEXT_ENCODER_TYPES] | None = None
     # A transcription deployment's spoken language.
     language: str | None = Field(default=None, pattern=LANGUAGE)
+    # A language model SlimServe serves instead of llama-server.
+    slimserve: SlimServeProfile | None = None
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -216,8 +283,9 @@ class AgentDeployment(BaseModel):
                 raise ValueError("steps, cfg_scale and sampler apply to image and video deployments only")
             if self.kind == "speech":
                 speech_components(self.components, self.model_path)
-            elif self.components:
-                raise ValueError("components apply to image, video and speech deployments only")
+            elif self.kind != "generation" and self.components:
+                raise ValueError("components apply to image, video, speech and SlimServe deployments only")
+        slimserve_options(self.kind, self.slimserve, self.components, self.mmproj_path, self.thinking, self.thinking_budget)
         if self.kind == "transcription":
             self.language = self.language or "auto"
         elif self.language is not None:
@@ -318,6 +386,7 @@ class DeploymentRequest(BaseModel):
     upscale_sigmas: list[float] | None = None
     text_encoder_type: Literal[TEXT_ENCODER_TYPES] | None = None
     language: str | None = Field(default=None, pattern=LANGUAGE)
+    slimserve: SlimServeProfile | None = None
 
     @model_validator(mode="after")
     def projector_checksum(self):
@@ -334,8 +403,9 @@ class DeploymentRequest(BaseModel):
         elif self.kind == "speech":
             if set(self.components) != SPEECH_COMPONENTS:
                 raise ValueError("a speech deployment names its voice configuration as its one component, config")
-        elif self.components:
-            raise ValueError("components apply to image, video and speech deployments only")
+        elif self.kind != "generation" and self.components:
+            raise ValueError("components apply to image, video, speech and SlimServe deployments only")
+        slimserve_options(self.kind, self.slimserve, self.components, self.mmproj, self.thinking, self.thinking_budget)
         if self.kind != "transcription" and self.language is not None:
             raise ValueError("language applies to transcription deployments only")
         return self
@@ -408,12 +478,59 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     return command
 
 
+def engine_of(deployment: AgentDeployment) -> str:
+    return SLIMSERVE if deployment.slimserve is not None else ENGINES[deployment.kind]
+
+
+# SlimServe finds a profile's files under its model directory by the paths
+# its profile list gives them. Each deployment gets a directory of its own
+# holding links to the verified files it was given, laid out afresh at every
+# start; SlimServe keeps the KV cache it spills to disk there too.
+def lay_out_slimserve(agent: Agent, deployment_id: str, deployment: AgentDeployment) -> Path:
+    import shutil
+
+    home = agent.config_path.parent if agent.config_path else Path.home() / ".sovereign"
+    directory = home / "slimserve" / deployment_id
+    shutil.rmtree(directory, ignore_errors=True)
+    sources = {"model": deployment.model_path, "projector": deployment.mmproj_path}
+    if "drafter" in deployment.components:
+        sources["drafter"] = deployment.components["drafter"].path
+    for name, file in deployment.slimserve.layout.items():
+        link = directory / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(sources[file])
+    return directory
+
+
+# The profile is served as SlimServe tuned it; only the window is capped to
+# the deployment's. Every file is in place, so SlimServe downloads nothing,
+# and it is not told it may: one found missing or changed fails the launch
+# rather than being fetched.
+def slimserve_command(agent: Agent, deployment: AgentDeployment, directory: Path) -> list[str]:
+    return [
+        agent.config.slimserve, deployment.slimserve.profile,
+        "--quant", deployment.slimserve.quant,
+        "--cache", str(directory),
+        "--host", "127.0.0.1",
+        "--port", str(deployment.port),
+        "--served-model-name", deployment.served_model_name,
+        "--ctx", str(deployment.context_length),
+    ]
+
+
 # What a language model server takes through its environment: the server's
 # reasoning switches are read from it (LLAMA_ARG_REASONING, the budget as
 # LLAMA_ARG_THINK_BUDGET) rather than from its arguments, and its verbosity
-# at the appliance's log level as it starts.
+# at the appliance's log level as it starts. SlimServe is told it is offline,
+# and logs at the appliance's level.
 def deployment_environment(deployment: AgentDeployment) -> dict[str, str]:
     environment: dict[str, str] = {}
+    if deployment.slimserve is not None:
+        environment["HF_HUB_OFFLINE"] = "1"
+        level = log_level.current()
+        if level in log_level.LEVELS:
+            environment["VLLM_LOGGING_LEVEL"] = {"warn": "WARNING"}.get(level, level.upper())
+        return environment
     verbosity = log_level.LLAMA_VERBOSITY.get(log_level.current() or "")
     if deployment.kind in ("generation", "embedding") and verbosity is not None:
         environment["LLAMA_ARG_LOG_VERBOSITY"] = verbosity
@@ -552,7 +669,7 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "thinking": deployment.thinking,
         "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
-        "engine": ENGINES[deployment.kind],
+        "engine": engine_of(deployment),
         "memory_bytes": process.memory_bytes() if running else None,
     }
 
@@ -580,7 +697,7 @@ async def observe_deployments(agent: Agent) -> dict[str, dict]:
 
 
 async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, process: ServerProcess) -> None:
-    timeout = getattr(agent, "deployment_ready_timeout", READY_TIMEOUT)
+    timeout = getattr(agent, "deployment_ready_timeout", SLIMSERVE_READY_TIMEOUT if deployment.slimserve else READY_TIMEOUT)
     if deployment.kind == "embedding":
         await agent.wait_embedding_ready(process, timeout=timeout)
         return
@@ -627,11 +744,17 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     # checks them again, since the disk may have changed meanwhile.
     if verify:
         verify_deployment_files(deployment)
+    if deployment.slimserve is not None:
+        if not agent.config.slimserve:
+            raise ValueError("SlimServe is not installed on this host")
+        command = slimserve_command(agent, deployment, lay_out_slimserve(agent, deployment_id, deployment))
+    else:
+        command = deployment_command(agent, deployment)
     return ServerProcess(
-        deployment_id, deployment_command(agent, deployment), deployment.port, deployment.model_path,
+        deployment_id, command, deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
         authenticated=deployment.kind == "generation", environment=deployment_environment(deployment),
-        health_path=HEALTH_PATHS[deployment.kind], engine=ENGINES[deployment.kind],
+        health_path=HEALTH_PATHS[deployment.kind], engine=engine_of(deployment),
     )
 
 
@@ -725,6 +848,8 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     # llama-server loads GGUF alone; stable-diffusion.cpp takes its encoders
     # and autoencoder as safetensors too. A file the loader would refuse is
     # refused here, before a serving process is touched.
+    if request.slimserve is not None and not agent.config.slimserve:
+        raise ValueError("SlimServe is not installed on this host")
     suffixes = weight_suffixes(request.kind)
     model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
@@ -773,6 +898,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
         upscale_sigmas=request.upscale_sigmas, text_encoder_type=request.text_encoder_type, language=request.language,
+        slimserve=request.slimserve,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)

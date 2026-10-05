@@ -51,6 +51,17 @@ class RelayedResponse(StreamingResponse):
                 await self._cleanup()
 
 
+# SlimServe as the manifest names it: installed when its command is, at the
+# version its package records (SlimServe's distribution is named vllm).
+def slimserve_engine(command: str) -> dict | None:
+    if not command or not os.access(command, os.X_OK):
+        return None
+    environment = Path(command).resolve().parent.parent
+    records = sorted(environment.glob("lib/python3*/site-packages/vllm-*.dist-info"))
+    version = records[-1].name.removeprefix("vllm-").removesuffix(".dist-info") if records else "unknown"
+    return {"name": "slimserve", "version": version, "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
+
+
 class ServerProcess:
     """One llama-server child: started here, probed here, stopped here."""
 
@@ -87,6 +98,8 @@ class ServerProcess:
                 raise ValueError("generation authentication is agent-owned")
             child_env.pop("LLAMA_ARG_API_KEY_FILE", None)
             child_env["LLAMA_API_KEY"] = self.api_key
+            # SlimServe's server, vLLM's, reads its key the same way.
+            child_env["VLLM_API_KEY"] = self.api_key
         if environment:
             child_env.update(environment)
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
@@ -150,9 +163,13 @@ class Agent:
         self.available_engines: list[dict] = []
 
     async def discover_engines(self) -> None:
-        """The installed llama-server's version, for the manifest; not evidence
-        of what any running child loaded."""
+        """The installed llama-server's version, and SlimServe's where it is
+        installed, for the manifest; not evidence of what any running child
+        loaded."""
         self.available_engines = []
+        slimserve = slimserve_engine(self.config.slimserve)
+        if slimserve is not None:
+            self.available_engines.append(slimserve)
         binary = self.config.llama_server
         if binary == "llama-server":
             binary = shutil.which(binary)

@@ -1,0 +1,89 @@
+diff --git a/cmake/metal.cmake b/cmake/metal.cmake
+index fb4159990..dc5f158bb 100644
+--- a/cmake/metal.cmake
++++ b/cmake/metal.cmake
+@@ -55,7 +55,7 @@ add_custom_command(
+   COMMAND ${XCRUN_EXECUTABLE} metal
+           # metal4.0 for mpp::tensor_ops (M5 GPU neural accelerators) in
+           # qgemm_sm_t; the pre-existing kernels compile unchanged under it
+-          -std=metal4.0 -O2
++          -std=metal3.2 -O2
+           -I ${QUIXICORE_METAL_INCLUDE}
+           # No .metal currently includes from kernels/common -- only the host
+           # header does -- but upstream's build passes it, so keep it here too
+diff --git a/csrc/quixicore/tm_metal/qc_metal_serving.mm b/csrc/quixicore/tm_metal/qc_metal_serving.mm
+index c5ca290f0..1b4518c26 100644
+--- a/csrc/quixicore/tm_metal/qc_metal_serving.mm
++++ b/csrc/quixicore/tm_metal/qc_metal_serving.mm
+@@ -38,6 +38,12 @@
+ 
+ #include "tk_launch.h"
+ 
++
++// Built for a Metal language version older than 4.0, the metallib has no
++// tensor-ops kernels (qgemm_sm_t*, the uint4/uint8 verify kernels): the
++// simdgroup kernels serve the verify band instead.
++static constexpr bool kTensorKernels = false;
++
+ namespace {
+ 
+ // ---- transient-output ring --------------------------------------------
+@@ -667,7 +673,7 @@ void emit_matvec(TorchEncoder& e, const Proj& p, const at::Tensor& x,
+     int variant = 9;
+     if (K % 64 == 0) {
+       const bool kquant = fmt == "q4_K" || fmt == "q5_K" || fmt == "q6_K";
+-      if (kquant && p.rows % 32 == 0) {
++      if (kTensorKernels && kquant && p.rows % 32 == 0) {
+         // mirror the eager route (quixicore/ops.py): tensor-ops kernels,
+         // per-shape 15/16/17 selection (the rested-A/B winner)
+         if (p.rows % 64 == 0 && p.rows >= 16384) {
+@@ -1806,7 +1812,8 @@ at::Tensor dflash_sample_greedy(const at::Tensor& hidden,
+   auto partials = at::empty({4, N, 32}, opt.dtype(at::kFloat));
+   auto logits = at::empty({m, N}, opt);
+   auto tokens = at::empty({m}, opt.dtype(at::kLong));
+-  const int variant = 16;  // wide-N 8-warp tensor kernel
++  // wide-N 8-warp tensor kernel, or the BK=32 split-K kernel without one
++  const int variant = kTensorKernels ? 16 : 9;
+   encode([&](TorchEncoder& e) {
+     tk::launch_muse_xpose32(e, xp, hidden, K, m);
+     tk::launch_qgemm_sm(e, partials, lm_w, xp, N, K, variant, fmt);
+diff --git a/vllm/model_executor/layers/quantization/gguf/linear.py b/vllm/model_executor/layers/quantization/gguf/linear.py
+index 049cbe519..353298b01 100644
+--- a/vllm/model_executor/layers/quantization/gguf/linear.py
++++ b/vllm/model_executor/layers/quantization/gguf/linear.py
+@@ -417,6 +417,11 @@ class GGUFLinearMethod(LinearMethodBase):
+         """
+         if not current_platform.is_metal():
+             return
++        from vllm.quixicore.ops import TENSOR_KERNELS
++
++        # The uint4 kernels are tensor-ops kernels.
++        if not TENSOR_KERNELS:
++            return
+         # Default ON: part of the route that won the same-protocol rested
+         # A/B (2026-08-15). VLLM_MUSE_U4=0 disables for A/B.
+         if os.environ.get("VLLM_MUSE_U4", "1").lower() in ("0", "false"):
+diff --git a/vllm/quixicore/ops.py b/vllm/quixicore/ops.py
+index 99012d771..25f36b557 100644
+--- a/vllm/quixicore/ops.py
++++ b/vllm/quixicore/ops.py
+@@ -50,6 +50,10 @@ def _qc():
+     return qc
+ 
+ 
++# Built for a Metal language version older than 4.0, the metallib has no
++# tensor-ops kernels: the simdgroup kernels serve the verify band instead.
++TENSOR_KERNELS = False
++
+ class quixicore_ops:
+     @staticmethod
+     @cache
+@@ -1081,7 +1085,7 @@ class quixicore_ops:
+         """
+         variant = 9
+         if x.shape[-1] % 64 == 0:
+-            if quant_type in (12, 13, 14) and row % 32 == 0:
++            if TENSOR_KERNELS and quant_type in (12, 13, 14) and row % 32 == 0:
+                 # Default: the per-shape 15/16/17 selection -- it won the
+                 # same-protocol rested A/B (17.81/17.56/17.58 vs 16.05
+                 # flat for the split-K=1 route, 2026-08-15). The split-K=1
