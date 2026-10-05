@@ -280,3 +280,18 @@ def test_log_level_is_set_and_kept(monkeypatch, tmp_path):
     finally:
         for name, level in before.items():
             logging.getLogger(name).setLevel(level)
+
+
+# SlimServe is listed among the agent's engines exactly when its command is
+# installed, at the version its package records.
+def test_slimserve_is_an_available_engine_when_installed(tmp_path):
+    from lazarus.agent.server import slimserve_engine
+
+    command = tmp_path / "slimserve" / "bin" / "slimserve"
+    assert slimserve_engine(str(command)) is None and slimserve_engine("") is None
+    command.parent.mkdir(parents=True)
+    command.write_text("#!/bin/sh\n")
+    command.chmod(0o755)
+    (tmp_path / "slimserve" / "lib" / "python3.12" / "site-packages" / "vllm-0.1.dev1+g6aa3c3956.dist-info").mkdir(parents=True)
+    engine = slimserve_engine(str(command))
+    assert engine == {"name": "slimserve", "version": "0.1.dev1+g6aa3c3956", "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
