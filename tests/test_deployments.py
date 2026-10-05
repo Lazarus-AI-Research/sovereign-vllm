@@ -1708,3 +1708,23 @@ def test_a_recorded_slimserve_deployment_without_slimserve_does_not_stop_the_age
     restarted = Agent(config, harness.config_path)
     restarted.start_deployments()
     assert "assistant-third" in restarted.deployments and "assistant-second" not in restarted.deployments
+
+
+# A SlimServe deployment that names no window is served with its profile's
+# own; llama-server keeps its default and its limit.
+def test_a_slimserve_deployment_takes_its_profiles_window_unless_it_names_one(harness):
+    harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
+    with TestClient(build_app(harness.agent)) as api:
+        request = slimserve_request(harness)
+        del request["context_length"]
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request).status_code == 200
+        assert "--ctx" not in harness.children[-1].command
+        assert harness.agent.config.deployments["assistant-second"].context_length == 0
+        request = second_request(harness, served_model_name="assistant-third")
+        del request["context_length"]
+        assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request).status_code == 200
+        command = harness.children[-1].command
+        assert command[command.index("-c") + 1] == "8192"
+        too_wide = api.put("/agent/admin/deployments/assistant-fourth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fourth", context_length=262144))
+        assert too_wide.status_code == 422
+    assert load_agent_config(harness.config_path).deployments["assistant-second"].context_length == 0

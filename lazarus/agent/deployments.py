@@ -116,6 +116,11 @@ SLIMSERVE_FILES = ("model", "projector", "drafter")
 SLIMSERVE_READY_TIMEOUT = 1800.0
 PROFILE_ID = r"^[a-z0-9][a-z0-9.-]{0,63}$"
 PROFILE_QUANT = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
+# llama-server's windows the agent accepts, and the largest a SlimServe
+# profile serves (GLM-5.3-Flash's million tokens).
+LLAMA_WINDOW_LIMIT = 131072
+LLAMA_DEFAULT_WINDOW = 8192
+SLIMSERVE_WINDOW_LIMIT = 1048576
 
 
 # What each kind's loader accepts: GGUF for llama-server, GGUF or safetensors
@@ -213,7 +218,9 @@ class AgentDeployment(BaseModel):
     sha256: str
     port: int = Field(ge=1, le=65535)
     served_model_name: str
-    context_length: int = Field(default=0, ge=0, le=131072)
+    # Zero for a model with no window, and for a SlimServe deployment served
+    # with its profile's own.
+    context_length: int = Field(default=0, ge=0, le=SLIMSERVE_WINDOW_LIMIT)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     # Whether a language model thinks before it answers, and for how many
@@ -290,9 +297,24 @@ class AgentDeployment(BaseModel):
             self.language = self.language or "auto"
         elif self.language is not None:
             raise ValueError("language applies to transcription deployments only")
-        if self.kind not in NO_CONTEXT and self.context_length < 128:
-            raise ValueError("a language model deployment needs a context length of at least 128")
+        if self.slimserve is None:
+            llama_window(self.kind, self.context_length)
+        elif self.context_length and self.context_length < 128:
+            raise ValueError("a SlimServe deployment's window, when it names one, is at least 128 tokens")
         return self
+
+
+def llama_window(kind: str, window: int) -> None:
+    if kind not in NO_CONTEXT and not 128 <= window <= LLAMA_WINDOW_LIMIT:
+        raise ValueError(f"a llama-server deployment's window is between 128 and {LLAMA_WINDOW_LIMIT} tokens")
+
+
+# The window a request is served with: the one it names, or llama-server's
+# default; a SlimServe profile's own when it names none.
+def request_window(request: DeploymentRequest) -> int:
+    if request.context_length is not None:
+        return request.context_length
+    return 0 if request.slimserve is not None else LLAMA_DEFAULT_WINDOW
 
 
 def video_options(kind: str, flow_shift, fps, seconds, size) -> None:
@@ -370,7 +392,8 @@ class DeploymentRequest(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     mmproj_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
     served_model_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-    context_length: int = Field(default=8192, ge=128, le=131072)
+    # Unset is 8192 for llama-server, and a SlimServe profile's own window.
+    context_length: int | None = Field(default=None, ge=128, le=SLIMSERVE_WINDOW_LIMIT)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     thinking: Literal["on", "off"] | None = None
@@ -502,8 +525,8 @@ def lay_out_slimserve(agent: Agent, deployment_id: str, deployment: AgentDeploym
     return directory
 
 
-# The profile is served as SlimServe tuned it; only the window is capped to
-# the deployment's. Every file is in place, so SlimServe downloads nothing,
+# The profile is served as SlimServe tuned it, with its own window unless the
+# deployment names a smaller one. Every file is in place, so SlimServe downloads nothing,
 # and it is not told it may: one found missing or changed fails the launch
 # rather than being fetched.
 def slimserve_command(agent: Agent, deployment: AgentDeployment, directory: Path) -> list[str]:
@@ -514,7 +537,7 @@ def slimserve_command(agent: Agent, deployment: AgentDeployment, directory: Path
         "--host", "127.0.0.1",
         "--port", str(deployment.port),
         "--served-model-name", deployment.served_model_name,
-        "--ctx", str(deployment.context_length),
+        *(["--ctx", str(deployment.context_length)] if deployment.context_length else []),
     ]
 
 
@@ -892,7 +915,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         revision=request.revision.lower(), sha256=request.sha256.lower(),
         port=port,
         served_model_name=request.served_model_name,
-        context_length=0 if request.kind in NO_CONTEXT else request.context_length,
+        context_length=0 if request.kind in NO_CONTEXT else request_window(request),
         pooling=request.pooling, normalization=request.normalization,
         thinking=request.thinking, thinking_budget=request.thinking_budget,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
