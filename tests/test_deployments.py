@@ -1725,6 +1725,10 @@ def test_a_slimserve_deployment_takes_its_profiles_window_unless_it_names_one(ha
         assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request).status_code == 200
         command = harness.children[-1].command
         assert command[command.index("-c") + 1] == "8192"
-        too_wide = api.put("/agent/admin/deployments/assistant-fourth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fourth", context_length=262144))
+        # A model's own long window is served; one beyond a million tokens is not.
+        wide = api.put("/agent/admin/deployments/assistant-fourth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fourth", context_length=262144))
+        assert wide.status_code == 200
+        assert harness.children[-1].command[harness.children[-1].command.index("-c") + 1] == "262144"
+        too_wide = api.put("/agent/admin/deployments/assistant-fifth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fifth", context_length=2097152))
         assert too_wide.status_code == 422
     assert load_agent_config(harness.config_path).deployments["assistant-second"].context_length == 0
