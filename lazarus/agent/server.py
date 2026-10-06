@@ -80,7 +80,7 @@ class ServerProcess:
         self.revision = revision
         self.context_length = context_length
         # A generation child answers only with a key the agent alone holds,
-        # so nothing on the host reaches it except through the agent. b9960
+        # so nothing on the host reaches it except through the agent. b11429
         # traces the final four key characters; those stay public while 256
         # random bits never enter argv or logs.
         self.api_key = secrets.token_urlsafe(32) + "-agent" if authenticated else None
@@ -92,7 +92,7 @@ class ServerProcess:
         if self.api_key is not None or environment:
             child_env = dict(os.environ)
         if self.api_key is not None:
-            # b9960 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
+            # b11429 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
             # Extra keys would create ingress outside the agent's admission gate.
             if any(arg.split("=", 1)[0].replace("_", "-") in {"--api-key", "--api-key-file"} for arg in command):
                 raise ValueError("generation authentication is agent-owned")
@@ -189,10 +189,12 @@ class Agent:
             await asyncio.wait_for(process.wait(), timeout=5)
             if process.returncode != 0:
                 return
-            match = re.search(rb"(?m)^version: ([0-9]{1,8}) \(([0-9a-f]{7,40})\)\r?$", output)
+            # "version: 9960 (a935fbffe)" before llama.cpp 0.6, and
+            # "version: 0.6.0-dev (build 11429, commit d81235049)" since.
+            match = re.search(rb"(?m)^version: (?:([0-9]{1,8}) \(([0-9a-f]{7,40})\)|[0-9.]+(?:-[a-z]+)? \(build ([0-9]{1,8}), commit ([0-9a-f]{7,40})\))\r?$", output)
             if match is not None:
                 self.available_engines.append({
-                    "name": "llama.cpp", "version": f"b{match[1].decode()}-{match[2].decode()}",
+                    "name": "llama.cpp", "version": f"b{(match[1] or match[3]).decode()}-{(match[2] or match[4]).decode()}",
                     "adapter": "metal-host-agent", "variants": ["metal-arm64"],
                 })
         except (OSError, asyncio.TimeoutError):

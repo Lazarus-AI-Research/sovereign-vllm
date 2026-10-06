@@ -139,7 +139,7 @@ acknowledgements.
 
 The managed native llama.cpp path closes host ingress and drains complete
 responses before observing both `llamacpp:requests_processing` and
-`llamacpp:requests_deferred` at zero. The audited `b9960` source is
+`llamacpp:requests_deferred` at zero. The audited `b11429` source is
 `a935fbffe1a3d31509c325c116454ab5d56b2eb8`. Each owned generation process receives
 a private random API key through its environment. The metrics endpoint must
 reject an unauthenticated probe and accept that key; process identity/liveness
@@ -306,7 +306,7 @@ discovery (`available_engines` in the manifest) is not loaded-engine version
 evidence. The file projection is not a checksum measurement or physical
 serving qualification.
 
-The supported native llama-server contract is the reviewed **b9960** CLI, not
+The supported native llama-server contract is the reviewed **b11429** CLI, not
 arbitrary historical versions. The agent makes `model_path` authoritative by
 placing the primary-file argument last and clearing the primary URL, Hugging
 Face, and Docker selectors with their supported empty string arguments. This
@@ -315,8 +315,8 @@ it does not replace auxiliary projector inputs. No caller-supplied `llama.cpp`
 argument crosses the deployments API. Binaries that do not support this CLI
 are not covered; this source-reviewed argument policy
 does not attest the version of a loaded child. See the
-[b9960 string setters](https://github.com/ggml-org/llama.cpp/blob/b9960/common/arg.cpp#L2733-L2768)
-and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b9960/common/arg.cpp#L459-L576).
+[b11429 string setters](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp#L2733-L2768)
+and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp#L459-L576).
 
 ### Backends behind one seam (`lazarus/appliance/backends/`)
 
