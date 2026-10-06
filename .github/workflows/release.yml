@@ -11,8 +11,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io/lazarus-ai-research
-  LLAMA_VERSION: b9960
-  LLAMA_SHA256: 7a8c6b6ae3395e15b5cc330ed2938cc0aa4510905db1189658fd022035734b48
+  LLAMA_VERSION: b11429
+  LLAMA_SHA256: 740288ec6887be94280a5dfa25b5e23a78285cab104519e6c7e218904ee82459
   # stable-diffusion.cpp serves image deployments; its Metal build ships
   # beside llama-server in the Metal distribution.
   SD_VERSION: master-872-cc515a0
