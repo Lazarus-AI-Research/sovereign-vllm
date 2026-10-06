@@ -116,9 +116,10 @@ SLIMSERVE_FILES = ("model", "projector", "drafter")
 SLIMSERVE_READY_TIMEOUT = 1800.0
 PROFILE_ID = r"^[a-z0-9][a-z0-9.-]{0,63}$"
 PROFILE_QUANT = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
-# llama-server's windows the agent accepts, and the largest a SlimServe
-# profile serves (GLM-5.3-Flash's million tokens).
-LLAMA_WINDOW_LIMIT = 131072
+# The largest window the agent accepts for llama-server and for a SlimServe
+# profile: a million tokens (GLM-5.3-Flash's, DeepSeek V4's). Control sizes
+# each deployment's window to its model and memory.
+LLAMA_WINDOW_LIMIT = 1048576
 LLAMA_DEFAULT_WINDOW = 8192
 SLIMSERVE_WINDOW_LIMIT = 1048576
 
