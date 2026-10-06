@@ -140,7 +140,7 @@ acknowledgements.
 The managed native llama.cpp path closes host ingress and drains complete
 responses before observing both `llamacpp:requests_processing` and
 `llamacpp:requests_deferred` at zero. The audited `b11429` source is
-`a935fbffe1a3d31509c325c116454ab5d56b2eb8`. Each owned generation process receives
+`d81235049384534c167caea52b85a694f6103d14`. Each owned generation process receives
 a private random API key through its environment. The metrics endpoint must
 reject an unauthenticated probe and accept that key; process identity/liveness
 must still match. Health is never idle proof. The key's fixed public suffix
@@ -315,8 +315,8 @@ it does not replace auxiliary projector inputs. No caller-supplied `llama.cpp`
 argument crosses the deployments API. Binaries that do not support this CLI
 are not covered; this source-reviewed argument policy
 does not attest the version of a loaded child. See the
-[b11429 string setters](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp#L2733-L2768)
-and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp#L459-L576).
+[b11429 string setters](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp#L3047-L3070)
+and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b11429/common/arg.cpp).
 
 ### Backends behind one seam (`lazarus/appliance/backends/`)
 
