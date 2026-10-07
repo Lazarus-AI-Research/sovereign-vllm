@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lazarus.agent import log_level
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
 from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
-from lazarus.agent.memory import memory_bytes
+from lazarus.agent.memory import memory_held
 from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
@@ -128,9 +128,10 @@ class ServerProcess:
     def running(self) -> bool:
         return self.process.poll() is None
 
-    def memory_bytes(self) -> int | None:
-        """What the child holds now; None once it has exited or the host cannot say."""
-        return memory_bytes(self.process.pid, self.weights_root) if self.running() else None
+    def memory_held(self) -> tuple[int, int] | None:
+        """What the child holds now, and of that the weights it maps; None
+        once it has exited or the host cannot say."""
+        return memory_held(self.process.pid, self.weights_root) if self.running() else None
 
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}

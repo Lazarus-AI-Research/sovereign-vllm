@@ -761,7 +761,7 @@ def port_available(port: int) -> bool:
     return True
 
 
-def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool, memory: int | None = None) -> dict:
+def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool, memory: tuple[int, int] | None = None) -> dict:
     """memory is what memory_of read for it, off the event loop."""
     process = agent.deployments.get(deployment_id)
     running = process is not None and process.running()
@@ -789,17 +789,18 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
         "engine": engine_of(deployment),
-        "memory_bytes": memory if running else None,
+        "memory_bytes": memory[0] if running and memory else None,
+        "weights_bytes": memory[1] if running and memory else None,
     }
 
 
-async def memory_of(agent: Agent, deployment_id: str) -> int | None:
+async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
     """What the deployment's process holds; read in a thread, since asking
     the kernel which of a large model's pages are in memory takes a while."""
     process = agent.deployments.get(deployment_id)
     if process is None:
         return None
-    return await asyncio.to_thread(process.memory_bytes)
+    return await asyncio.to_thread(process.memory_held)
 
 
 async def observe_deployments(agent: Agent) -> dict[str, dict]:

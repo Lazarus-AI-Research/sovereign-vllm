@@ -47,16 +47,25 @@ class _RusageInfoV2(ctypes.Structure):
 
 
 def memory_bytes(pid: int, weights_root: Path | None = None) -> int | None:
+    held = memory_held(pid, weights_root)
+    return None if held is None else held[0]
+
+
+def memory_held(pid: int, weights_root: Path | None = None) -> tuple[int, int] | None:
+    """All the process and its children hold, and of that the weights they
+    map, which macOS counts as files in memory rather than memory in use: a
+    reader of the machine's memory in use adds them to it."""
     own = _own_bytes(pid)
     if own is None:
         return None
     family = [pid, *_descendants(pid)]
     held = own + sum(_own_bytes(child) or 0 for child in family[1:])
+    weights = 0
     if sys.platform == "darwin" and weights_root is not None:
         # A file two of the family map is in memory once.
-        weights = set().union(*(_darwin_mapped_weights(member, weights_root) for member in family))
-        held += sum(_resident_bytes(path) for path in weights)
-    return held
+        mapped = set().union(*(_darwin_mapped_weights(member, weights_root) for member in family))
+        weights = sum(_resident_bytes(path) for path in mapped)
+    return held + weights, weights
 
 
 def _own_bytes(pid: int) -> int | None:
