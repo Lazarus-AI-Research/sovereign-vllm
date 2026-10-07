@@ -493,7 +493,7 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--alias", deployment.served_model_name,
         "--host", "127.0.0.1",
         "--port", str(deployment.port),
-        # b11457 applies env before argv, then remote selection after argv; the
+        # b11459 applies env before argv, then remote selection after argv; the
         # selectors are cleared so the final -m is the model that loads.
         "--model-url", "", "--hf-repo", "", "--docker-repo", "",
         "-m", deployment.model_path,

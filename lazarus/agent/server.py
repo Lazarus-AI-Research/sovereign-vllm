@@ -80,7 +80,7 @@ class ServerProcess:
         self.revision = revision
         self.context_length = context_length
         # A generation child answers only with a key the agent alone holds,
-        # so nothing on the host reaches it except through the agent. b11457
+        # so nothing on the host reaches it except through the agent. b11459
         # traces the final four key characters; those stay public while 256
         # random bits never enter argv or logs.
         self.api_key = secrets.token_urlsafe(32) + "-agent" if authenticated else None
@@ -92,7 +92,7 @@ class ServerProcess:
         if self.api_key is not None or environment:
             child_env = dict(os.environ)
         if self.api_key is not None:
-            # b11457 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
+            # b11459 accepts LLAMA_API_KEY without exposing a secret in argv/logs.
             # Extra keys would create ingress outside the agent's admission gate.
             if any(arg.split("=", 1)[0].replace("_", "-") in {"--api-key", "--api-key-file"} for arg in command):
                 raise ValueError("generation authentication is agent-owned")
@@ -190,7 +190,7 @@ class Agent:
             if process.returncode != 0:
                 return
             # "version: 9960 (a935fbffe)" before llama.cpp 0.6, and
-            # "version: 0.6.0-dev (build 11457, commit 5ad1c5da0)" since.
+            # "version: 0.6.0-dev (build 11459, commit f498f864f)" since.
             match = re.search(rb"(?m)^version: (?:([0-9]{1,8}) \(([0-9a-f]{7,40})\)|[0-9.]+(?:-[a-z]+)? \(build ([0-9]{1,8}), commit ([0-9a-f]{7,40})\))\r?$", output)
             if match is not None:
                 self.available_engines.append({
