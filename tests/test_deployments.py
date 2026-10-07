@@ -217,8 +217,24 @@ def test_embedding_deployment_gets_pooling_flags_and_is_probed(harness):
         assert created.status_code == 200, created.text
         command = harness.children[-1].command
         assert command[1:6] == ["--embedding", "--pooling", "last", "--embd-normalize", "-1"]
+        assert command[command.index("-b") + 1] == command[command.index("-ub") + 1] == "2048"
+        assert "--mmproj" not in command
         assert harness.inference[-1][1] == "/v1/embeddings"
         assert harness.children[-1].env is None
+
+
+# A multimodal embedding model reads images and recordings through its
+# projector.
+def test_embedding_deployment_takes_its_projector(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/embed-media", headers=harness.headers, json=second_request(
+            harness, kind="embedding", served_model_name="embedding-media", context_length=8192,
+        ))
+        assert created.status_code == 200, created.text
+        command = harness.children[-1].command
+        assert command[command.index("--mmproj") + 1].endswith("metal/second-mmproj.gguf")
+        assert command[command.index("-ub") + 1] == "8192"
+
 
 
 def test_removing_a_deployment_stops_only_that_process(harness):

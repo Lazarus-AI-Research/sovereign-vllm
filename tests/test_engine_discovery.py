@@ -9,7 +9,7 @@ from lazarus.agent.server import Agent
 # llama-server names its build both ways: before llama.cpp 0.6 and since.
 @pytest.mark.parametrize("line, version", [
     ("version: 9960 (a935fbffe)", "b9960-a935fbffe"),
-    ("version: 0.6.0-dev (build 11429, commit d81235049)", "b11429-d81235049"),
+    ("version: 0.6.0-dev (build 11457, commit 5ad1c5da0)", "b11457-5ad1c5da0"),
 ])
 def test_the_installed_llama_server_is_listed_at_its_build(tmp_path, line, version):
     binary = tmp_path / "llama-server"
