@@ -3,15 +3,19 @@ process it started: SlimServe's server holds its model in an engine process
 of its own.
 
 On macOS this is each process's physical footprint, the figure Activity
-Monitor shows: a Metal engine's weights sit in unified memory the resident
-set does not fully count. On Linux it is the resident set. None where the
-host cannot say.
+Monitor shows, and the weights it maps from the models directory: llama.cpp
+maps its model file rather than copying it, and a mapped file's pages are
+the file's, not the process's, so the footprint leaves them out. On Linux it
+is the resident set, which counts mapped pages already. None where the host
+cannot say.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import mmap
+import os
 import sys
 from pathlib import Path
 
@@ -42,11 +46,17 @@ class _RusageInfoV2(ctypes.Structure):
     ]
 
 
-def memory_bytes(pid: int) -> int | None:
+def memory_bytes(pid: int, weights_root: Path | None = None) -> int | None:
     own = _own_bytes(pid)
     if own is None:
         return None
-    return own + sum(_own_bytes(child) or 0 for child in _descendants(pid))
+    family = [pid, *_descendants(pid)]
+    held = own + sum(_own_bytes(child) or 0 for child in family[1:])
+    if sys.platform == "darwin" and weights_root is not None:
+        # A file two of the family map is in memory once.
+        weights = set().union(*(_darwin_mapped_weights(member, weights_root) for member in family))
+        held += sum(_resident_bytes(path) for path in weights)
+    return held
 
 
 def _own_bytes(pid: int) -> int | None:
@@ -113,3 +123,96 @@ def _linux_resident(pid: int) -> int | None:
         if line.startswith("VmRSS:"):
             return int(line.split()[1]) * 1024
     return None
+
+
+class _RegionInfo(ctypes.Structure):
+    _fields_ = [
+        *((name, ctypes.c_uint32) for name in ("pri_protection", "pri_max_protection", "pri_inheritance", "pri_flags")),
+        ("pri_offset", ctypes.c_uint64),
+        *((name, ctypes.c_uint32) for name in (
+            "pri_behavior", "pri_user_wired_count", "pri_user_tag", "pri_pages_resident", "pri_pages_shared_now_private",
+            "pri_pages_swapped_out", "pri_pages_dirtied", "pri_ref_count", "pri_shadow_depth", "pri_share_mode",
+            "pri_private_pages_resident", "pri_shared_pages_resident", "pri_obj_id", "pri_depth",
+        )),
+        ("pri_address", ctypes.c_uint64),
+        ("pri_size", ctypes.c_uint64),
+    ]
+
+
+_PROC_PIDREGIONINFO = 7
+# A process maps its weights once it has loaded them and keeps them mapped,
+# so the walk over its regions, the slow part, is made once per process and
+# directory: a process known by its id and when it started, since an id is
+# used again.
+_mapped_weights: dict[tuple[int, int, str], frozenset[str]] = {}
+
+
+def _darwin_mapped_weights(pid: int, root: Path) -> frozenset[str]:
+    library = _libproc()
+    if library is None:
+        return frozenset()
+    usage = _RusageInfoV2()
+    if library.proc_pid_rusage(ctypes.c_int(pid), ctypes.c_int(_RUSAGE_INFO_V2), ctypes.byref(usage)) != 0:
+        return frozenset()
+    prefix = str(root).rstrip("/") + "/"
+    process = (pid, int(usage.ri_proc_start_abstime), prefix)
+    if process in _mapped_weights:
+        return _mapped_weights[process]
+    found: set[str] = set()
+    path = ctypes.create_string_buffer(4096)
+    address = 0
+    while True:
+        info = _RegionInfo()
+        if library.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDREGIONINFO), ctypes.c_uint64(address), ctypes.byref(info), ctypes.sizeof(info)) < ctypes.sizeof(info):
+            break
+        if library.proc_regionfilename(ctypes.c_int(pid), ctypes.c_uint64(info.pri_address), path, ctypes.sizeof(path)) > 0:
+            name = os.fsdecode(path.value)
+            if name.startswith(prefix):
+                found.add(name)
+        address = info.pri_address + info.pri_size
+    weights = frozenset(found)
+    # Until the model is loaded nothing is mapped yet; look again then.
+    if weights:
+        if len(_mapped_weights) > 256:
+            _mapped_weights.clear()
+        _mapped_weights[process] = weights
+    return weights
+
+
+# Each page's flags, as mincore writes them, to 1 when the page is in memory.
+_IN_MEMORY = bytes(flags & 1 for flags in range(256))
+
+
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    return libc
+
+
+def _resident_bytes(path: str) -> int:
+    """How much of the file is in memory, whoever mapped it."""
+    libc = _libc()
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return 0
+    try:
+        size = os.fstat(descriptor).st_size
+        if size == 0:
+            return 0
+        address = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, descriptor, 0)
+    finally:
+        os.close(descriptor)
+    if address in (None, ctypes.c_void_p(-1).value):
+        return 0
+    try:
+        pages = (size + mmap.PAGESIZE - 1) // mmap.PAGESIZE
+        vector = ctypes.create_string_buffer(pages)
+        if libc.mincore(address, size, vector) != 0:
+            return 0
+        return min(size, vector.raw[:pages].translate(_IN_MEMORY).count(1) * mmap.PAGESIZE)
+    finally:
+        libc.munmap(address, size)

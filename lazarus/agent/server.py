@@ -83,9 +83,11 @@ class ServerProcess:
         self, name: str, command: list[str], port: int, model_path: str,
         *, revision: str | None, context_length: int | None, authenticated: bool = False,
         environment: dict[str, str] | None = None,
-        health_path: str = "/health", engine: str = "llama.cpp",
+        health_path: str = "/health", engine: str = "llama.cpp", weights_root: Path | None = None,
     ):
         self.name = name
+        # Where the weights it maps are read from, so they count as its own.
+        self.weights_root = weights_root
         self.port = port
         self.model_path = model_path
         self.health_path = health_path
@@ -128,7 +130,7 @@ class ServerProcess:
 
     def memory_bytes(self) -> int | None:
         """What the child holds now; None once it has exited or the host cannot say."""
-        return memory_bytes(self.process.pid) if self.running() else None
+        return memory_bytes(self.process.pid, self.weights_root) if self.running() else None
 
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}

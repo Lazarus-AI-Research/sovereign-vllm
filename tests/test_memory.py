@@ -30,3 +30,25 @@ def test_a_process_is_counted_with_the_processes_it_started():
     finally:
         parent.kill()
         subprocess.run(["pkill", "-f", "bytearray\\(512"], check=False)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="only macOS leaves mapped weights out of a process's footprint")
+def test_the_weights_a_process_maps_from_the_models_directory_count_as_its_own(tmp_path):
+    weights = tmp_path / "models" / "weights.gguf"
+    weights.parent.mkdir()
+    weights.write_bytes(os.urandom(64 * 1024 * 1024))
+    # Like llama.cpp: the file mapped, every page read, and kept mapped.
+    code = (
+        "import mmap, sys, time; f = open(sys.argv[1], 'rb'); m = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ); "
+        "sum(m[i] for i in range(0, len(m), 4096)); print('ready', flush=True); time.sleep(30)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code, str(weights)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        alone = memory_bytes(child.pid)
+        with_weights = memory_bytes(child.pid, tmp_path / "models")
+        elsewhere = memory_bytes(child.pid, tmp_path / "other")
+        assert with_weights - alone >= 60 * 1024 * 1024
+        assert elsewhere - alone < 8 * 1024 * 1024
+    finally:
+        child.kill()
