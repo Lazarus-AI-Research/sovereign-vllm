@@ -139,8 +139,8 @@ acknowledgements.
 
 The managed native llama.cpp path closes host ingress and drains complete
 responses before observing both `llamacpp:requests_processing` and
-`llamacpp:requests_deferred` at zero. The audited `b11457` source is
-`5ad1c5da0ad7f6176256b823925aad19134f0263`. Each owned generation process receives
+`llamacpp:requests_deferred` at zero. The audited `b11459` source is
+`f498f864fbc0472004ee1c3616c1188c68eb157f`. Each owned generation process receives
 a private random API key through its environment. The metrics endpoint must
 reject an unauthenticated probe and accept that key; process identity/liveness
 must still match. Health is never idle proof. The key's fixed public suffix
@@ -306,7 +306,7 @@ discovery (`available_engines` in the manifest) is not loaded-engine version
 evidence. The file projection is not a checksum measurement or physical
 serving qualification.
 
-The supported native llama-server contract is the reviewed **b11457** CLI, not
+The supported native llama-server contract is the reviewed **b11459** CLI, not
 arbitrary historical versions. The agent makes `model_path` authoritative by
 placing the primary-file argument last and clearing the primary URL, Hugging
 Face, and Docker selectors with their supported empty string arguments. This
@@ -315,8 +315,8 @@ it does not replace auxiliary projector inputs. No caller-supplied `llama.cpp`
 argument crosses the deployments API. Binaries that do not support this CLI
 are not covered; this source-reviewed argument policy
 does not attest the version of a loaded child. See the
-[b11457 string setters](https://github.com/ggml-org/llama.cpp/blob/b11457/common/arg.cpp#L3047-L3070)
-and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b11457/common/arg.cpp).
+[b11459 string setters](https://github.com/ggml-org/llama.cpp/blob/b11459/common/arg.cpp#L3047-L3070)
+and [remote-selection handling](https://github.com/ggml-org/llama.cpp/blob/b11459/common/arg.cpp).
 
 ### Backends behind one seam (`lazarus/appliance/backends/`)
 
