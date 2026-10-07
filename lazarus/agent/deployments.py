@@ -273,7 +273,9 @@ class AgentDeployment(BaseModel):
             self.normalization = self.normalization or "l2"
         elif self.pooling is not None or self.normalization is not None:
             raise ValueError("pooling and normalization apply to embedding deployments only")
-        if self.kind != "generation" and self.mmproj_path is not None:
+        # A multimodal embedding model's projector holds its image and audio
+        # encoders, as a vision model's does for generation.
+        if self.kind not in ("generation", "embedding") and self.mmproj_path is not None:
             raise ValueError(f"a {self.kind} deployment has no projector")
         thinking_options(self.kind, self.thinking, self.thinking_budget)
         video_options(self.kind, self.flow_shift, self.fps, self.seconds, self.size)
@@ -491,7 +493,7 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         "--alias", deployment.served_model_name,
         "--host", "127.0.0.1",
         "--port", str(deployment.port),
-        # b11429 applies env before argv, then remote selection after argv; the
+        # b11457 applies env before argv, then remote selection after argv; the
         # selectors are cleared so the final -m is the model that loads.
         "--model-url", "", "--hf-repo", "", "--docker-repo", "",
         "-m", deployment.model_path,
@@ -499,6 +501,11 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     if deployment.mmproj_path:
         command += ["--mmproj", deployment.mmproj_path]
     command += ["-c", str(deployment.context_length)]
+    if deployment.kind == "embedding":
+        # An embedding model reads each input whole in one batch, so a batch
+        # as large as the window takes any input the window does: a recording
+        # or an image runs to hundreds of tokens, past the default 512.
+        command += ["-b", str(deployment.context_length), "-ub", str(deployment.context_length)]
     return command
 
 
