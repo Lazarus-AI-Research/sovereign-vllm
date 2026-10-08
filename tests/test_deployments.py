@@ -1788,7 +1788,7 @@ def test_an_mlx_deployment_runs_mlx_lm_over_its_verified_snapshot(harness):
         assert child.command == [
             sys.executable, "-m", "lazarus.agent.mlx_server", "--model", str(directory.resolve()),
             "--host", "127.0.0.1", "--port", "9110", "--max-tokens", "4096",
-            "--decode-concurrency", "4", "--prompt-cache-bytes", str(2 << 30),
+            "--decode-concurrency", "1", "--prompt-cache-bytes", str(2 << 30),
             "--chat-template-args", '{"enable_thinking": false}',
         ]
         # The guard reads the key the agent gives every generation child.

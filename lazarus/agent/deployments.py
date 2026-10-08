@@ -576,9 +576,10 @@ def engine_of(deployment: AgentDeployment) -> str:
 # to the model's template as llama-server's is; a reply runs to the window
 # unless the caller asks for less. mlx-lm takes no window of its own, so
 # the window is the default reply's length, not a bound on a request; what
-# it holds beside the weights is bounded instead: four requests decoded at
-# once, and the prompts it keeps for reuse held to MLX_PROMPT_CACHE_BYTES.
-MLX_DECODE_CONCURRENCY = 4
+# it holds beside the weights is bounded instead: one request decoded at a
+# time, as Control claims memory for one window's cache, and the prompts it
+# keeps for reuse held to MLX_PROMPT_CACHE_BYTES, which Control counts too.
+MLX_DECODE_CONCURRENCY = 1
 MLX_PROMPT_CACHE_BYTES = 2 << 30
 
 
