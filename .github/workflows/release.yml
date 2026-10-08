@@ -118,7 +118,10 @@ jobs:
           PYTHON="$(find stage/python-install -type f -path '*/bin/python3.12' -print -quit)"
           test -x "$PYTHON"
           cp -R "$(cd "$(dirname "$PYTHON")/.." && pwd)"/. stage/python/
-          "$PYTHON" -m pip download --require-hashes --only-binary=:all: --dest stage/wheels --requirement requirements-agent.lock
+          # The oldest macOS the agent runs on: the runner's own would pick
+          # mlx's build for macOS 15, which macOS 14 cannot install.
+          "$PYTHON" -m pip download --require-hashes --only-binary=:all: --platform macosx_14_0_arm64 --python-version 3.12 --implementation cp \
+            --dest stage/wheels --requirement requirements-agent.lock
           cp dist/*.whl stage/wheels/
           cp -R agent-dist/. stage/agent-dist/
           cp LICENSE NOTICE THIRD_PARTY_NOTICES.md stage/

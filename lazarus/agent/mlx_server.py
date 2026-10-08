@@ -1,14 +1,19 @@
 """The server the agent starts for an MLX deployment: mlx-lm's own, which
-answers only the agent's key and only for the model it was started with.
+answers only the agent's key, only for the model it was started with, and
+says it is healthy only once that model is loaded.
 
-mlx-lm's server takes no key and loads whatever model a request names, so
-both are closed here before it starts: a request without the key the agent
-gave this child is refused, and every request is served by the model on the
-command line. The weights are on disk already; nothing is downloaded."""
+mlx-lm's server takes no key, loads whatever model a request names, and
+answers its health route while it is still loading the model, so all three
+are closed here before it starts: a request without the key the agent gave
+this child is refused; every request is served by the model on the command
+line; and the health route waits for the model, while a model that cannot
+load ends the process, so the agent sees the failure at once. The weights
+are on disk already; nothing is downloaded."""
 
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 
 
@@ -20,11 +25,14 @@ def main() -> None:
     os.environ.pop("VLLM_API_KEY", None)
     if not key:
         raise SystemExit("an MLX server answers only the agent, which gives it a key")
-    expected = f"Bearer {key}"
+    # Headers arrive as Latin-1 text; compared as bytes, any header is a
+    # clean refusal rather than an error.
+    expected = f"Bearer {key}".encode("latin-1")
 
     def guarded(handle):
         def answer(self):
-            if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
+            given = self.headers.get("Authorization", "").encode("latin-1", "replace")
+            if not hmac.compare_digest(given, expected):
                 self.send_response(401)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -41,6 +49,18 @@ def main() -> None:
         return load(self, "default_model", None, None)
 
     server.ModelProvider.load = started_with
+    available = server.ResponseGenerator.is_healthy.fget
+    server.ResponseGenerator.is_healthy = property(lambda self: available(self) and self.model_provider.model is not None)
+    generate = server.ResponseGenerator._generate
+
+    def generate_or_end(self):
+        try:
+            generate(self)
+        except BaseException:
+            logging.exception("the MLX server stopped: its model could not be loaded or run")
+            os._exit(1)
+
+    server.ResponseGenerator._generate = generate_or_end
     server.main()
 
 

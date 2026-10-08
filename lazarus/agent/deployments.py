@@ -206,6 +206,8 @@ class MLXSnapshot(BaseModel):
             parts = PurePosixPath(name).parts
             if not parts or name.startswith("/") or str(PurePosixPath(name)) != name or any(part in (".", "..") for part in parts):
                 raise ValueError("an MLX snapshot names each file by a canonical relative path")
+            if any(ord(char) < 32 for char in name):
+                raise ValueError("an MLX snapshot's file names hold no control characters")
             if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
                 raise ValueError("an MLX snapshot pins each file by its sha256")
         if "config.json" not in files or not any(name.endswith(".safetensors") for name in files):
@@ -572,7 +574,14 @@ def engine_of(deployment: AgentDeployment) -> str:
 # mlx-lm's server behind the agent's guard (lazarus.agent.mlx_server), in the
 # agent's own Python, which carries mlx-lm. Its thinking switch is passed
 # to the model's template as llama-server's is; a reply runs to the window
-# unless the caller asks for less.
+# unless the caller asks for less. mlx-lm takes no window of its own, so
+# the window is the default reply's length, not a bound on a request; what
+# it holds beside the weights is bounded instead: four requests decoded at
+# once, and the prompts it keeps for reuse held to MLX_PROMPT_CACHE_BYTES.
+MLX_DECODE_CONCURRENCY = 4
+MLX_PROMPT_CACHE_BYTES = 2 << 30
+
+
 def mlx_command(deployment: AgentDeployment) -> list[str]:
     command = [
         sys.executable, "-m", "lazarus.agent.mlx_server",
@@ -580,6 +589,8 @@ def mlx_command(deployment: AgentDeployment) -> list[str]:
         "--host", "127.0.0.1",
         "--port", str(deployment.port),
         "--max-tokens", str(deployment.context_length or LLAMA_DEFAULT_WINDOW),
+        "--decode-concurrency", str(MLX_DECODE_CONCURRENCY),
+        "--prompt-cache-bytes", str(MLX_PROMPT_CACHE_BYTES),
     ]
     if deployment.thinking is not None:
         command += ["--chat-template-args", json.dumps({"enable_thinking": deployment.thinking == "on"})]
@@ -815,6 +826,20 @@ async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, proce
     raise RuntimeError("deployment did not become healthy before timeout")
 
 
+# mlx-lm loads every weight file it finds in the directory, so the
+# directory holds the pinned files and nothing else, none of them a link.
+def snapshot_holds_its_pins(directory: Path, files: dict[str, str]) -> None:
+    present = set()
+    for path in directory.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"{path} is a link; an MLX snapshot holds its files themselves")
+        if path.is_file():
+            present.add(path.relative_to(directory).as_posix())
+    if present != set(files):
+        extra, missing = sorted(present - set(files)), sorted(set(files) - present)
+        raise ValueError(f"the MLX snapshot in {directory} holds {extra or 'nothing'} beyond its pins and lacks {missing or 'nothing'}")
+
+
 def file_digest(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -827,6 +852,7 @@ def verify_deployment_files(deployment: AgentDeployment) -> None:
     """The bytes on disk are the bytes the record was made for. A weight
     overwritten since is refused, never loaded under the recorded revision."""
     if deployment.mlx is not None:
+        snapshot_holds_its_pins(Path(deployment.model_path), deployment.mlx.files)
         for name, digest in deployment.mlx.files.items():
             if file_digest(str(Path(deployment.model_path) / name)) != digest:
                 raise ValueError(f"{deployment.model_path}/{name} no longer matches its recorded checksum")
@@ -963,6 +989,10 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         raise ValueError("SlimServe is not installed on this host")
     suffixes = weight_suffixes(request.kind)
     if request.mlx is not None:
+        from lazarus.agent.server import mlx_engine
+
+        if mlx_engine() is None:
+            raise ValueError("mlx-lm is not installed on this host")
         model = await asyncio.to_thread(agent.resolve_snapshot, request.artifact, request.mlx.files)
     else:
         model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
@@ -1323,6 +1353,10 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         video = deployment.kind == "video" and VIDEO_PATH.match(path)
         if path not in ALLOWED_PATHS[deployment.kind] and not video:
             return JSONResponse(status_code=404, content={"error": "unsupported deployment endpoint"})
+        # mlx-lm lists the host's own model cache, under its paths; the
+        # deployment is its one model, by the name it is served under.
+        if deployment.mlx is not None and path == "models" and request.method == "GET":
+            return JSONResponse(content={"object": "list", "data": [{"id": deployment.served_model_name, "object": "model", "owned_by": "sovereign"}]})
         # Only a video, not its file or anything else, is deleted.
         if request.method == "DELETE" and not (video and not video.group(2)):
             return JSONResponse(status_code=405, content={"error": "method not allowed"})

@@ -79,6 +79,8 @@ def harness(tmp_path, monkeypatch):
         return child
 
     monkeypatch.setattr("lazarus.agent.server.subprocess.Popen", spawn)
+    # mlx-lm stands installed wherever the tests run, Linux included.
+    monkeypatch.setattr("lazarus.agent.server.mlx_engine", lambda: {"name": "mlx-lm", "version": "test"})
     # The port ledger is what is under test; whatever listens on this host
     # (a live appliance, another test) must not shift the ports it hands out.
     monkeypatch.setattr("lazarus.agent.deployments.port_available", lambda port: True, raising=False)
@@ -1786,6 +1788,7 @@ def test_an_mlx_deployment_runs_mlx_lm_over_its_verified_snapshot(harness):
         assert child.command == [
             sys.executable, "-m", "lazarus.agent.mlx_server", "--model", str(directory.resolve()),
             "--host", "127.0.0.1", "--port", "9110", "--max-tokens", "4096",
+            "--decode-concurrency", "4", "--prompt-cache-bytes", str(2 << 30),
             "--chat-template-args", '{"enable_thinking": false}',
         ]
         # The guard reads the key the agent gives every generation child.
@@ -1793,6 +1796,8 @@ def test_an_mlx_deployment_runs_mlx_lm_over_its_verified_snapshot(harness):
         answered = api.post("/deployments/assistant-second/v1/chat/completions", headers=harness.headers, json={"messages": []})
         assert answered.status_code == 200
         assert harness.inference[-1][2] == f"Bearer {child.env['LLAMA_API_KEY']}"
+        listed = api.get("/deployments/assistant-second/v1/models", headers=harness.headers).json()
+        assert [model["id"] for model in listed["data"]] == ["assistant-second"]
 
     restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
     assert restarted.config.deployments["assistant-second"].mlx.files == request["mlx"]["files"]
@@ -1827,6 +1832,24 @@ def test_an_mlx_snapshot_changed_on_disk_is_refused_at_restart(harness, caplog):
 def test_bad_mlx_requests_are_refused_before_any_process_starts(harness, bad):
     request, _ = mlx_request(harness)
     request.update(bad)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
+
+
+def test_an_mlx_snapshot_holding_more_than_its_pins_is_refused(harness):
+    request, directory = mlx_request(harness)
+    (directory / "model-00002.safetensors").write_bytes(b"left over")
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
+
+
+def test_an_mlx_deployment_is_refused_where_mlx_lm_is_not_installed(harness, monkeypatch):
+    monkeypatch.setattr("lazarus.agent.server.mlx_engine", lambda: None)
+    request, _ = mlx_request(harness)
     with TestClient(build_app(harness.agent)) as api:
         refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
     assert refused.status_code in (400, 422), refused.text

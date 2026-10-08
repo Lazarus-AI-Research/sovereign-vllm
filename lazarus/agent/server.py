@@ -296,6 +296,9 @@ class Agent:
         directory = self._resolve_managed_path(Path(artifact))
         if not directory.is_dir():
             raise ValueError("an MLX artifact must resolve to a snapshot directory within the managed model directory")
+        from lazarus.agent.deployments import snapshot_holds_its_pins
+
+        snapshot_holds_its_pins(directory, files)
         for name, expected in files.items():
             file = self._resolve_managed_path(Path(artifact) / name)
             if not file.is_file():
