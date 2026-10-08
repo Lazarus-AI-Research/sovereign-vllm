@@ -112,6 +112,9 @@ ENGINES = {
 # directory laid out as its profile list names them, and opens its port only
 # once the model is loaded, which for a large model takes many minutes.
 SLIMSERVE = "slimserve"
+# mlx-lm serves a language model from its MLX snapshot: a repository's
+# files, each pinned by its checksum, in one directory.
+MLX = "mlx-lm"
 SLIMSERVE_FILES = ("model", "projector", "drafter")
 SLIMSERVE_READY_TIMEOUT = 1800.0
 PROFILE_ID = r"^[a-z0-9][a-z0-9.-]{0,63}$"
@@ -186,6 +189,51 @@ class SlimServeProfile(BaseModel):
         return layout
 
 
+class MLXSnapshot(BaseModel):
+    """An MLX model's files by their path in its snapshot directory, each
+    with its sha256: its configuration, tokenizer and safetensors weights."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    files: dict[str, str]
+
+    @field_validator("files")
+    @classmethod
+    def pinned_files(cls, files: dict[str, str]) -> dict[str, str]:
+        from pathlib import PurePosixPath
+
+        for name, digest in files.items():
+            parts = PurePosixPath(name).parts
+            if not parts or name.startswith("/") or str(PurePosixPath(name)) != name or any(part in (".", "..") for part in parts):
+                raise ValueError("an MLX snapshot names each file by a canonical relative path")
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError("an MLX snapshot pins each file by its sha256")
+        if "config.json" not in files or not any(name.endswith(".safetensors") for name in files):
+            raise ValueError("an MLX snapshot holds its config.json and safetensors weights")
+        return {name: digest.lower() for name, digest in files.items()}
+
+    def digest(self) -> str:
+        """The snapshot's own checksum: its files' paths and checksums, in
+        order, as Control computes it."""
+        return hashlib.sha256("".join(f"{name}\t{self.files[name]}\n" for name in sorted(self.files)).encode()).hexdigest()
+
+
+# An MLX deployment is a language model served from its snapshot alone: no
+# projector, no components, no SlimServe profile, and no thinking budget,
+# which mlx-lm does not take.
+def mlx_options(kind: str, mlx: MLXSnapshot | None, slimserve, components: dict, projector: str | None, budget: int | None, sha256: str) -> None:
+    if mlx is None:
+        return
+    if kind != "generation":
+        raise ValueError("MLX serves language model deployments only")
+    if slimserve is not None or components or projector is not None:
+        raise ValueError("an MLX deployment is its snapshot alone")
+    if budget is not None:
+        raise ValueError("mlx-lm takes no thinking budget")
+    if sha256.lower() != mlx.digest():
+        raise ValueError("an MLX deployment's sha256 is its snapshot's own checksum")
+
+
 # A SlimServe deployment is a language model whose files are the weights, a
 # projector where the model reads images, and a drafter where the profile
 # speculates, each named in the layout exactly when it is given. Its thinking
@@ -253,6 +301,8 @@ class AgentDeployment(BaseModel):
     language: str | None = Field(default=None, pattern=LANGUAGE)
     # A language model SlimServe serves instead of llama-server.
     slimserve: SlimServeProfile | None = None
+    # A language model mlx-lm serves from its snapshot directory, model_path.
+    mlx: MLXSnapshot | None = None
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -296,6 +346,7 @@ class AgentDeployment(BaseModel):
             elif self.kind != "generation" and self.components:
                 raise ValueError("components apply to image, video, speech and SlimServe deployments only")
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj_path, self.thinking, self.thinking_budget)
+        mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj_path, self.thinking_budget, self.sha256)
         if self.kind == "transcription":
             self.language = self.language or "auto"
         elif self.language is not None:
@@ -413,6 +464,8 @@ class DeploymentRequest(BaseModel):
     text_encoder_type: Literal[TEXT_ENCODER_TYPES] | None = None
     language: str | None = Field(default=None, pattern=LANGUAGE)
     slimserve: SlimServeProfile | None = None
+    # The artifact is then the snapshot's directory.
+    mlx: MLXSnapshot | None = None
 
     @model_validator(mode="after")
     def projector_checksum(self):
@@ -432,6 +485,7 @@ class DeploymentRequest(BaseModel):
         elif self.kind != "generation" and self.components:
             raise ValueError("components apply to image, video, speech and SlimServe deployments only")
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj, self.thinking, self.thinking_budget)
+        mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
         if self.kind != "transcription" and self.language is not None:
             raise ValueError("language applies to transcription deployments only")
         return self
@@ -510,7 +564,26 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
 
 
 def engine_of(deployment: AgentDeployment) -> str:
+    if deployment.mlx is not None:
+        return MLX
     return SLIMSERVE if deployment.slimserve is not None else ENGINES[deployment.kind]
+
+
+# mlx-lm's server behind the agent's guard (lazarus.agent.mlx_server), in the
+# agent's own Python, which carries mlx-lm. Its thinking switch is passed
+# to the model's template as llama-server's is; a reply runs to the window
+# unless the caller asks for less.
+def mlx_command(deployment: AgentDeployment) -> list[str]:
+    command = [
+        sys.executable, "-m", "lazarus.agent.mlx_server",
+        "--model", deployment.model_path,
+        "--host", "127.0.0.1",
+        "--port", str(deployment.port),
+        "--max-tokens", str(deployment.context_length or LLAMA_DEFAULT_WINDOW),
+    ]
+    if deployment.thinking is not None:
+        command += ["--chat-template-args", json.dumps({"enable_thinking": deployment.thinking == "on"})]
+    return command
 
 
 # SlimServe finds a profile's files under its model directory by the paths
@@ -678,7 +751,7 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
     process = agent.deployments.get(deployment_id)
     running = process is not None and process.running()
     try:
-        model = agent.observed_model(deployment.model_path)
+        model = agent.observed_model(deployment.model_path, directory=deployment.mlx is not None)
     except (OSError, ValueError, TypeError, RuntimeError):
         return {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED", "kind": deployment.kind}
     admission = agent.deployment_admission.get(deployment_id)
@@ -753,6 +826,11 @@ def file_digest(path: str) -> str:
 def verify_deployment_files(deployment: AgentDeployment) -> None:
     """The bytes on disk are the bytes the record was made for. A weight
     overwritten since is refused, never loaded under the recorded revision."""
+    if deployment.mlx is not None:
+        for name, digest in deployment.mlx.files.items():
+            if file_digest(str(Path(deployment.model_path) / name)) != digest:
+                raise ValueError(f"{deployment.model_path}/{name} no longer matches its recorded checksum")
+        return
     if file_digest(deployment.model_path) != deployment.sha256.lower():
         raise ValueError(f"{deployment.model_path} no longer matches its recorded checksum")
     if deployment.mmproj_path and deployment.mmproj_sha256 and file_digest(deployment.mmproj_path) != deployment.mmproj_sha256.lower():
@@ -770,7 +848,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     if agent.stopping:
         raise RuntimeError("the agent is shutting down")
     deployment = record or agent.config.deployments[deployment_id]
-    agent.observed_model(deployment.model_path)
+    agent.observed_model(deployment.model_path, directory=deployment.mlx is not None)
     # A request's files were checked as it arrived; a restart from agent.yaml
     # checks them again, since the disk may have changed meanwhile.
     if verify:
@@ -779,6 +857,8 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         if not agent.config.slimserve:
             raise ValueError("SlimServe is not installed on this host")
         command = slimserve_command(agent, deployment, lay_out_slimserve(agent, deployment_id, deployment))
+    elif deployment.mlx is not None:
+        command = mlx_command(deployment)
     else:
         command = deployment_command(agent, deployment)
     return ServerProcess(
@@ -882,7 +962,10 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     if request.slimserve is not None and not agent.config.slimserve:
         raise ValueError("SlimServe is not installed on this host")
     suffixes = weight_suffixes(request.kind)
-    model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
+    if request.mlx is not None:
+        model = await asyncio.to_thread(agent.resolve_snapshot, request.artifact, request.mlx.files)
+    else:
+        model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
     if request.mmproj:
         mmproj = await asyncio.to_thread(agent.resolve_model, request.mmproj, request.mmproj_sha256, suffixes)
@@ -929,7 +1012,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
         upscale_sigmas=request.upscale_sigmas, text_encoder_type=request.text_encoder_type, language=request.language,
-        slimserve=request.slimserve,
+        slimserve=request.slimserve, mlx=request.mlx,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)

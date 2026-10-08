@@ -20,6 +20,9 @@ dependencies = [
     # The text-to-speech server a speech deployment runs on; its HTTP extra
     # is the server itself.
     "piper-tts[http]==1.8.0",
+    # The MLX language model server an MLX deployment runs on; Apple
+    # Silicon only, where the agent runs.
+    "mlx-lm==0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.optional-dependencies]

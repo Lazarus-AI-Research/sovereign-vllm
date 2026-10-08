@@ -1748,3 +1748,95 @@ def test_a_slimserve_deployment_takes_its_profiles_window_unless_it_names_one(ha
         too_wide = api.put("/agent/admin/deployments/assistant-fifth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fifth", context_length=2097152))
         assert too_wide.status_code == 422
     assert load_agent_config(harness.config_path).deployments["assistant-second"].context_length == 0
+
+
+def mlx_snapshot(harness):
+    """An MLX snapshot's files on disk under the managed directory, and their
+    checksums as a request pins them."""
+    directory = harness.models / "mlx-community--Second-4bit" / ("d" * 40)
+    directory.mkdir(parents=True)
+    files = {}
+    for name, contents in {"config.json": b'{"model_type": "qwen3"}', "model.safetensors": b"mlx weights", "tokenizer.json": b"{}"}.items():
+        (directory / name).write_bytes(contents)
+        files[name] = hashlib.sha256(contents).hexdigest()
+    return directory, files
+
+
+def mlx_request(harness, **overrides):
+    from lazarus.agent.deployments import MLXSnapshot
+
+    directory, files = mlx_snapshot(harness)
+    request = {
+        "kind": "generation", "artifact": f"metal/mlx-community--Second-4bit/{'d' * 40}",
+        "sha256": MLXSnapshot(files=files).digest(), "revision": "d" * 40,
+        "served_model_name": "assistant-second", "context_length": 4096, "thinking": "off",
+        "mlx": {"files": files},
+    }
+    request.update(overrides)
+    return request, directory
+
+
+def test_an_mlx_deployment_runs_mlx_lm_over_its_verified_snapshot(harness):
+    request, directory = mlx_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "mlx-lm"
+        child = harness.children[-1]
+        assert child.command == [
+            sys.executable, "-m", "lazarus.agent.mlx_server", "--model", str(directory.resolve()),
+            "--host", "127.0.0.1", "--port", "9110", "--max-tokens", "4096",
+            "--chat-template-args", '{"enable_thinking": false}',
+        ]
+        # The guard reads the key the agent gives every generation child.
+        assert child.env["LLAMA_API_KEY"]
+        answered = api.post("/deployments/assistant-second/v1/chat/completions", headers=harness.headers, json={"messages": []})
+        assert answered.status_code == 200
+        assert harness.inference[-1][2] == f"Bearer {child.env['LLAMA_API_KEY']}"
+
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    assert restarted.config.deployments["assistant-second"].mlx.files == request["mlx"]["files"]
+    restarted.start_deployments()
+    assert harness.children[-1].command[:3] == [sys.executable, "-m", "lazarus.agent.mlx_server"]
+
+
+def test_an_mlx_snapshot_changed_on_disk_is_refused_at_restart(harness, caplog):
+    request, directory = mlx_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request).status_code == 200
+    (directory / "model.safetensors").write_bytes(b"other weights")
+    spawned = len(harness.children)
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    restarted.start_deployments()
+    assert len(harness.children) == spawned
+    assert "no longer matches" in caplog.text
+
+
+@pytest.mark.parametrize("bad", [
+    # The snapshot's own checksum is not its files'.
+    {"sha256": "0" * 64},
+    # A file climbing out, one with no checksum, and no weights at all.
+    {"mlx": {"files": {"../config.json": "a" * 64, "model.safetensors": "b" * 64}}},
+    {"mlx": {"files": {"config.json": "short", "model.safetensors": "b" * 64}}},
+    {"mlx": {"files": {"config.json": "a" * 64}}},
+    # A snapshot alone: no projector, no SlimServe profile, no budget.
+    {"mmproj": "metal/second-mmproj.gguf", "mmproj_sha256": "c" * 64},
+    {"thinking": "on", "thinking_budget": 512},
+    {"kind": "embedding"},
+])
+def test_bad_mlx_requests_are_refused_before_any_process_starts(harness, bad):
+    request, _ = mlx_request(harness)
+    request.update(bad)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
+
+
+def test_an_mlx_snapshot_missing_a_file_is_refused(harness):
+    request, directory = mlx_request(harness)
+    (directory / "tokenizer.json").unlink()
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
