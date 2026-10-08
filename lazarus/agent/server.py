@@ -62,6 +62,20 @@ def slimserve_engine(command: str) -> dict | None:
     return {"name": "slimserve", "version": version, "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
 
 
+def mlx_engine() -> dict | None:
+    """mlx-lm where the agent's own Python carries it, as the distribution
+    built for Apple Silicon does."""
+    from importlib import metadata, util
+
+    if util.find_spec("mlx_lm") is None:
+        return None
+    try:
+        version = metadata.version("mlx-lm")
+    except metadata.PackageNotFoundError:
+        return None
+    return {"name": "mlx-lm", "version": version, "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
+
+
 class ServerProcess:
     """One llama-server child: started here, probed here, stopped here."""
 
@@ -170,6 +184,9 @@ class Agent:
         slimserve = slimserve_engine(self.config.slimserve)
         if slimserve is not None:
             self.available_engines.append(slimserve)
+        mlx = mlx_engine()
+        if mlx is not None:
+            self.available_engines.append(mlx)
         binary = self.config.llama_server
         if binary == "llama-server":
             binary = shutil.which(binary)
@@ -272,6 +289,28 @@ class Agent:
             raise ValueError("artifact checksum does not match sha256")
         return model
 
+    def resolve_snapshot(self, artifact: str, files: dict[str, str]) -> Path:
+        """An MLX snapshot's directory, every file in it the one pinned."""
+        if not valid_native_model_identity(f"/models/{artifact}"):
+            raise ValueError("artifact must use a bounded canonical relative native model path")
+        directory = self._resolve_managed_path(Path(artifact))
+        if not directory.is_dir():
+            raise ValueError("an MLX artifact must resolve to a snapshot directory within the managed model directory")
+        from lazarus.agent.deployments import snapshot_holds_its_pins
+
+        snapshot_holds_its_pins(directory, files)
+        for name, expected in files.items():
+            file = self._resolve_managed_path(Path(artifact) / name)
+            if not file.is_file():
+                raise ValueError(f"{name} is not in the snapshot")
+            digest = hashlib.sha256()
+            with file.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected.lower():
+                raise ValueError(f"{name} does not match its sha256")
+        return directory
+
     def _resolve_managed_path(self, relative: Path) -> Path:
         current = self.model_root
         for component in relative.parts:
@@ -283,8 +322,9 @@ class Agent:
             raise ValueError("model must use its exact managed local path")
         return resolved
 
-    def observed_model(self, model_path: str) -> str:
-        """Project an actual native loader input, never an intended model alias."""
+    def observed_model(self, model_path: str, directory: bool = False) -> str:
+        """Project an actual native loader input, never an intended model
+        alias: a weight file, or an MLX snapshot's directory."""
         path = Path(model_path)
         if not path.is_absolute() or str(path) != model_path or ".." in path.parts:
             raise ValueError("observed model must use a canonical absolute path")
@@ -292,8 +332,9 @@ class Agent:
         identity = f"/models/{relative.as_posix()}"
         if not valid_native_model_identity(identity):
             raise ValueError("native model identity must use at most 512 UTF-8 bytes and canonical path components")
-        if not self._resolve_managed_path(relative).is_file():
-            raise ValueError("observed model must be a managed local file")
+        resolved = self._resolve_managed_path(relative)
+        if not (resolved.is_dir() if directory else resolved.is_file()):
+            raise ValueError("observed model must be a managed local file, or an MLX snapshot's directory")
         return identity
 
     async def wait_embedding_ready(self, process: ServerProcess, timeout: float = 120) -> None:

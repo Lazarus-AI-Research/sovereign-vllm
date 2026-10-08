@@ -12,6 +12,9 @@ third-party components. Their own license terms continue to apply.
   as its own program in the Metal distribution's environment and run as a
   separate process for speech deployments; it bundles espeak-ng, GPL-3.0)
 - ONNX Runtime — MIT License — <https://github.com/microsoft/onnxruntime>
+- MLX and mlx-lm — MIT License — <https://github.com/ml-explore/mlx>,
+  <https://github.com/ml-explore/mlx-lm> (installed in the Metal distribution's
+  environment; mlx-lm's server runs as a separate process for MLX deployments)
 - CPython — Python Software Foundation License — <https://www.python.org/psf/license/>
 - uv — Apache License 2.0 or MIT License — <https://github.com/astral-sh/uv>
 
