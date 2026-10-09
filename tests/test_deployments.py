@@ -1729,7 +1729,8 @@ def test_a_recorded_slimserve_deployment_without_slimserve_does_not_stop_the_age
 
 
 # A SlimServe deployment that names no window is served with its profile's
-# own; llama-server keeps its default and its limit.
+# own, and a language model on llama-server with its model's own, for one
+# request; the limit stays.
 def test_a_slimserve_deployment_takes_its_profiles_window_unless_it_names_one(harness):
     harness.agent.config.slimserve = "/opt/slimserve/bin/slimserve"
     with TestClient(build_app(harness.agent)) as api:
@@ -1742,7 +1743,7 @@ def test_a_slimserve_deployment_takes_its_profiles_window_unless_it_names_one(ha
         del request["context_length"]
         assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request).status_code == 200
         command = harness.children[-1].command
-        assert command[command.index("-c") + 1] == "8192"
+        assert command[command.index("-c") + 1] == "0" and command[command.index("-np") + 1] == "1"
         # A model's own long window is served; one beyond a million tokens is not.
         wide = api.put("/agent/admin/deployments/assistant-fourth", headers=harness.headers, json=second_request(harness, served_model_name="assistant-fourth", context_length=262144))
         assert wide.status_code == 200
@@ -1863,3 +1864,23 @@ def test_an_mlx_snapshot_missing_a_file_is_refused(harness):
         refused = api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request)
     assert refused.status_code in (400, 422), refused.text
     assert harness.children == []
+
+
+# A language model's requests share one pool of its window times the
+# requests, as many at once as the pool holds at the full window, with no
+# copy of idle prompts kept beside it; only such a model takes requests.
+def test_a_language_models_requests_share_one_pool(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        request = second_request(harness, context_length=131072)
+        request["requests"] = 4
+        assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=request).status_code == 200
+        command = harness.children[-1].command
+        assert command[command.index("-np") + 1] == "4" and "--kv-unified" in command
+        assert command[command.index("-c") + 1] == "524288" and command[command.index("--kv-unified-per-slot") + 1] == "131072"
+        assert command[command.index("--cache-ram") + 1] == "0"
+        assert harness.agent.config.deployments["assistant-second"].requests == 4
+        listed = api.get("/agent/deployments", headers=harness.headers).json()
+        assert listed["deployments"]["assistant-second"]["requests"] == 4
+        request["requests"] = 257
+        assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request).status_code == 422
+    assert load_agent_config(harness.config_path).deployments["assistant-second"].requests == 4

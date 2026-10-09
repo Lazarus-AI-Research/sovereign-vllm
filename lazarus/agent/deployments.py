@@ -124,6 +124,9 @@ PROFILE_QUANT = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
 # each deployment's window to its model and memory.
 LLAMA_WINDOW_LIMIT = 1048576
 LLAMA_DEFAULT_WINDOW = 8192
+# The most requests llama-server runs at once: it holds at most 256
+# sequences.
+LLAMA_MAX_REQUESTS = 256
 SLIMSERVE_WINDOW_LIMIT = 1048576
 
 
@@ -269,9 +272,12 @@ class AgentDeployment(BaseModel):
     sha256: str
     port: int = Field(ge=1, le=65535)
     served_model_name: str
-    # Zero for a model with no window, and for a SlimServe deployment served
-    # with its profile's own.
+    # Zero for a model with no window, for a language model served with its
+    # own, and for a SlimServe deployment served with its profile's own.
     context_length: int = Field(default=0, ge=0, le=SLIMSERVE_WINDOW_LIMIT)
+    # How many requests at the full window a language model llama-server
+    # serves holds at once.
+    requests: int = Field(default=1, ge=1, le=LLAMA_MAX_REQUESTS)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     # Whether a language model thinks before it answers, and for how many
@@ -361,16 +367,19 @@ class AgentDeployment(BaseModel):
 
 
 def llama_window(kind: str, window: int) -> None:
+    if kind == "generation" and window == 0:
+        return
     if kind not in NO_CONTEXT and not 128 <= window <= LLAMA_WINDOW_LIMIT:
         raise ValueError(f"a llama-server deployment's window is between 128 and {LLAMA_WINDOW_LIMIT} tokens")
 
 
-# The window a request is served with: the one it names, or llama-server's
-# default; a SlimServe profile's own when it names none.
+# The window a request is served with: the one it names; when it names none,
+# a language model's own, a SlimServe profile's own, and llama-server's
+# default for an embedding model.
 def request_window(request: DeploymentRequest) -> int:
     if request.context_length is not None:
         return request.context_length
-    return 0 if request.slimserve is not None else LLAMA_DEFAULT_WINDOW
+    return 0 if request.kind == "generation" else LLAMA_DEFAULT_WINDOW
 
 
 def video_options(kind: str, flow_shift, fps, seconds, size) -> None:
@@ -448,8 +457,12 @@ class DeploymentRequest(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     mmproj_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
     served_model_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-    # Unset is 8192 for llama-server, and a SlimServe profile's own window.
+    # Unset is a language model's own window, a SlimServe profile's own, and
+    # 8192 for an embedding model.
     context_length: int | None = Field(default=None, ge=128, le=SLIMSERVE_WINDOW_LIMIT)
+    # How many requests at the full window a language model's memory holds
+    # at once, which llama-server runs at most; unset is one.
+    requests: int | None = Field(default=None, ge=1, le=LLAMA_MAX_REQUESTS)
     pooling: Literal["mean", "last", "cls"] | None = None
     normalization: Literal["l2", "none"] | None = None
     thinking: Literal["on", "off"] | None = None
@@ -488,6 +501,8 @@ class DeploymentRequest(BaseModel):
             raise ValueError("components apply to image, video, speech and SlimServe deployments only")
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj, self.thinking, self.thinking_budget)
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
+        if self.requests is not None and (self.kind != "generation" or self.slimserve is not None or self.mlx is not None):
+            raise ValueError("requests apply to a language model llama-server serves")
         if self.kind != "transcription" and self.language is not None:
             raise ValueError("language applies to transcription deployments only")
         return self
@@ -556,13 +571,29 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
     ]
     if deployment.mmproj_path:
         command += ["--mmproj", deployment.mmproj_path]
-    command += ["-c", str(deployment.context_length)]
-    if deployment.kind == "embedding":
-        # An embedding model reads each input whole in one batch, so a batch
-        # as large as the window takes any input the window does: a recording
-        # or an image runs to hundreds of tokens, past the default 512.
-        command += ["-b", str(deployment.context_length), "-ub", str(deployment.context_length)]
-    return command
+    if deployment.kind == "generation":
+        return command + generation_requests(deployment)
+    # An embedding model reads each input whole in one batch, so a batch as
+    # large as the window takes any input the window does: a recording or an
+    # image runs to hundreds of tokens, past the default 512.
+    window = str(deployment.context_length)
+    return command + ["-c", window, "-b", window, "-ub", window]
+
+
+# A language model's requests share one pool of the window times the
+# requests, and run no more at once than it holds at the full window, since
+# a pool that fills fails every request running. The prompts idle requests
+# leave in the pool are what a returning conversation reuses, and the pool
+# frees them as it needs the room, so no copy is kept in memory beside it.
+# Without a window the model's own is the pool, for one request.
+def generation_requests(deployment: AgentDeployment) -> list[str]:
+    if deployment.context_length == 0:
+        return ["-np", "1", "--kv-unified", "--cache-ram", "0", "-c", "0"]
+    window = deployment.context_length
+    return [
+        "-np", str(deployment.requests), "--kv-unified", "--cache-ram", "0",
+        "-c", str(window * deployment.requests), "--kv-unified-per-slot", str(window),
+    ]
 
 
 def engine_of(deployment: AgentDeployment) -> str:
@@ -785,6 +816,7 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "port": deployment.port,
         "served_model_name": deployment.served_model_name,
         "context_length": deployment.context_length,
+        "requests": deployment.requests,
         "thinking": deployment.thinking,
         "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
@@ -1052,6 +1084,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         port=port,
         served_model_name=request.served_model_name,
         context_length=0 if request.kind in NO_CONTEXT else request_window(request),
+        requests=request.requests or 1,
         pooling=request.pooling, normalization=request.normalization,
         thinking=request.thinking, thinking_budget=request.thinking_budget,
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
