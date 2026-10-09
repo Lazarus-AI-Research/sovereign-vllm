@@ -35,6 +35,17 @@ def fake_mlx(monkeypatch):
         def do_POST(self):
             calls.answered.append("POST")
 
+        # mlx-lm 0.32.0's own order; a whole answer's token counts come
+        # positionally, and whether it streams is the handler's.
+        def generate_response(self, text, finish_reason, prompt_token_count=None, completion_token_count=None,
+                              prompt_cache_count=None, token_logprobs=None, top_tokens=None, tokens=None,
+                              tool_calls=None, reasoning_text=None):
+            key = "delta" if self.stream else "message"
+            part = {"role": "assistant", "content": text}
+            if reasoning_text:
+                part["reasoning"] = reasoning_text
+            return {"choices": [{"index": 0, key: part, "finish_reason": finish_reason}]}
+
     class ModelProvider:
         def __init__(self):
             self.model = None
@@ -108,3 +119,16 @@ def test_the_server_refuses_to_start_without_a_key(fake_mlx, monkeypatch):
     with pytest.raises(SystemExit):
         mlx_server.main()
     assert not fake_mlx.calls.started
+
+
+def test_thinking_is_answered_as_reasoning_content(fake_mlx, monkeypatch):
+    monkeypatch.setenv("LLAMA_API_KEY", "child-key")
+    mlx_server.main()
+    handler = fake_mlx.server.APIHandler("Bearer child-key")
+    handler.stream = False
+    part = handler.generate_response("no", "stop", 12, 3, 0, reasoning_text="91 is 7 times 13")["choices"][0]["message"]
+    assert part == {"role": "assistant", "content": "no", "reasoning_content": "91 is 7 times 13"}
+    assert "reasoning_content" not in handler.generate_response("hi", "stop", 12, 1, 0)["choices"][0]["message"]
+    handler.stream = True
+    part = handler.generate_response("", None, reasoning_text="91 is")["choices"][0]["delta"]
+    assert part == {"role": "assistant", "content": "", "reasoning_content": "91 is"}

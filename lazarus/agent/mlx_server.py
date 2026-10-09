@@ -7,8 +7,10 @@ answers its health route while it is still loading the model, so all three
 are closed here before it starts: a request without the key the agent gave
 this child is refused; every request is served by the model on the command
 line; and the health route waits for the model, while a model that cannot
-load ends the process, so the agent sees the failure at once. The weights
-are on disk already; nothing is downloaded."""
+load ends the process, so the agent sees the failure at once. A model's
+thinking is answered as reasoning_content, as vLLM and llama.cpp answer it,
+where mlx-lm names it reasoning, a field the gateway does not carry. The
+weights are on disk already; nothing is downloaded."""
 
 from __future__ import annotations
 
@@ -61,6 +63,17 @@ def main() -> None:
             os._exit(1)
 
     server.ResponseGenerator._generate = generate_or_end
+    respond = server.APIHandler.generate_response
+
+    def with_reasoning_content(self, *arguments, **options):
+        response = respond(self, *arguments, **options)
+        for choice in response.get("choices", []):
+            for part in (choice.get("message"), choice.get("delta")):
+                if isinstance(part, dict) and "reasoning" in part:
+                    part["reasoning_content"] = part.pop("reasoning")
+        return response
+
+    server.APIHandler.generate_response = with_reasoning_content
     server.main()
 
 
