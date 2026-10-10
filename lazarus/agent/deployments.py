@@ -761,7 +761,8 @@ def port_available(port: int) -> bool:
     return True
 
 
-def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool) -> dict:
+def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, healthy: bool, memory: tuple[int, int] | None = None) -> dict:
+    """memory is what memory_of read for it, off the event loop."""
     process = agent.deployments.get(deployment_id)
     running = process is not None and process.running()
     try:
@@ -788,8 +789,18 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
         "thinking_budget": deployment.thinking_budget,
         "revision": deployment.revision,
         "engine": engine_of(deployment),
-        "memory_bytes": process.memory_bytes() if running else None,
+        "memory_bytes": memory[0] if running and memory else None,
+        "weights_bytes": memory[1] if running and memory else None,
     }
+
+
+async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
+    """What the deployment's process holds; read in a thread, since walking
+    a process's mapped regions takes a while."""
+    process = agent.deployments.get(deployment_id)
+    if process is None:
+        return None
+    return await asyncio.to_thread(process.memory_held)
 
 
 async def observe_deployments(agent: Agent) -> dict[str, dict]:
@@ -805,12 +816,13 @@ async def observe_deployments(agent: Agent) -> dict[str, dict]:
             return False
 
     healthy = await asyncio.gather(*(probe(deployment_id) for deployment_id, _ in snapshot))
+    memories = await asyncio.gather(*(memory_of(agent, deployment_id) for deployment_id, _ in snapshot))
     result = {}
-    for (deployment_id, deployment), is_healthy in zip(snapshot, healthy):
+    for (deployment_id, deployment), is_healthy, memory in zip(snapshot, healthy, memories):
         # A deployment removed while it was being probed is not reported.
         if agent.config.deployments.get(deployment_id) is not deployment:
             continue
-        result[deployment_id] = status_of(agent, deployment_id, deployment, is_healthy)
+        result[deployment_id] = status_of(agent, deployment_id, deployment, is_healthy, memory)
     return result
 
 
@@ -894,7 +906,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         deployment_id, command, deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
         authenticated=deployment.kind == "generation", environment=deployment_environment(deployment),
-        health_path=HEALTH_PATHS[deployment.kind], engine=engine_of(deployment),
+        health_path=HEALTH_PATHS[deployment.kind], engine=engine_of(deployment), weights_root=agent.model_root,
     )
 
 
@@ -1115,7 +1127,8 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
             "rolled_back": rolled_back, "rollback_verified": rolled_back, "rollback_error": rollback_error,
         }
     agent.deployment_admission[deployment_id].paused = False
-    return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, candidate, True)}
+    memory = await memory_of(agent, deployment_id)
+    return {"status": "healthy", "id": deployment_id, **status_of(agent, deployment_id, candidate, True, memory)}
 
 
 class PersistenceError(RuntimeError):
