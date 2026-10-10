@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from lazarus.agent import log_level
 
+from lazarus.agent.queueing import Queueing
+
 if TYPE_CHECKING:
     from lazarus.agent.server import Agent, ServerProcess
 
@@ -54,6 +56,8 @@ ALLOWED_PATHS = {
 # What llama-server tells about its own work, read through the agent: its
 # Prometheus metrics and its slots, each a request's place in the pool.
 ENGINE_PATHS = {"metrics", "slots"}
+# The requests that take one of a language model's places.
+ANSWER_PATHS = {"chat/completions", "completions"}
 VIDEO_PATH = re.compile(r"^videos/(video_[A-Za-z0-9_-]{1,256})(/content)?$")
 KINDS = tuple(ALLOWED_PATHS)
 # The kinds served without a context window: a diffusion, transcription or
@@ -834,7 +838,18 @@ def status_of(
         "weights_bytes": memory[1] if running and memory else None,
         "requests_running": load[0] if running and load else None,
         "requests_waiting": load[1] if running and load else None,
+        **queued_of(agent, deployment_id, deployment),
     }
+
+
+def queued_of(agent: Agent, deployment_id: str, deployment: AgentDeployment) -> dict:
+    """The requests that waited for a place in the last day, and the longest
+    wait, for a language model whose places the agent knows."""
+    if places_of(deployment) is None:
+        return {}
+    queueing = agent.deployment_queueing.get(deployment_id)
+    queued, longest = queueing.last_day() if queueing else (0, 0)
+    return {"queued_last_day": queued, "longest_wait_ms_last_day": longest}
 
 
 async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
@@ -844,6 +859,16 @@ async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
     if process is None:
         return None
     return await asyncio.to_thread(process.memory_held)
+
+
+def places_of(deployment: AgentDeployment) -> int | None:
+    """How many requests the language model's engine runs at once, where the
+    agent knows: llama-server's slots, or mlx-lm's one."""
+    if deployment.mlx is not None:
+        return MLX_CONCURRENCY
+    if engine_serves_metrics(deployment):
+        return deployment.requests if deployment.context_length else 1
+    return None
 
 
 def engine_serves_metrics(deployment: AgentDeployment) -> bool:
@@ -1197,6 +1222,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
             await stop_deployment(agent, deployment_id)
             if previous is None:
                 agent.deployment_admission.pop(deployment_id, None)
+                agent.deployment_queueing.pop(deployment_id, None)
             else:
                 await asyncio.to_thread(verify_deployment_files, previous)
                 restored = start_deployment(agent, deployment_id, record=previous)
@@ -1256,6 +1282,7 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
                 agent.config.deployments = {**agent.config.deployments, deployment_id: previous}
                 raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
         agent.deployment_admission.pop(deployment_id, None)
+        agent.deployment_queueing.pop(deployment_id, None)
         return {"status": "stopped", "id": deployment_id}
 
 
@@ -1509,15 +1536,24 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         except (UnicodeError, ValueError) as exc:
             await client.aclose()
             return JSONResponse(status_code=400, content={"error": f"request could not be forwarded: {exc}"})
+        places = places_of(deployment) if path in ANSWER_PATHS else None
+        queueing = agent.deployment_queueing.setdefault(deployment_id, Queueing()) if places else None
+        ticket = queueing.arrive(places) if queueing else None
+
+        def release():
+            admission.leave()
+            if queueing:
+                queueing.leave(ticket)
+
         admission.enter()
         try:
             response = await client.send(upstream, stream=True)
         except httpx.HTTPError:
-            admission.leave()
+            release()
             await client.aclose()
             return JSONResponse(status_code=503, content={"error": "deployment engine unavailable"})
         except BaseException:
-            admission.leave()
+            release()
             await client.aclose()
             raise
 
@@ -1533,7 +1569,7 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
                 await response.aclose()
                 await client.aclose()
             finally:
-                admission.leave()
+                release()
 
         from lazarus.agent.server import RelayedResponse
 

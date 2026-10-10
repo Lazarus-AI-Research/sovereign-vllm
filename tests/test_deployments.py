@@ -199,6 +199,8 @@ def test_deployment_is_its_own_process_on_its_own_port_and_is_persisted(harness)
         assert metrics.status_code == 200 and "llamacpp:requests_deferred 2" in metrics.text
         assert api.get("/deployments/assistant-second/slots", headers=harness.headers).json() == [{"id": 0, "is_processing": True}]
         assert api.get("/deployments/assistant-second/props", headers=harness.headers).status_code == 404
+        # Nothing has waited for a place yet.
+        assert (listed["assistant-second"]["queued_last_day"], listed["assistant-second"]["longest_wait_ms_last_day"]) == (0, 0)
         manifest = api.get("/agent/manifest", headers=harness.headers).json()
         assert "assistant-second" in manifest["deployments"] and "roles" not in manifest
 
