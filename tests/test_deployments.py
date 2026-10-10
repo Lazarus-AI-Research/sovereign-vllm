@@ -103,6 +103,11 @@ def harness(tmp_path, monkeypatch):
             return answer({"status": "ok"})
         if request.url.path == "/v1/models" and request.method == "GET":
             return answer({"data": [{"id": "served", "object": "model"}]})
+        if request.url.path == "/metrics" and request.method == "GET":
+            return httpx.Response(200, content=b"# TYPE llamacpp:requests_processing gauge\nllamacpp:requests_processing 3\n# TYPE llamacpp:requests_deferred gauge\nllamacpp:requests_deferred 2\n",
+                                  headers={"content-type": "text/plain; version=0.0.4"})
+        if request.url.path == "/slots" and request.method == "GET":
+            return answer([{"id": 0, "is_processing": True}])
         if request.url.path == "/voices" and request.method == "GET":
             return answer({"en_US-ljspeech-medium": {}})
         if request.url.path.startswith("/sdcpp/v1/jobs/") and request.method == "GET":
@@ -181,13 +186,21 @@ def test_deployment_is_its_own_process_on_its_own_port_and_is_persisted(harness)
         child = harness.children[-1]
         assert child.port == 9110 and child.command[child.command.index("-c") + 1] == "4096"
         assert child.command[child.command.index("--alias") + 1] == "assistant-second"
-        assert "--jinja" in child.command and "--mmproj" in child.command and "--metrics" not in child.command
+        assert "--jinja" in child.command and "--mmproj" in child.command and "--metrics" in child.command
         assert child.env["LLAMA_API_KEY"].endswith("-agent")
 
         listed = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]
         assert listed["assistant-second"]["served_model_name"] == "assistant-second"
         assert listed["assistant-second"]["status"] == "healthy"
         assert listed["assistant-second"]["memory_bytes"] > 0
+        # How many it runs and how many wait, as llama-server counts them.
+        assert (listed["assistant-second"]["requests_running"], listed["assistant-second"]["requests_waiting"]) == (3, 2)
+        metrics = api.get("/deployments/assistant-second/metrics", headers=harness.headers)
+        assert metrics.status_code == 200 and "llamacpp:requests_deferred 2" in metrics.text
+        assert api.get("/deployments/assistant-second/slots", headers=harness.headers).json() == [{"id": 0, "is_processing": True}]
+        assert api.get("/deployments/assistant-second/props", headers=harness.headers).status_code == 404
+        # Nothing has waited for a place yet.
+        assert (listed["assistant-second"]["queued_last_day"], listed["assistant-second"]["longest_wait_ms_last_day"]) == (0, 0)
         manifest = api.get("/agent/manifest", headers=harness.headers).json()
         assert "assistant-second" in manifest["deployments"] and "roles" not in manifest
 
@@ -1889,3 +1902,11 @@ def test_a_language_models_requests_share_one_pool(harness):
         refused = api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request)
         assert refused.status_code == 422 and "context_length" in refused.text
     assert load_agent_config(harness.config_path).deployments["assistant-second"].requests == 4
+
+
+def test_a_metrics_page_without_both_counts_says_nothing():
+    from lazarus.agent.deployments import parse_load
+
+    assert parse_load("llamacpp:requests_processing 1\nllamacpp:requests_deferred 0\n") == (1, 0)
+    assert parse_load("llamacpp:requests_processing 1\n") is None
+    assert parse_load("llamacpp:requests_processing x\nllamacpp:requests_deferred 0\n") is None
