@@ -510,6 +510,8 @@ class DeploymentRequest(BaseModel):
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
         if self.requests is not None and (self.kind != "generation" or self.slimserve is not None or self.mlx is not None):
             raise ValueError("requests apply to a language model llama-server serves")
+        if self.requests is not None and self.requests > 1 and self.context_length is None:
+            raise ValueError("more than one request needs a context_length: the model's own window is served for one")
         if self.kind != "transcription" and self.language is not None:
             raise ValueError("language applies to transcription deployments only")
         return self
@@ -853,8 +855,8 @@ def queued_of(agent: Agent, deployment_id: str, deployment: AgentDeployment) -> 
 
 
 async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
-    """What the deployment's process holds; read in a thread, since asking
-    the kernel which of a large model's pages are in memory takes a while."""
+    """What the deployment's process holds; read in a thread, since walking
+    a process's mapped regions takes a while."""
     process = agent.deployments.get(deployment_id)
     if process is None:
         return None

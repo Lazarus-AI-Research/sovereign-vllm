@@ -4,7 +4,8 @@ import sys
 
 import pytest
 
-from lazarus.agent.memory import memory_bytes
+from lazarus.agent import memory
+from lazarus.agent.memory import memory_bytes, memory_held
 
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="the host counts memory only on macOS and Linux")
@@ -52,3 +53,47 @@ def test_the_weights_a_process_maps_from_the_models_directory_count_as_its_own(t
         assert elsewhere - alone < 8 * 1024 * 1024
     finally:
         child.kill()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="only macOS leaves mapped weights out of a process's footprint")
+def test_mapped_weights_count_at_the_size_mapped_not_the_pages_in_memory_now(tmp_path):
+    # A sparse file mapped and never read: none of its pages is in memory,
+    # as for experts not yet used, yet the model holds all of it when warm.
+    whole = tmp_path / "models" / "whole.gguf"
+    part = tmp_path / "models" / "part.gguf"
+    whole.parent.mkdir()
+    for file in (whole, part):
+        with open(file, "wb") as handle:
+            handle.truncate(64 * 1024 * 1024)
+    code = (
+        "import mmap, sys, time; w = open(sys.argv[1], 'rb'); p = open(sys.argv[2], 'rb'); "
+        "a = mmap.mmap(w.fileno(), 0, prot=mmap.PROT_READ); b = mmap.mmap(w.fileno(), 0, prot=mmap.PROT_READ); "
+        "c = mmap.mmap(p.fileno(), 16 * 1024 * 1024, prot=mmap.PROT_READ, offset=16 * 1024 * 1024); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code, str(whole), str(part)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        _, weights = memory_held(child.pid, tmp_path / "models")
+        # The whole file mapped twice counts once; of the other, the 16 MiB mapped.
+        assert weights == 80 * 1024 * 1024
+    finally:
+        child.kill()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="only macOS walks a process's mapped weights")
+def test_a_process_that_maps_no_weights_is_not_walked_again_on_every_look(tmp_path, monkeypatch):
+    memory._mapped_weights.clear()
+    memory_held(os.getpid(), tmp_path)
+    assert [weights for (pid, _, _), (_, weights) in memory._mapped_weights.items() if pid == os.getpid()] == [{}]
+    library = memory._libproc()
+    monkeypatch.setattr(memory, "_libproc", lambda: library)
+    monkeypatch.setattr(library, "proc_pidinfo", lambda *arguments: pytest.fail("walked again"))
+    memory_held(os.getpid(), tmp_path)
+    # One still loading maps its weights later, so it is walked again in time.
+    monkeypatch.setattr(memory, "_UNMAPPED_RECHECK_SECONDS", 0.0)
+    with pytest.raises(pytest.fail.Exception):
+        memory_held(os.getpid(), tmp_path)
+
+def test_stretches_of_a_file_mapped_twice_count_once():
+    assert memory._covered_bytes([(0, 10), (5, 20), (30, 40), (32, 35)]) == 30
