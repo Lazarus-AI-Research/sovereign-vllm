@@ -827,8 +827,8 @@ def status_of(agent: Agent, deployment_id: str, deployment: AgentDeployment, hea
 
 
 async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
-    """What the deployment's process holds; read in a thread, since asking
-    the kernel which of a large model's pages are in memory takes a while."""
+    """What the deployment's process holds; read in a thread, since walking
+    a process's mapped regions takes a while."""
     process = agent.deployments.get(deployment_id)
     if process is None:
         return None
