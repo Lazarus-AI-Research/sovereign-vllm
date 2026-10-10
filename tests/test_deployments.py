@@ -1883,4 +1883,9 @@ def test_a_language_models_requests_share_one_pool(harness):
         assert listed["deployments"]["assistant-second"]["requests"] == 4
         request["requests"] = 257
         assert api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request).status_code == 422
+        # The model's own window is served for one request only.
+        del request["context_length"]
+        request["requests"] = 2
+        refused = api.put("/agent/admin/deployments/assistant-third", headers=harness.headers, json=request)
+        assert refused.status_code == 422 and "context_length" in refused.text
     assert load_agent_config(harness.config_path).deployments["assistant-second"].requests == 4
