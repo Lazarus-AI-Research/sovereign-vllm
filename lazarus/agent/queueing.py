@@ -25,13 +25,13 @@ class Ticket:
     waiting for a place and how long it waited for one, the hour it was
     counted as queued in, and the process it came to."""
 
-    __slots__ = ("arrived", "waiting", "waited_ms", "hour", "process")
+    __slots__ = ("arrived", "waiting", "waited_ms", "counted", "process")
 
     def __init__(self, arrived: float, waiting: bool, process: int) -> None:
         self.arrived = arrived
         self.waiting = waiting
         self.waited_ms = 0
-        self.hour: int | None = None
+        self.counted: list[int] | None = None
         self.process = process
 
 
@@ -65,9 +65,8 @@ class Queueing:
         self.in_flight += 1
         if ticket.waiting:
             self.waiting.append(ticket)
-            bucket = self._hour()
-            bucket[1] += 1
-            ticket.hour = bucket[0]
+            ticket.counted = self._hour()
+            ticket.counted[1] += 1
         return ticket
 
     def leave(self, ticket: Ticket, refused: bool = False) -> None:
@@ -81,17 +80,18 @@ class Queueing:
             self.waiting.remove(ticket)
             if refused:
                 ticket.waiting = False
-                for bucket in self.hours:
-                    if bucket[0] == ticket.hour:
-                        bucket[1] -= 1
+                if any(bucket is ticket.counted for bucket in self.hours):
+                    ticket.counted[1] -= 1
             else:
                 self._waited(ticket)
         elif self.waiting:
             self._waited(self.waiting.popleft())
 
-    def waited_ms(self, ticket: Ticket) -> int:
-        """How long the request waited for its place, or has waited so far."""
-        return int((self.clock() - ticket.arrived) * 1000) if ticket.waiting else ticket.waited_ms
+    def waited_ms(self, ticket: Ticket) -> int | None:
+        """How long the request waited for its place; None while it waits
+        still, as an engine may answer before it has one (mlx-lm queues a
+        request it has already begun answering)."""
+        return None if ticket.waiting else ticket.waited_ms
 
     def restart(self) -> None:
         """A new process serves the deployment: the requests the last one

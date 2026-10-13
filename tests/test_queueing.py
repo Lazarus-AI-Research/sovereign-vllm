@@ -116,7 +116,26 @@ def test_a_request_knows_how_long_it_waited_for_its_place():
     late = queueing.arrive(1)
     assert queueing.waited_ms(held) == 0
     clock.now = 1.5
-    assert queueing.waited_ms(late) == 1500
+    # Waiting still: not known yet.
+    assert queueing.waited_ms(late) is None
     queueing.leave(held)
     clock.now = 4.0
     assert queueing.waited_ms(late) == 1500
+
+
+def test_a_refused_request_is_taken_off_only_the_hour_it_was_counted_in():
+    clock, wall = Clock(), Clock()
+    queueing = Queueing(clock=clock, wall=wall)
+    wall.now = 3600.0
+    held = queueing.arrive(1)
+    queueing.leave(queueing.arrive(1))
+    queueing.leave(held)
+    # The wall clock steps back across the hour: a second bucket of the
+    # same hour behind the first.
+    wall.now = 3599.0
+    queueing.arrive(1)
+    wall.now = 3600.0
+    held = queueing.arrive(1)
+    refused = queueing.arrive(1)
+    queueing.leave(refused, refused=True)
+    assert queueing.last_day()[0] == 2

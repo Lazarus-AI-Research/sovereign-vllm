@@ -1580,10 +1580,11 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
 
         from lazarus.agent.server import RelayedResponse
 
-        # An engine answers once the request has its place, so how long it
-        # waited for one is known here, as the engine does not say it.
+        # How long it waited for its place is known here, as the engine does
+        # not say it; said only once the wait is over.
+        waited = queueing.waited_ms(ticket) if queueing else None
         return RelayedResponse(
             relay(), cleanup=cleanup, status_code=response.status_code,
             media_type=response.headers.get("content-type"),
-            headers={QUEUE_HEADER: str(queueing.waited_ms(ticket))} if queueing else None,
+            headers={QUEUE_HEADER: str(waited)} if waited is not None else None,
         )
