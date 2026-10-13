@@ -21,6 +21,10 @@ env:
   # whisper.cpp serves transcription deployments; no macOS binary is
   # published, so its server is built from the pinned source tarball.
   WHISPER_VERSION: v1.9.4
+  # embeddinggemma.c serves EmbeddingGemma 2 deployments; built from this
+  # commit (the Metal 3 route of QuixiAI/embeddinggemma.c#5), with both of its
+  # Metal libraries embedded in the one binary.
+  EMBEDDINGGEMMA_COMMIT: d304eb0a12e0f2749945499c60f33a4d1b99a359
   WHISPER_SHA256: 57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae
   UV_VERSION: 0.11.28
   PYTHON_VERSION: 3.12.11
@@ -148,6 +152,17 @@ jobs:
             -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build whisper-build --target whisper-server -j "$(sysctl -n hw.ncpu)"
           cp whisper-build/bin/whisper-server stage/bin/whisper-server
+          git init -q embeddinggemma-src
+          git -C embeddinggemma-src fetch -q --depth 1 https://github.com/QuixiAI/embeddinggemma.c "$EMBEDDINGGEMMA_COMMIT"
+          git -C embeddinggemma-src checkout -q FETCH_HEAD
+          # Its Metal 4 kernels need the Xcode 26 toolchain, given to this build
+          # alone so the other engines keep the runner's; the binary targets
+          # macOS 14 (its Makefile's MACOSX_DEPLOYMENT_TARGET).
+          XCODE26="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          test -n "$XCODE26"
+          DEVELOPER_DIR="$XCODE26/Contents/Developer" make -C embeddinggemma-src -j "$(sysctl -n hw.ncpu)" metal
+          cp embeddinggemma-src/build/embeddinggemma-metal stage/bin/embeddinggemma
+          echo "$EMBEDDINGGEMMA_COMMIT" > stage/bin/embeddinggemma.version
           agent-dist/slimserve/build-slimserve.sh "$PYTHON" stage/slimserve-wheels
           test -n "$(find stage/slimserve-wheels -maxdepth 1 -name 'vllm-*.whl' -print -quit)"
           TEST_HOME="$(mktemp -d)"
@@ -158,9 +173,11 @@ jobs:
           "$TEST_HOME/.sovereign/runtime/bin/llama-server" --version
           "$TEST_HOME/.sovereign/runtime/bin/sd-server" -h >/dev/null
           "$TEST_HOME/.sovereign/runtime/bin/whisper-server" -h >/dev/null
+          "$TEST_HOME/.sovereign/runtime/bin/embeddinggemma" --help >/dev/null
           "$TEST_HOME/.sovereign/runtime/venv/bin/python" -c 'import piper.http_server, onnxruntime'
           grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^whisper_server: $TEST_HOME/.sovereign/runtime/bin/whisper-server" "$TEST_HOME/.sovereign/agent.yaml"
+          grep -q "^embeddinggemma_server: $TEST_HOME/.sovereign/runtime/bin/embeddinggemma" "$TEST_HOME/.sovereign/agent.yaml"
           # An agent.yaml from before image deployments gains the image server
           # at upgrade and keeps everything else.
           printf 'listen: 127.0.0.1\nport: 9100\ndeployments: {}\n' > "$TEST_HOME/.sovereign/agent.yaml"
@@ -168,6 +185,7 @@ jobs:
             stage/agent-dist/install-agent.sh
           grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^whisper_server: $TEST_HOME/.sovereign/runtime/bin/whisper-server" "$TEST_HOME/.sovereign/agent.yaml"
+          grep -q "^embeddinggemma_server: $TEST_HOME/.sovereign/runtime/bin/embeddinggemma" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^port: 9100" "$TEST_HOME/.sovereign/agent.yaml"
           rm -rf "$TEST_HOME"
           tar -C stage -czf "sovereign-metal-agent-$VERSION-arm64.tar.gz" .

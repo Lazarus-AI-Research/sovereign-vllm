@@ -53,6 +53,9 @@ class AgentConfig(BaseModel):
     # The SlimServe command a language model deployment served from a
     # SlimServe profile runs; empty where SlimServe is not installed.
     slimserve: str = ""
+    # The embeddinggemma.c server an EmbeddingGemma 2 deployment can run on;
+    # empty where it is not installed.
+    embeddinggemma_server: str = ""
     # Every served model: created by Control while the appliance runs and
     # persisted so a restarted agent serves them again.
     deployments: dict[str, AgentDeployment] = {}

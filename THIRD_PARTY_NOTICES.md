@@ -8,6 +8,9 @@ third-party components. Their own license terms continue to apply.
 - stable-diffusion.cpp — MIT License — <https://github.com/leejet/stable-diffusion.cpp>
 - whisper.cpp — MIT License — <https://github.com/ggml-org/whisper.cpp> (the Metal
   distribution builds `whisper-server` from the pinned source tarball)
+- embeddinggemma.c — MIT License — <https://github.com/QuixiAI/embeddinggemma.c> (the
+  Metal distribution builds its server from a pinned commit for EmbeddingGemma 2
+  deployments)
 - Piper — GPL-3.0-or-later — <https://github.com/OHF-Voice/piper1-gpl> (installed
   as its own program in the Metal distribution's environment and run as a
   separate process for speech deployments; it bundles espeak-ng, GPL-3.0)

@@ -99,7 +99,7 @@ def harness(tmp_path, monkeypatch):
         port = request.url.port
         if port not in healthy_ports:
             raise httpx.ConnectError("refused")
-        if request.url.path == "/health":
+        if request.url.path in ("/health", "/healthz"):
             return answer({"status": "ok"})
         if request.url.path == "/v1/models" and request.method == "GET":
             return answer({"data": [{"id": "served", "object": "model"}]})
@@ -252,6 +252,68 @@ def test_embedding_deployment_takes_its_projector(harness):
         assert command[command.index("--mmproj") + 1].endswith("metal/second-mmproj.gguf")
         assert command[command.index("-ub") + 1] == "8192"
 
+
+
+def embeddinggemma_installed(harness, tmp_path):
+    server = tmp_path / "embeddinggemma"
+    server.write_text("#!/bin/sh\n")
+    server.chmod(0o755)
+    harness.agent.config.embeddinggemma_server = str(server)
+    return server
+
+
+# EmbeddingGemma 2 can run on embeddinggemma.c instead of llama-server: its
+# verified weights and projector, on loopback, with short requests beside
+# the bulk waves, and it is up once /healthz answers.
+def test_an_embedding_deployment_runs_on_embeddinggemma_where_installed(harness, tmp_path):
+    server = embeddinggemma_installed(harness, tmp_path)
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/embed-native", headers=harness.headers, json=second_request(
+            harness, kind="embedding", served_model_name="embeddinggemma-2", context_length=8192, engine="embeddinggemma.c",
+        ))
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "embeddinggemma.c"
+        child = harness.children[-1]
+        assert child.command == [
+            str(server), "--bind", "127.0.0.1", "--port", str(child.port),
+            "--model", str(harness.weights.resolve()), "--short-bypass-tokens", "64",
+            "--mmproj", str(harness.projector.resolve()),
+        ]
+        assert not child.env or not any(name.startswith("LLAMA_") for name in child.env)
+        answered = api.post("/deployments/embed-native/v1/embeddings", headers=harness.headers, json={"input": ["a"]})
+        assert answered.status_code == 200
+        assert harness.inference[-1][1] == "/v1/embeddings"
+
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    restarted.config.embeddinggemma_server = str(server)
+    assert restarted.config.deployments["embed-native"].engine == "embeddinggemma.c"
+    restarted.start_deployments()
+    assert harness.children[-1].command[0] == str(server)
+
+
+@pytest.mark.parametrize("bad", [
+    {"kind": "generation"},
+    {"pooling": "last"},
+    {"normalization": "none"},
+    {"context_length": 16384},
+])
+def test_bad_embeddinggemma_requests_are_refused_before_any_process_starts(harness, tmp_path, bad):
+    embeddinggemma_installed(harness, tmp_path)
+    request = second_request(harness, kind="embedding", served_model_name="embeddinggemma-2", context_length=8192, engine="embeddinggemma.c")
+    request.update(bad)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/embed-native", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
+
+
+def test_an_embeddinggemma_deployment_is_refused_where_it_is_not_installed(harness):
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/embed-native", headers=harness.headers, json=second_request(
+            harness, kind="embedding", served_model_name="embeddinggemma-2", context_length=8192, engine="embeddinggemma.c",
+        ))
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
 
 
 def test_removing_a_deployment_stops_only_that_process(harness):

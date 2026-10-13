@@ -21,7 +21,8 @@ PYTHON_BIN="$DIST_DIR/python/bin/python3"
 LLAMA_BIN="$DIST_DIR/bin/llama-server"
 SD_BIN="$DIST_DIR/bin/sd-server"
 WHISPER_BIN="$DIST_DIR/bin/whisper-server"
-for required in "$UV_BIN" "$PYTHON_BIN" "$LLAMA_BIN" "$SD_BIN" "$WHISPER_BIN"; do
+EMBEDDINGGEMMA_BIN="$DIST_DIR/bin/embeddinggemma"
+for required in "$UV_BIN" "$PYTHON_BIN" "$LLAMA_BIN" "$SD_BIN" "$WHISPER_BIN" "$EMBEDDINGGEMMA_BIN"; do
   [[ -x "$required" ]] || { echo "error: Metal distribution is missing $required" >&2; exit 1; }
 done
 LLAMA_LIBS=("$DIST_DIR"/bin/*.dylib)
@@ -39,6 +40,8 @@ mkdir -p "$RUNTIME_HOME/bin" "$LOG_DIR" "$AGENT_HOME/models/metal" "$HOME/Librar
 install -m 755 "$LLAMA_BIN" "$RUNTIME_HOME/bin/llama-server"
 install -m 755 "$SD_BIN" "$RUNTIME_HOME/bin/sd-server"
 install -m 755 "$WHISPER_BIN" "$RUNTIME_HOME/bin/whisper-server"
+install -m 755 "$EMBEDDINGGEMMA_BIN" "$RUNTIME_HOME/bin/embeddinggemma"
+install -m 644 "$EMBEDDINGGEMMA_BIN.version" "$RUNTIME_HOME/bin/embeddinggemma.version"
 cp -pPR "${LLAMA_LIBS[@]}" "$RUNTIME_HOME/bin/"
 
 if [[ ! -f "$CONFIG" ]]; then
@@ -53,6 +56,10 @@ fi
 # Likewise the transcription server, which arrived with speech deployments.
 if ! grep -q '^whisper_server:' "$CONFIG"; then
   printf 'whisper_server: %s\n' "$RUNTIME_HOME/bin/whisper-server" >> "$CONFIG"
+fi
+# And the EmbeddingGemma 2 server, which arrived after both.
+if ! grep -q '^embeddinggemma_server:' "$CONFIG"; then
+  printf 'embeddinggemma_server: %s\n' "$RUNTIME_HOME/bin/embeddinggemma" >> "$CONFIG"
 fi
 # SlimServe serves the models it has a profile for, and the smallest of its
 # Metal profiles needs a Mac of 48 GiB: a smaller one is not given it. It
