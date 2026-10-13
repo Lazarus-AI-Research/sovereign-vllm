@@ -215,6 +215,8 @@ def test_deployment_proxy_forwards_to_that_process_and_only_its_kind(harness):
         assert api.put("/agent/admin/deployments/assistant-second", headers=harness.headers, json=second_request(harness)).status_code == 200
         answer = api.post("/deployments/assistant-second/v1/chat/completions", headers=harness.headers, json={"messages": []})
         assert answer.status_code == 200 and answer.json()["choices"][0]["message"]["content"] == "from 9110"
+        # It found a place free, and says it waited for none.
+        assert answer.headers["x-queue-ms"] == "0"
         port, path, authorization, _ = harness.inference[-1]
         assert (port, path) == (9110, "/v1/chat/completions") and authorization.startswith("Bearer ")
 
