@@ -258,10 +258,6 @@ def mlx_options(kind: str, mlx: MLXSnapshot | None, slimserve, components: dict,
         raise ValueError("an MLX deployment's sha256 is its snapshot's own checksum")
 
 
-# A SlimServe deployment is a language model whose files are the weights, a
-# projector where the model reads images, and a drafter where the profile
-# speculates, each named in the layout exactly when it is given. Its thinking
-# is the profile's, which SlimServe does not let a launch change.
 def embeddinggemma_options(kind: str, engine: str | None, slimserve, mlx, components: dict) -> None:
     if engine is None:
         return
@@ -269,6 +265,10 @@ def embeddinggemma_options(kind: str, engine: str | None, slimserve, mlx, compon
         raise ValueError("embeddinggemma.c serves embedding deployments of its own weights and projector only")
 
 
+# A SlimServe deployment is a language model whose files are the weights, a
+# projector where the model reads images, and a drafter where the profile
+# speculates, each named in the layout exactly when it is given. Its thinking
+# is the profile's, which SlimServe does not let a launch change.
 def slimserve_options(kind: str, slimserve: SlimServeProfile | None, components: dict, projector: str | None, thinking: str | None, budget: int | None) -> None:
     if slimserve is None:
         if kind == "generation" and components:

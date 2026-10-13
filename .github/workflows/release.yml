@@ -108,13 +108,6 @@ jobs:
           version: ${{ env.UV_VERSION }}
       - name: Require Apple Silicon runner
         run: test "$(uname -m)" = arm64
-      # embeddinggemma.c compiles its Metal 4 kernels too, which needs the
-      # Xcode 26 toolchain; the binary still runs on macOS 15.
-      - name: Select Xcode 26
-        run: |
-          XCODE="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
-          test -n "$XCODE"
-          sudo xcode-select -s "$XCODE"
       - name: Build self-contained distribution
         run: |
           set -euo pipefail
@@ -162,7 +155,12 @@ jobs:
           git init -q embeddinggemma-src
           git -C embeddinggemma-src fetch -q --depth 1 https://github.com/QuixiAI/embeddinggemma.c "$EMBEDDINGGEMMA_COMMIT"
           git -C embeddinggemma-src checkout -q FETCH_HEAD
-          make -C embeddinggemma-src -j "$(sysctl -n hw.ncpu)" metal
+          # Its Metal 4 kernels need the Xcode 26 toolchain, given to this build
+          # alone so the other engines keep the runner's; the binary targets
+          # macOS 14 (its Makefile's MACOSX_DEPLOYMENT_TARGET).
+          XCODE26="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          test -n "$XCODE26"
+          DEVELOPER_DIR="$XCODE26/Contents/Developer" make -C embeddinggemma-src -j "$(sysctl -n hw.ncpu)" metal
           cp embeddinggemma-src/build/embeddinggemma-metal stage/bin/embeddinggemma
           echo "$EMBEDDINGGEMMA_COMMIT" > stage/bin/embeddinggemma.version
           agent-dist/slimserve/build-slimserve.sh "$PYTHON" stage/slimserve-wheels
