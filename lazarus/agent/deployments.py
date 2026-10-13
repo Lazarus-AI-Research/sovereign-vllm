@@ -38,6 +38,9 @@ DEPLOYMENT_PORTS = range(9110, 9200)
 # A request that has not finished in this long is not worth keeping a
 # replacement waiting for.
 IDLE_TIMEOUT = 600.0
+# How long an answered request waited for a place in its engine, in
+# milliseconds; the gateway reads it.
+QUEUE_HEADER = "X-Queue-Ms"
 READY_TIMEOUT = 300.0
 # The manifest is read by clients with a five-second budget; every deployment
 # is probed at once and each probe is cut off well inside it, so a hung
@@ -1181,6 +1184,8 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
             return {"status": "unchanged", "id": deployment_id}
     agent.deployment_admission[deployment_id] = Admission()
     agent.deployment_admission[deployment_id].paused = True
+    if queueing := agent.deployment_queueing.get(deployment_id):
+        queueing.restart()
     try:
         # The previous process goes, and so does a child a failed creation
         # left registered without a record: a handle is never overwritten
@@ -1542,16 +1547,16 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
         queueing = agent.deployment_queueing.setdefault(deployment_id, Queueing()) if places else None
         ticket = queueing.arrive(places) if queueing else None
 
-        def release():
+        def release(refused: bool = False):
             admission.leave()
             if queueing:
-                queueing.leave(ticket)
+                queueing.leave(ticket, refused)
 
         admission.enter()
         try:
             response = await client.send(upstream, stream=True)
         except httpx.HTTPError:
-            release()
+            release(refused=True)
             await client.aclose()
             return JSONResponse(status_code=503, content={"error": "deployment engine unavailable"})
         except BaseException:
@@ -1571,11 +1576,15 @@ def register_deployment_routes(app: FastAPI, agent: Agent) -> None:
                 await response.aclose()
                 await client.aclose()
             finally:
-                release()
+                release(refused=response.is_error)
 
         from lazarus.agent.server import RelayedResponse
 
+        # How long it waited for its place is known here, as the engine does
+        # not say it; said only once the wait is over.
+        waited = queueing.waited_ms(ticket) if queueing else None
         return RelayedResponse(
             relay(), cleanup=cleanup, status_code=response.status_code,
             media_type=response.headers.get("content-type"),
+            headers={QUEUE_HEADER: str(waited)} if waited is not None else None,
         )
