@@ -29,6 +29,7 @@ from lazarus.agent import log_level
 from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_model_identity
 from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.agent.memory import memory_held
+from lazarus.agent.queueing import Queueing
 from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
@@ -163,6 +164,9 @@ class Agent:
         self.token = os.environ.get(config.token_env, "")
         self.deployments: dict[str, ServerProcess] = {}
         self.deployment_admission: dict[str, Admission] = {}
+        # The requests that waited for a place in each language model,
+        # kept across its relaunches.
+        self.deployment_queueing: dict[str, Queueing] = {}
         # One lock per deployment for its transitions, so a long drain or
         # readiness wait on one never holds up another; records_lock guards
         # only what they share: ports and the saved configuration.
