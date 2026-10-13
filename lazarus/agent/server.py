@@ -77,6 +77,16 @@ def mlx_engine() -> dict | None:
     return {"name": "mlx-lm", "version": version, "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
 
 
+# embeddinggemma.c as the manifest names it: installed when its server is,
+# at the commit the distribution recorded beside it.
+def embeddinggemma_engine(command: str) -> dict | None:
+    if not command or not os.access(command, os.X_OK):
+        return None
+    record = Path(command + ".version")
+    version = record.read_text().strip() if record.is_file() else "unknown"
+    return {"name": "embeddinggemma.c", "version": version, "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
+
+
 class ServerProcess:
     """One llama-server child: started here, probed here, stopped here."""
 
@@ -184,8 +194,8 @@ class Agent:
         self.available_engines: list[dict] = []
 
     async def discover_engines(self) -> None:
-        """The installed llama-server's version, and SlimServe's where it is
-        installed, for the manifest; not evidence of what any running child
+        """The installed llama-server's version, and SlimServe's, mlx-lm's and
+        embeddinggemma.c's where they are installed, for the manifest; not evidence of what any running child
         loaded."""
         self.available_engines = []
         slimserve = slimserve_engine(self.config.slimserve)
@@ -194,6 +204,9 @@ class Agent:
         mlx = mlx_engine()
         if mlx is not None:
             self.available_engines.append(mlx)
+        embeddinggemma = embeddinggemma_engine(self.config.embeddinggemma_server)
+        if embeddinggemma is not None:
+            self.available_engines.append(embeddinggemma)
         binary = self.config.llama_server
         if binary == "llama-server":
             binary = shutil.which(binary)

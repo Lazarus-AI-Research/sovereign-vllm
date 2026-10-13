@@ -295,3 +295,17 @@ def test_slimserve_is_an_available_engine_when_installed(tmp_path):
     (tmp_path / "slimserve" / "lib" / "python3.12" / "site-packages" / "vllm-0.1.dev1+g6aa3c3956.dist-info").mkdir(parents=True)
     engine = slimserve_engine(str(command))
     assert engine == {"name": "slimserve", "version": "0.1.dev1+g6aa3c3956", "adapter": "metal-host-agent", "variants": ["metal-arm64"]}
+
+
+# embeddinggemma.c is listed among the agent's engines exactly when its server
+# is installed, at the commit recorded beside it.
+def test_embeddinggemma_is_an_available_engine_when_installed(tmp_path):
+    from lazarus.agent.server import embeddinggemma_engine
+
+    command = tmp_path / "embeddinggemma"
+    assert embeddinggemma_engine(str(command)) is None and embeddinggemma_engine("") is None
+    command.write_text("#!/bin/sh\n")
+    command.chmod(0o755)
+    assert embeddinggemma_engine(str(command))["version"] == "unknown"
+    (tmp_path / "embeddinggemma.version").write_text("d8f9e33\n")
+    assert embeddinggemma_engine(str(command)) == {"name": "embeddinggemma.c", "version": "d8f9e33", "adapter": "metal-host-agent", "variants": ["metal-arm64"]}

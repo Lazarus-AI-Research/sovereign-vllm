@@ -125,6 +125,15 @@ SLIMSERVE = "slimserve"
 # mlx-lm serves a language model from its MLX snapshot: a repository's
 # files, each pinned by its checksum, in one directory.
 MLX = "mlx-lm"
+# embeddinggemma.c serves EmbeddingGemma 2 from its GGUF and projector on
+# kernels written for that one model. It reads at most 8,192 tokens of an
+# input, mean-pools and L2-normalizes as the model card says, and answers
+# /healthz once its weights are loaded.
+EMBEDDINGGEMMA = "embeddinggemma.c"
+EMBEDDINGGEMMA_WINDOW = 8192
+# A request this short (a search query) runs beside the waves bulk indexing
+# packs rather than behind them.
+EMBEDDINGGEMMA_SHORT_TOKENS = 64
 SLIMSERVE_FILES = ("model", "projector", "drafter")
 SLIMSERVE_READY_TIMEOUT = 1800.0
 PROFILE_ID = r"^[a-z0-9][a-z0-9.-]{0,63}$"
@@ -253,6 +262,13 @@ def mlx_options(kind: str, mlx: MLXSnapshot | None, slimserve, components: dict,
 # projector where the model reads images, and a drafter where the profile
 # speculates, each named in the layout exactly when it is given. Its thinking
 # is the profile's, which SlimServe does not let a launch change.
+def embeddinggemma_options(kind: str, engine: str | None, slimserve, mlx, components: dict) -> None:
+    if engine is None:
+        return
+    if kind != "embedding" or slimserve is not None or mlx is not None or components:
+        raise ValueError("embeddinggemma.c serves embedding deployments of its own weights and projector only")
+
+
 def slimserve_options(kind: str, slimserve: SlimServeProfile | None, components: dict, projector: str | None, thinking: str | None, budget: int | None) -> None:
     if slimserve is None:
         if kind == "generation" and components:
@@ -321,6 +337,8 @@ class AgentDeployment(BaseModel):
     slimserve: SlimServeProfile | None = None
     # A language model mlx-lm serves from its snapshot directory, model_path.
     mlx: MLXSnapshot | None = None
+    # An embedding model embeddinggemma.c serves instead of llama-server.
+    engine: Literal[EMBEDDINGGEMMA] | None = None
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -365,6 +383,11 @@ class AgentDeployment(BaseModel):
                 raise ValueError("components apply to image, video, speech and SlimServe deployments only")
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj_path, self.thinking, self.thinking_budget)
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj_path, self.thinking_budget, self.sha256)
+        embeddinggemma_options(self.kind, self.engine, self.slimserve, self.mlx, self.components)
+        if self.engine == EMBEDDINGGEMMA and (self.pooling != "mean" or self.normalization != "l2"):
+            raise ValueError("embeddinggemma.c pools by the mean and normalizes to unit length")
+        if self.engine == EMBEDDINGGEMMA and self.context_length > EMBEDDINGGEMMA_WINDOW:
+            raise ValueError(f"embeddinggemma.c reads at most {EMBEDDINGGEMMA_WINDOW} tokens of an input")
         if self.kind == "transcription":
             self.language = self.language or "auto"
         elif self.language is not None:
@@ -491,6 +514,7 @@ class DeploymentRequest(BaseModel):
     slimserve: SlimServeProfile | None = None
     # The artifact is then the snapshot's directory.
     mlx: MLXSnapshot | None = None
+    engine: Literal[EMBEDDINGGEMMA] | None = None
 
     @model_validator(mode="after")
     def projector_checksum(self):
@@ -511,6 +535,7 @@ class DeploymentRequest(BaseModel):
             raise ValueError("components apply to image, video, speech and SlimServe deployments only")
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj, self.thinking, self.thinking_budget)
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
+        embeddinggemma_options(self.kind, self.engine, self.slimserve, self.mlx, self.components)
         if self.requests is not None and (self.kind != "generation" or self.slimserve is not None or self.mlx is not None):
             raise ValueError("requests apply to a language model llama-server serves")
         if self.requests is not None and self.requests > 1 and self.context_length is None:
@@ -564,6 +589,8 @@ def server_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
         return transcription_command(agent, deployment)
     if deployment.kind == "speech":
         return speech_command(agent, deployment)
+    if deployment.engine == EMBEDDINGGEMMA:
+        return embeddinggemma_command(agent, deployment)
     command = [agent.config.llama_server]
     if deployment.kind == "embedding":
         command += [
@@ -613,7 +640,25 @@ def generation_requests(deployment: AgentDeployment) -> list[str]:
 def engine_of(deployment: AgentDeployment) -> str:
     if deployment.mlx is not None:
         return MLX
+    if deployment.engine is not None:
+        return deployment.engine
     return SLIMSERVE if deployment.slimserve is not None else ENGINES[deployment.kind]
+
+
+# The server listens on loopback and is reached through the agent's proxy,
+# like every other; its weights and projector are the verified files, so it
+# downloads nothing.
+def embeddinggemma_command(agent: Agent, deployment: AgentDeployment) -> list[str]:
+    command = [
+        agent.config.embeddinggemma_server,
+        "--bind", "127.0.0.1",
+        "--port", str(deployment.port),
+        "--model", deployment.model_path,
+        "--short-bypass-tokens", str(EMBEDDINGGEMMA_SHORT_TOKENS),
+    ]
+    if deployment.mmproj_path:
+        command += ["--mmproj", deployment.mmproj_path]
+    return command
 
 
 # mlx-lm's server behind the agent's guard (lazarus.agent.mlx_server), in the
@@ -688,6 +733,8 @@ def slimserve_command(agent: Agent, deployment: AgentDeployment, directory: Path
 # and logs at the appliance's level.
 def deployment_environment(deployment: AgentDeployment) -> dict[str, str]:
     environment: dict[str, str] = {}
+    if deployment.engine == EMBEDDINGGEMMA:
+        return environment
     if deployment.slimserve is not None:
         environment["HF_HUB_OFFLINE"] = "1"
         level = log_level.current()
@@ -1016,12 +1063,14 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     elif deployment.mlx is not None:
         command = mlx_command(deployment)
     else:
+        if deployment.engine == EMBEDDINGGEMMA and not agent.config.embeddinggemma_server:
+            raise ValueError("embeddinggemma.c is not installed on this host")
         command = deployment_command(agent, deployment)
     return ServerProcess(
         deployment_id, command, deployment.port, deployment.model_path,
         revision=deployment.revision, context_length=deployment.context_length,
         authenticated=deployment.kind == "generation", environment=deployment_environment(deployment),
-        health_path=HEALTH_PATHS[deployment.kind], engine=engine_of(deployment), weights_root=agent.model_root,
+        health_path="/healthz" if deployment.engine == EMBEDDINGGEMMA else HEALTH_PATHS[deployment.kind], engine=engine_of(deployment), weights_root=agent.model_root,
     )
 
 
@@ -1117,6 +1166,8 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
     # refused here, before a serving process is touched.
     if request.slimserve is not None and not agent.config.slimserve:
         raise ValueError("SlimServe is not installed on this host")
+    if request.engine == EMBEDDINGGEMMA and not agent.config.embeddinggemma_server:
+        raise ValueError("embeddinggemma.c is not installed on this host")
     suffixes = weight_suffixes(request.kind)
     if request.mlx is not None:
         from lazarus.agent.server import mlx_engine
@@ -1173,7 +1224,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
         upscale_sigmas=request.upscale_sigmas, text_encoder_type=request.text_encoder_type, language=request.language,
-        slimserve=request.slimserve, mlx=request.mlx,
+        slimserve=request.slimserve, mlx=request.mlx, engine=request.engine,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)

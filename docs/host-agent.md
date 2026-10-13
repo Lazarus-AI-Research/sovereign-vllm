@@ -47,7 +47,12 @@ is constrained; arbitrary `llama.cpp` flags never cross this boundary:
 ```
 
 An embedding deployment takes `pooling` (`mean`, `last`, `cls`) and
-`normalization` (`l2`, `none`) instead of a projector. An image deployment
+`normalization` (`l2`, `none`). One whose model is EmbeddingGemma 2 can name
+`"engine": "embeddinggemma.c"` to run on that model's own server instead of
+`llama-server`: mean pooling, L2 normalization and a window of at most 8,192
+tokens, with its projector for images and audio, short requests (a search
+query) served beside bulk indexing, and health at `/healthz`. The agent lists
+it among its engines where `embeddinggemma_server` is installed. An image deployment
 (`"kind": "image"`) names its diffusion weights as the artifact and the files
 served beside them under `components` (`clip_l`, `t5xxl`, `vae`, each
 `{"artifact", "sha256"}`), with the sampling it is pinned to: `steps`,
