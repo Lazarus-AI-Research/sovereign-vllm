@@ -22,9 +22,9 @@ env:
   # published, so its server is built from the pinned source tarball.
   WHISPER_VERSION: v1.9.4
   # embeddinggemma.c serves EmbeddingGemma 2 deployments; built from this
-  # commit (the Metal 3 route of QuixiAI/embeddinggemma.c#5), with both of its
+  # commit on its main (the Metal 3 route merged in QuixiAI/embeddinggemma.c#5), with both of its
   # Metal libraries embedded in the one binary.
-  EMBEDDINGGEMMA_COMMIT: d304eb0a12e0f2749945499c60f33a4d1b99a359
+  EMBEDDINGGEMMA_COMMIT: cf466b0a1f5fdd6e6a63fc430c3ab6831cd1cf3e
   WHISPER_SHA256: 57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae
   UV_VERSION: 0.11.28
   PYTHON_VERSION: 3.12.11
