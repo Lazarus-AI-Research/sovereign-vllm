@@ -52,7 +52,20 @@ An embedding deployment takes `pooling` (`mean`, `last`, `cls`) and
 `llama-server`: mean pooling, L2 normalization and a window of at most 8,192
 tokens, with its projector for images and audio, short requests (a search
 query) served beside bulk indexing, and health at `/healthz`. The agent lists
-it among its engines where `embeddinggemma_server` is installed. An image deployment
+it among its engines where `embeddinggemma_server` is installed. A language
+model deployment whose files are the ones Strata builds its pack from names
+them under `"strata": {"files": {path: sha256}, "tensors": {path: {"name",
+"dtype", "shape"}}}`, with the artifact their directory and `sha256` their own
+checksum, a `context_length` and at most 8 `requests`: the two GGUF shards of
+Qwen3.8-Flash-Next and the draft layer's tensors read out of Qwen's checkpoint.
+The agent builds the pack and the draft layer once per set of files with
+Strata's own tools (under `~/.sovereign/strata/packs`), writes the run
+settings at every start, and runs Strata's server on loopback with the key it
+gives every language model. It lists Strata among its engines where `strata`
+names its installed directory, which the installer sets on a Mac of macOS 15
+or later with 96 GB. Before macOS 26 Strata's prompt kernels do not compile, so
+prompts go through its decode window instead (about 67 tokens a second read on
+an M3 Max). An image deployment
 (`"kind": "image"`) names its diffusion weights as the artifact and the files
 served beside them under `components` (`clip_l`, `t5xxl`, `vae`, each
 `{"artifact", "sha256"}`), with the sampling it is pinned to: `steps`,

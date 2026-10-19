@@ -26,6 +26,15 @@ env:
   # Metal libraries embedded in the one binary.
   EMBEDDINGGEMMA_COMMIT: d304eb0a12e0f2749945499c60f33a4d1b99a359
   WHISPER_SHA256: 57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae
+  # Strata serves Qwen3.8-Flash-Next: its server and Python, and its Metal
+  # engine, as its release publishes them; its preparation tools read GGUF
+  # through llama.cpp's gguf-py at the commit Strata pins.
+  STRATA_RELEASE: v0.2.0-beta
+  STRATA_CONTROL_ASSET: strata-control-0.1.45.3-macos-arm64.tar.gz
+  STRATA_CONTROL_SHA256: 26ad2684d64d43005ae2ccc805797a6248369f1ab1ce0693acf2f1bd4da6e0ed
+  STRATA_ENGINE_ASSET: strata-engine-0.1.45.3-macos-arm64-metal.tar.gz
+  STRATA_ENGINE_SHA256: 47c5f5a8936e1497ed4c24ca0a26a46812affbce43d530106a317214c353d207
+  STRATA_LLAMA_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
   UV_VERSION: 0.11.28
   PYTHON_VERSION: 3.12.11
 
@@ -163,6 +172,18 @@ jobs:
           DEVELOPER_DIR="$XCODE26/Contents/Developer" make -C embeddinggemma-src -j "$(sysctl -n hw.ncpu)" metal
           cp embeddinggemma-src/build/embeddinggemma-metal stage/bin/embeddinggemma
           echo "$EMBEDDINGGEMMA_COMMIT" > stage/bin/embeddinggemma.version
+          mkdir -p stage/strata/engine stage/strata/third_party/llama.cpp
+          curl -fL -o strata-control.tar.gz "https://github.com/Niko1221/Strata/releases/download/$STRATA_RELEASE/$STRATA_CONTROL_ASSET"
+          echo "$STRATA_CONTROL_SHA256  strata-control.tar.gz" | shasum -a 256 -c -
+          tar -xzf strata-control.tar.gz -C stage/strata
+          curl -fL -o strata-engine.tar.gz "https://github.com/Niko1221/Strata/releases/download/$STRATA_RELEASE/$STRATA_ENGINE_ASSET"
+          echo "$STRATA_ENGINE_SHA256  strata-engine.tar.gz" | shasum -a 256 -c -
+          tar -xzf strata-engine.tar.gz -C stage/strata/engine
+          git init -q strata-llama-src
+          git -C strata-llama-src fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$STRATA_LLAMA_COMMIT"
+          git -C strata-llama-src checkout -q FETCH_HEAD
+          cp -R strata-llama-src/gguf-py stage/strata/third_party/llama.cpp/gguf-py
+          stage/strata/engine/strata --version
           agent-dist/slimserve/build-slimserve.sh "$PYTHON" stage/slimserve-wheels
           test -n "$(find stage/slimserve-wheels -maxdepth 1 -name 'vllm-*.whl' -print -quit)"
           TEST_HOME="$(mktemp -d)"
@@ -175,6 +196,9 @@ jobs:
           "$TEST_HOME/.sovereign/runtime/bin/whisper-server" -h >/dev/null
           "$TEST_HOME/.sovereign/runtime/bin/embeddinggemma" --help >/dev/null
           "$TEST_HOME/.sovereign/runtime/venv/bin/python" -c 'import piper.http_server, onnxruntime'
+          # The runner is smaller than any Mac Strata is installed on, so its
+          # server is checked where the distribution carries it.
+          stage/strata/python/bin/python3 -I stage/strata/serve/server.py --help >/dev/null
           grep -q "^sd_server: $TEST_HOME/.sovereign/runtime/bin/sd-server" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^whisper_server: $TEST_HOME/.sovereign/runtime/bin/whisper-server" "$TEST_HOME/.sovereign/agent.yaml"
           grep -q "^embeddinggemma_server: $TEST_HOME/.sovereign/runtime/bin/embeddinggemma" "$TEST_HOME/.sovereign/agent.yaml"

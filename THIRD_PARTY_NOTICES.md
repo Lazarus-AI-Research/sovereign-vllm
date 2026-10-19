@@ -11,6 +11,10 @@ third-party components. Their own license terms continue to apply.
 - embeddinggemma.c — MIT License — <https://github.com/QuixiAI/embeddinggemma.c> (the
   Metal distribution builds its server from a pinned commit for EmbeddingGemma 2
   deployments)
+- Strata — MIT License — <https://github.com/Niko1221/Strata> (the Metal
+  distribution carries its released server, Python and Metal engine, run as
+  a separate process for Qwen3.8-Flash-Next deployments; its preparation tools
+  read GGUF through llama.cpp's gguf-py, MIT, at the commit Strata pins)
 - Piper — GPL-3.0-or-later — <https://github.com/OHF-Voice/piper1-gpl> (installed
   as its own program in the Metal distribution's environment and run as a
   separate process for speech deployments; it bundles espeak-ng, GPL-3.0)

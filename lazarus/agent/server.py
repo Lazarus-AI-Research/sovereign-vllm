@@ -30,6 +30,7 @@ from lazarus.agent.config import AgentConfig, load_agent_config, valid_native_mo
 from lazarus.agent.deployments import Admission, observe_deployments, register_deployment_routes, start_deployment
 from lazarus.agent.memory import memory_held
 from lazarus.agent.queueing import Queueing
+from lazarus.agent.strata import strata_engine
 from lazarus.appliance.manifest import RUNTIME_VERSION
 
 logger = logging.getLogger("sovereign.agent.server")
@@ -125,8 +126,10 @@ class ServerProcess:
                 raise ValueError("generation authentication is agent-owned")
             child_env.pop("LLAMA_ARG_API_KEY_FILE", None)
             child_env["LLAMA_API_KEY"] = self.api_key
-            # SlimServe's server, vLLM's, reads its key the same way.
+            # SlimServe's server, vLLM's, reads its key the same way, and
+            # Strata's server its own variable.
             child_env["VLLM_API_KEY"] = self.api_key
+            child_env["STRATA_API_KEY"] = self.api_key
         if environment:
             child_env.update(environment)
         log_dir = Path(os.environ.get("SOVEREIGN_AGENT_LOG_DIR", Path.home() / ".sovereign" / "logs"))
@@ -194,9 +197,9 @@ class Agent:
         self.available_engines: list[dict] = []
 
     async def discover_engines(self) -> None:
-        """The installed llama-server's version, and SlimServe's, mlx-lm's and
-        embeddinggemma.c's where they are installed, for the manifest; not evidence of what any running child
-        loaded."""
+        """The installed llama-server's version, and SlimServe's, mlx-lm's,
+        embeddinggemma.c's and Strata's where they are installed, for the
+        manifest; not evidence of what any running child loaded."""
         self.available_engines = []
         slimserve = slimserve_engine(self.config.slimserve)
         if slimserve is not None:
@@ -207,6 +210,9 @@ class Agent:
         embeddinggemma = embeddinggemma_engine(self.config.embeddinggemma_server)
         if embeddinggemma is not None:
             self.available_engines.append(embeddinggemma)
+        strata = strata_engine(self.config.strata)
+        if strata is not None:
+            self.available_engines.append(strata)
         binary = self.config.llama_server
         if binary == "llama-server":
             binary = shutil.which(binary)
@@ -310,12 +316,13 @@ class Agent:
         return model
 
     def resolve_snapshot(self, artifact: str, files: dict[str, str]) -> Path:
-        """An MLX snapshot's directory, every file in it the one pinned."""
+        """A snapshot's directory (MLX's, or the files Strata builds its pack
+        from), every file in it the one pinned."""
         if not valid_native_model_identity(f"/models/{artifact}"):
             raise ValueError("artifact must use a bounded canonical relative native model path")
         directory = self._resolve_managed_path(Path(artifact))
         if not directory.is_dir():
-            raise ValueError("an MLX artifact must resolve to a snapshot directory within the managed model directory")
+            raise ValueError("a snapshot artifact must resolve to a snapshot directory within the managed model directory")
         from lazarus.agent.deployments import snapshot_holds_its_pins
 
         snapshot_holds_its_pins(directory, files)
@@ -344,7 +351,7 @@ class Agent:
 
     def observed_model(self, model_path: str, directory: bool = False) -> str:
         """Project an actual native loader input, never an intended model
-        alias: a weight file, or an MLX snapshot's directory."""
+        alias: a weight file, or a snapshot's directory."""
         path = Path(model_path)
         if not path.is_absolute() or str(path) != model_path or ".." in path.parts:
             raise ValueError("observed model must use a canonical absolute path")
@@ -354,7 +361,7 @@ class Agent:
             raise ValueError("native model identity must use at most 512 UTF-8 bytes and canonical path components")
         resolved = self._resolve_managed_path(relative)
         if not (resolved.is_dir() if directory else resolved.is_file()):
-            raise ValueError("observed model must be a managed local file, or an MLX snapshot's directory")
+            raise ValueError("observed model must be a managed local file, or a snapshot's directory")
         return identity
 
     async def wait_embedding_ready(self, process: ServerProcess, timeout: float = 120) -> None:
