@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -1974,3 +1975,162 @@ def test_a_metrics_page_without_both_counts_says_nothing():
     assert parse_load("llamacpp:requests_processing 1\nllamacpp:requests_deferred 0\n") == (1, 0)
     assert parse_load("llamacpp:requests_processing 1\n") is None
     assert parse_load("llamacpp:requests_processing x\nllamacpp:requests_deferred 0\n") is None
+
+
+def strata_files(harness):
+    """The files Strata builds its pack from, on disk under the managed
+    directory: two shards and one draft-layer tensor."""
+    directory = harness.models / "ISTA-DASLab--Flash-GGUF" / ("e" * 40)
+    contents = {
+        "Q2_0/Flash-GSQ-RCO-Q2_0-00001-of-00002.gguf": b"experts",
+        "Q2_0/Flash-GSQ-RCO-Q2_0-00002-of-00002.gguf": b"n-gram table",
+        "draft/mtp.fc.weight.bin": b"\x00\x01" * 4,
+    }
+    files = {}
+    for name, data in contents.items():
+        (directory / name).parent.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_bytes(data)
+        files[name] = hashlib.sha256(data).hexdigest()
+    return directory, files
+
+
+def strata_request(harness, **overrides):
+    from lazarus.agent.strata import StrataPack
+
+    directory, files = strata_files(harness)
+    tensors = {"draft/mtp.fc.weight.bin": {"name": "mtp.fc.weight", "dtype": "BF16", "shape": [2, 2]}}
+    request = {
+        "kind": "generation", "artifact": f"metal/ISTA-DASLab--Flash-GGUF/{'e' * 40}",
+        "sha256": StrataPack(files=files, tensors=tensors).digest(), "revision": "e" * 40,
+        "served_model_name": "flash", "context_length": 262144, "requests": 2, "thinking": "off",
+        "strata": {"files": files, "tensors": tensors},
+    }
+    request.update(overrides)
+    return request, directory
+
+
+@pytest.fixture()
+def strata(harness, tmp_path, monkeypatch):
+    """Strata installed for the agent, its pack builds recorded rather than
+    run."""
+    root = tmp_path / "strata"
+    harness.agent.config.strata = str(root)
+    builds = []
+
+    def prepare(agent, name, record):
+        from lazarus.agent.strata import settings_path
+
+        builds.append((name, record))
+        written = settings_path(agent, name, record)
+        written.parent.mkdir(parents=True, exist_ok=True)
+        written.write_text('{"args": []}')
+        pack = written.parent.parent / "packs" / record["sha256"] / "pack"
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / ".done").write_text("")
+        return written
+
+    monkeypatch.setattr("lazarus.agent.deployments.prepare_strata", prepare)
+    return SimpleNamespace(root=root, builds=builds)
+
+
+def test_a_strata_deployment_builds_its_pack_then_runs_strata_on_loopback(harness, strata):
+    request, directory = strata_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        created = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+        assert created.status_code == 200, created.text
+        assert created.json()["engine"] == "strata"
+        # Built, with the settings for the start, once and before anything
+        # serving is touched; the start uses those settings.
+        assert [name for name, _ in strata.builds] == ["flash"]
+        record = strata.builds[0][1]
+        assert record["model_path"] == str(directory.resolve()) and record["context_length"] == 262144 and record["thinking"] == "off"
+        from lazarus.agent.strata import settings_path
+
+        settings = settings_path(harness.agent, "flash", harness.agent.config.deployments["flash"].model_dump(mode="json"))
+        assert settings == settings_path(harness.agent, "flash", record)
+        child = harness.children[-1]
+        assert child.command == [
+            str(strata.root / "python" / "bin" / "python3"), "-I", str(strata.root / "serve" / "server.py"),
+            "--engine", "strata", "--config", str(settings), "--host", "127.0.0.1", "--port", "9110",
+            "--parallel", "2", "--offline",
+        ]
+        # Strata's server takes the key the agent gives every generation child.
+        assert child.env["STRATA_API_KEY"] == child.env["LLAMA_API_KEY"]
+        status = api.get("/agent/deployments", headers=harness.headers).json()["deployments"]["flash"]
+        assert status["requests"] == 2 and status["engine"] == "strata"
+
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    assert restarted.config.deployments["flash"].strata.files == request["strata"]["files"]
+
+
+def test_a_restart_that_finds_no_settings_writes_them(harness, strata):
+    request, _ = strata_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request).status_code == 200
+    for written in (Path(harness.config_path).parent / "strata" / "deployments").glob("flash.*.json"):
+        written.unlink()
+    restarted = Agent(load_agent_config(harness.config_path), harness.config_path)
+    restarted.config.strata = str(strata.root)
+    restarted.start_deployments()
+    assert [name for name, _ in strata.builds] == ["flash", "flash"]
+    assert harness.children[-1].command[3:5] == ["--engine", "strata"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"sha256": "0" * 64},
+    {"strata": {"files": {"Q2_0/Flash-GSQ-RCO-Q2_0-00001-of-00002.gguf": "a" * 64}, "tensors": {}}},
+    {"strata": {"files": {"../x.gguf": "a" * 64, "y.gguf": "b" * 64}, "tensors": {}}},
+    {"context_length": None},
+    {"requests": 9},
+    {"thinking": "on", "thinking_budget": 512},
+    {"mmproj": "metal/second-mmproj.gguf", "mmproj_sha256": "c" * 64},
+    {"kind": "embedding"},
+])
+def test_bad_strata_requests_are_refused_before_any_process_starts(harness, strata, bad):
+    request, _ = strata_request(harness)
+    request.update(bad)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == [] and strata.builds == []
+
+
+def test_a_draft_tensor_that_is_not_one_of_the_files_is_refused(harness, strata):
+    request, _ = strata_request(harness)
+    request["strata"]["tensors"]["draft/other.bin"] = {"name": "mtp.other", "dtype": "BF16", "shape": [1]}
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == []
+
+
+def test_a_strata_deployment_is_refused_where_strata_is_not_installed(harness, strata):
+    harness.agent.config.strata = ""
+    request, _ = strata_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422), refused.text
+    assert harness.children == [] and strata.builds == []
+
+
+def test_a_pack_that_cannot_be_built_is_refused_with_where_to_look(harness, strata, monkeypatch):
+    def fails(agent, name, record):
+        raise ValueError(f"Strata's pack for {name} could not be built; see prepare.log")
+
+    monkeypatch.setattr("lazarus.agent.deployments.prepare_strata", fails)
+    request, _ = strata_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422) and "prepare.log" in refused.text, refused.text
+    assert harness.children == []
+
+
+def test_removing_a_strata_deployment_frees_its_pack_and_settings(harness, strata):
+    request, _ = strata_request(harness)
+    home = Path(harness.config_path).parent / "strata"
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request).status_code == 200
+        assert (home / "packs" / request["sha256"]).is_dir() and list((home / "deployments").glob("flash.*.json"))
+        assert api.delete("/agent/admin/deployments/flash", headers=harness.headers).status_code == 200
+    assert not (home / "packs" / request["sha256"]).exists()
+    assert not list((home / "deployments").glob("flash.*.json"))

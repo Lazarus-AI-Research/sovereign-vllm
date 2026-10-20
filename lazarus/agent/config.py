@@ -56,6 +56,10 @@ class AgentConfig(BaseModel):
     # The embeddinggemma.c server an EmbeddingGemma 2 deployment can run on;
     # empty where it is not installed.
     embeddinggemma_server: str = ""
+    # The directory Strata's server, its Python and its engine are installed
+    # in, which a Qwen3.8-Flash-Next deployment runs on; empty where it is
+    # not installed.
+    strata: str = ""
     # Every served model: created by Control while the appliance runs and
     # persisted so a restarted agent serves them again.
     deployments: dict[str, AgentDeployment] = {}

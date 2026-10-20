@@ -26,6 +26,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from lazarus.agent import log_level
 
 from lazarus.agent.queueing import Queueing
+from lazarus.agent.strata import (
+    STRATA, STRATA_MAX_REQUESTS, STRATA_READY_TIMEOUT, StrataPack, prepare_strata, prepared, prune_strata, settings_path, strata_command,
+    strata_options,
+)
 
 if TYPE_CHECKING:
     from lazarus.agent.server import Agent, ServerProcess
@@ -339,6 +343,9 @@ class AgentDeployment(BaseModel):
     mlx: MLXSnapshot | None = None
     # An embedding model embeddinggemma.c serves instead of llama-server.
     engine: Literal[EMBEDDINGGEMMA] | None = None
+    # A language model Strata serves from the pack it builds out of the
+    # files in model_path.
+    strata: StrataPack | None = None
 
     @field_validator("model_path", "mmproj_path")
     @classmethod
@@ -384,6 +391,9 @@ class AgentDeployment(BaseModel):
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj_path, self.thinking, self.thinking_budget)
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj_path, self.thinking_budget, self.sha256)
         embeddinggemma_options(self.kind, self.engine, self.slimserve, self.mlx, self.components)
+        strata_options(self.kind, self.strata, [self.slimserve, self.mlx, self.engine], self.components, self.mmproj_path, self.thinking_budget, self.sha256)
+        if self.strata is not None and (not 128 <= self.context_length <= LLAMA_WINDOW_LIMIT or self.requests > STRATA_MAX_REQUESTS):
+            raise ValueError(f"a Strata deployment names its window, and runs at most {STRATA_MAX_REQUESTS} requests at once")
         if self.engine == EMBEDDINGGEMMA and (self.pooling != "mean" or self.normalization != "l2"):
             raise ValueError("embeddinggemma.c pools by the mean and normalizes to unit length")
         if self.engine == EMBEDDINGGEMMA and self.context_length > EMBEDDINGGEMMA_WINDOW:
@@ -515,6 +525,8 @@ class DeploymentRequest(BaseModel):
     # The artifact is then the snapshot's directory.
     mlx: MLXSnapshot | None = None
     engine: Literal[EMBEDDINGGEMMA] | None = None
+    # The artifact is then the directory of Strata's files.
+    strata: StrataPack | None = None
 
     @model_validator(mode="after")
     def projector_checksum(self):
@@ -536,8 +548,11 @@ class DeploymentRequest(BaseModel):
         slimserve_options(self.kind, self.slimserve, self.components, self.mmproj, self.thinking, self.thinking_budget)
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
         embeddinggemma_options(self.kind, self.engine, self.slimserve, self.mlx, self.components)
+        strata_options(self.kind, self.strata, [self.slimserve, self.mlx, self.engine], self.components, self.mmproj, self.thinking_budget, self.sha256)
+        if self.strata is not None and (not 128 <= (self.context_length or 0) <= LLAMA_WINDOW_LIMIT or (self.requests or 1) > STRATA_MAX_REQUESTS):
+            raise ValueError(f"a Strata deployment names its window, and runs at most {STRATA_MAX_REQUESTS} requests at once")
         if self.requests is not None and (self.kind != "generation" or self.slimserve is not None or self.mlx is not None):
-            raise ValueError("requests apply to a language model llama-server serves")
+            raise ValueError("requests apply to a language model llama-server or Strata serves")
         if self.requests is not None and self.requests > 1 and self.context_length is None:
             raise ValueError("more than one request needs a context_length: the model's own window is served for one")
         if self.kind != "transcription" and self.language is not None:
@@ -640,6 +655,8 @@ def generation_requests(deployment: AgentDeployment) -> list[str]:
 def engine_of(deployment: AgentDeployment) -> str:
     if deployment.mlx is not None:
         return MLX
+    if deployment.strata is not None:
+        return STRATA
     if deployment.engine is not None:
         return deployment.engine
     return SLIMSERVE if deployment.slimserve is not None else ENGINES[deployment.kind]
@@ -733,7 +750,7 @@ def slimserve_command(agent: Agent, deployment: AgentDeployment, directory: Path
 # and logs at the appliance's level.
 def deployment_environment(deployment: AgentDeployment) -> dict[str, str]:
     environment: dict[str, str] = {}
-    if deployment.engine == EMBEDDINGGEMMA:
+    if deployment.engine == EMBEDDINGGEMMA or deployment.strata is not None:
         return environment
     if deployment.slimserve is not None:
         environment["HF_HUB_OFFLINE"] = "1"
@@ -862,7 +879,7 @@ def status_of(
     process = agent.deployments.get(deployment_id)
     running = process is not None and process.running()
     try:
-        model = agent.observed_model(deployment.model_path, directory=deployment.mlx is not None)
+        model = agent.observed_model(deployment.model_path, directory=served_from_directory(deployment))
     except (OSError, ValueError, TypeError, RuntimeError):
         return {"status": "unhealthy", "error_code": "MODEL_LOAD_FAILED", "kind": deployment.kind}
     admission = agent.deployment_admission.get(deployment_id)
@@ -915,9 +932,11 @@ async def memory_of(agent: Agent, deployment_id: str) -> tuple[int, int] | None:
 
 def places_of(deployment: AgentDeployment) -> int | None:
     """How many requests the language model's engine runs at once, where the
-    agent knows: llama-server's slots, or mlx-lm's one."""
+    agent knows: llama-server's slots, mlx-lm's one, or Strata's."""
     if deployment.mlx is not None:
         return MLX_CONCURRENCY
+    if deployment.strata is not None:
+        return deployment.requests
     if engine_serves_metrics(deployment):
         return deployment.requests if deployment.context_length else 1
     return None
@@ -945,15 +964,16 @@ def parse_load(metrics: str) -> tuple[int, int] | None:
 
 async def load_of(agent: Agent, deployment_id: str, deployment: AgentDeployment) -> tuple[int, int] | None:
     """The requests the deployment runs now and the requests waiting: as
-    llama-server counts them, or for mlx-lm, which runs one at a time, from
-    the requests the agent has in flight to it. None where neither can say."""
+    llama-server counts them, or for mlx-lm and Strata, whose places the
+    agent knows, from the requests it has in flight to them. None where neither can say."""
     process = agent.deployments.get(deployment_id)
     if process is None or not process.running():
         return None
-    if deployment.mlx is not None:
+    if deployment.mlx is not None or deployment.strata is not None:
+        places = places_of(deployment)
         admission = agent.deployment_admission.get(deployment_id)
         in_flight = admission.requests if admission else 0
-        return min(in_flight, MLX_CONCURRENCY), max(0, in_flight - MLX_CONCURRENCY)
+        return min(in_flight, places), max(0, in_flight - places)
     if not engine_serves_metrics(deployment):
         return None
     try:
@@ -989,7 +1009,7 @@ async def observe_deployments(agent: Agent) -> dict[str, dict]:
 
 
 async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, process: ServerProcess) -> None:
-    timeout = getattr(agent, "deployment_ready_timeout", SLIMSERVE_READY_TIMEOUT if deployment.slimserve else READY_TIMEOUT)
+    timeout = getattr(agent, "deployment_ready_timeout", SLIMSERVE_READY_TIMEOUT if deployment.slimserve else STRATA_READY_TIMEOUT if deployment.strata else READY_TIMEOUT)
     if deployment.kind == "embedding":
         await agent.wait_embedding_ready(process, timeout=timeout)
         return
@@ -1004,17 +1024,22 @@ async def wait_deployment_ready(agent: Agent, deployment: AgentDeployment, proce
 
 
 # mlx-lm loads every weight file it finds in the directory, so the
-# directory holds the pinned files and nothing else, none of them a link.
+# directory holds the pinned files and nothing else, none of them a link;
+# Strata's files are held to the same.
 def snapshot_holds_its_pins(directory: Path, files: dict[str, str]) -> None:
     present = set()
     for path in directory.rglob("*"):
         if path.is_symlink():
-            raise ValueError(f"{path} is a link; an MLX snapshot holds its files themselves")
+            raise ValueError(f"{path} is a link; a snapshot holds its files themselves")
         if path.is_file():
             present.add(path.relative_to(directory).as_posix())
     if present != set(files):
         extra, missing = sorted(present - set(files)), sorted(set(files) - present)
-        raise ValueError(f"the MLX snapshot in {directory} holds {extra or 'nothing'} beyond its pins and lacks {missing or 'nothing'}")
+        raise ValueError(f"the snapshot in {directory} holds {extra or 'nothing'} beyond its pins and lacks {missing or 'nothing'}")
+
+
+def served_from_directory(deployment: AgentDeployment) -> bool:
+    return deployment.mlx is not None or deployment.strata is not None
 
 
 def file_digest(path: str) -> str:
@@ -1028,9 +1053,10 @@ def file_digest(path: str) -> str:
 def verify_deployment_files(deployment: AgentDeployment) -> None:
     """The bytes on disk are the bytes the record was made for. A weight
     overwritten since is refused, never loaded under the recorded revision."""
-    if deployment.mlx is not None:
-        snapshot_holds_its_pins(Path(deployment.model_path), deployment.mlx.files)
-        for name, digest in deployment.mlx.files.items():
+    snapshot = deployment.mlx or deployment.strata
+    if snapshot is not None:
+        snapshot_holds_its_pins(Path(deployment.model_path), snapshot.files)
+        for name, digest in snapshot.files.items():
             if file_digest(str(Path(deployment.model_path) / name)) != digest:
                 raise ValueError(f"{deployment.model_path}/{name} no longer matches its recorded checksum")
         return
@@ -1051,7 +1077,7 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
     if agent.stopping:
         raise RuntimeError("the agent is shutting down")
     deployment = record or agent.config.deployments[deployment_id]
-    agent.observed_model(deployment.model_path, directory=deployment.mlx is not None)
+    agent.observed_model(deployment.model_path, directory=served_from_directory(deployment))
     # A request's files were checked as it arrived; a restart from agent.yaml
     # checks them again, since the disk may have changed meanwhile.
     if verify:
@@ -1062,6 +1088,17 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         command = slimserve_command(agent, deployment, lay_out_slimserve(agent, deployment_id, deployment))
     elif deployment.mlx is not None:
         command = mlx_command(deployment)
+    elif deployment.strata is not None:
+        if not agent.config.strata:
+            raise ValueError("Strata is not installed on this host")
+        # Settings written as the request arrived are used as they are; only
+        # a restart from agent.yaml that finds them, or the pack they name,
+        # gone or unfinished makes them again here.
+        record = deployment.model_dump(mode="json")
+        settings = settings_path(agent, deployment_id, record)
+        if not prepared(agent, record, settings):
+            settings = prepare_strata(agent, deployment_id, record)
+        command = strata_command(agent, deployment, settings)
     else:
         if deployment.engine == EMBEDDINGGEMMA and not agent.config.embeddinggemma_server:
             raise ValueError("embeddinggemma.c is not installed on this host")
@@ -1168,6 +1205,8 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         raise ValueError("SlimServe is not installed on this host")
     if request.engine == EMBEDDINGGEMMA and not agent.config.embeddinggemma_server:
         raise ValueError("embeddinggemma.c is not installed on this host")
+    if request.strata is not None and not agent.config.strata:
+        raise ValueError("Strata is not installed on this host")
     suffixes = weight_suffixes(request.kind)
     if request.mlx is not None:
         from lazarus.agent.server import mlx_engine
@@ -1175,6 +1214,24 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
         if mlx_engine() is None:
             raise ValueError("mlx-lm is not installed on this host")
         model = await asyncio.to_thread(agent.resolve_snapshot, request.artifact, request.mlx.files)
+    elif request.strata is not None:
+        model = await asyncio.to_thread(agent.resolve_snapshot, request.artifact, request.strata.files)
+        # The pack, the draft layer and the run settings are made before any
+        # serving process is touched: a build that fails leaves the
+        # deployment as it was.
+        record = {
+            "model_path": str(model), "sha256": request.sha256.lower(), "strata": request.strata.model_dump(mode="json"),
+            "context_length": request_window(request), "served_model_name": request.served_model_name,
+            "requests": request.requests or 1, "thinking": request.thinking,
+        }
+        agent.strata_building.append(record["sha256"])
+        try:
+            await asyncio.to_thread(prepare_strata, agent, deployment_id, record)
+            transition = Transition()
+            return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, None, {}, transition), transition, http_request)
+        finally:
+            agent.strata_building.remove(record["sha256"])
+            prune_strata(agent, set(agent.strata_building))
     else:
         model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
@@ -1224,7 +1281,7 @@ async def replace_on_port(agent: Agent, deployment_id: str, request: DeploymentR
         components=components, steps=request.steps, cfg_scale=request.cfg_scale, sampler=request.sampler,
         flow_shift=request.flow_shift, fps=request.fps, seconds=request.seconds, size=request.size,
         upscale_sigmas=request.upscale_sigmas, text_encoder_type=request.text_encoder_type, language=request.language,
-        slimserve=request.slimserve, mlx=request.mlx, engine=request.engine,
+        slimserve=request.slimserve, mlx=request.mlx, engine=request.engine, strata=request.strata,
     )
     if previous is not None:
         was_paused = await quiesce(agent, deployment_id, transition)
@@ -1341,6 +1398,8 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
                 raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
         agent.deployment_admission.pop(deployment_id, None)
         agent.deployment_queueing.pop(deployment_id, None)
+        if previous.strata is not None:
+            prune_strata(agent, set(agent.strata_building))
         return {"status": "stopped", "id": deployment_id}
 
 

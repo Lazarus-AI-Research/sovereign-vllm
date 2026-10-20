@@ -75,6 +75,19 @@ if [[ -d "$SLIMSERVE_WHEELS" ]] && (( $(sysctl -n hw.memsize) >= SLIMSERVE_MINIM
     printf 'slimserve: %s\n' "$RUNTIME_HOME/slimserve/bin/slimserve" >> "$CONFIG"
   fi
 fi
+# Strata serves Qwen3.8-Flash-Next on a Mac of macOS 15 or later, which keeps
+# its buffers resident the way the engine needs, and of 96 GB, the smallest
+# whose share for models holds the size Control offers (45 GB at a 32k
+# window) with room left.
+STRATA_DIST="$DIST_DIR/strata"
+STRATA_MINIMUM_MEMORY=$((96 * 1024 * 1024 * 1024))
+if [[ -d "$STRATA_DIST" ]] && (( $(sw_vers -productVersion | cut -d. -f1) >= 15 )) && (( $(sysctl -n hw.memsize) >= STRATA_MINIMUM_MEMORY )); then
+  rm -rf "$RUNTIME_HOME/strata"
+  cp -pPR "$STRATA_DIST" "$RUNTIME_HOME/strata"
+  if ! grep -q '^strata:' "$CONFIG"; then
+    printf 'strata: %s\n' "$RUNTIME_HOME/strata" >> "$CONFIG"
+  fi
+fi
 chmod 600 "$CONFIG"
 if [[ ! -f "$TOKEN_FILE" ]]; then
   openssl rand -hex 32 > "$TOKEN_FILE"
