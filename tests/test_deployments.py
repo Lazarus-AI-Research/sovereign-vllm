@@ -2023,7 +2023,10 @@ def strata(harness, tmp_path, monkeypatch):
         builds.append((name, record))
         written = settings_path(agent, name, record)
         written.parent.mkdir(parents=True, exist_ok=True)
-        written.write_text("{}")
+        written.write_text('{"args": []}')
+        pack = written.parent.parent / "packs" / record["sha256"] / "pack"
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / ".done").write_text("")
         return written
 
     monkeypatch.setattr("lazarus.agent.deployments.prepare_strata", prepare)
@@ -2108,3 +2111,26 @@ def test_a_strata_deployment_is_refused_where_strata_is_not_installed(harness, s
         refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
     assert refused.status_code in (400, 422), refused.text
     assert harness.children == [] and strata.builds == []
+
+
+def test_a_pack_that_cannot_be_built_is_refused_with_where_to_look(harness, strata, monkeypatch):
+    def fails(agent, name, record):
+        raise ValueError(f"Strata's pack for {name} could not be built; see prepare.log")
+
+    monkeypatch.setattr("lazarus.agent.deployments.prepare_strata", fails)
+    request, _ = strata_request(harness)
+    with TestClient(build_app(harness.agent)) as api:
+        refused = api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request)
+    assert refused.status_code in (400, 422) and "prepare.log" in refused.text, refused.text
+    assert harness.children == []
+
+
+def test_removing_a_strata_deployment_frees_its_pack_and_settings(harness, strata):
+    request, _ = strata_request(harness)
+    home = Path(harness.config_path).parent / "strata"
+    with TestClient(build_app(harness.agent)) as api:
+        assert api.put("/agent/admin/deployments/flash", headers=harness.headers, json=request).status_code == 200
+        assert (home / "packs" / request["sha256"]).is_dir() and list((home / "deployments").glob("flash.*.json"))
+        assert api.delete("/agent/admin/deployments/flash", headers=harness.headers).status_code == 200
+    assert not (home / "packs" / request["sha256"]).exists()
+    assert not list((home / "deployments").glob("flash.*.json"))

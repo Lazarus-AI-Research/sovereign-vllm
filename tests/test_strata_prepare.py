@@ -30,3 +30,26 @@ def test_files_without_one_sizes_two_shards_are_refused(files):
 def test_prompts_take_the_decode_window_before_macos_26(monkeypatch, release, metal_4):
     monkeypatch.setattr(strata_prepare.platform, "mac_ver", lambda: (release, ("", "", ""), ""))
     assert strata_prepare.metal_4() is metal_4
+
+
+def test_a_build_out_of_time_ends_every_tool_it_started(tmp_path, monkeypatch):
+    import os
+    import time
+    from types import SimpleNamespace
+
+    from lazarus.agent import strata
+
+    python = tmp_path / "strata" / "python" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    started = tmp_path / "tool.pid"
+    python.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {started}\nsleep 60\n")
+    python.chmod(0o755)
+    agent = SimpleNamespace(config=SimpleNamespace(strata=str(tmp_path / "strata")), config_path=tmp_path / "agent.yaml")
+    monkeypatch.setattr(strata, "PREPARE_TIMEOUT", 1.0)
+    monkeypatch.setattr(strata, "unified_memory_gb", lambda: 128.0)
+    with pytest.raises(ValueError, match="not built within"):
+        strata.prepare_strata(agent, "flash", {"sha256": "a" * 64})
+    tool = int(started.read_text())
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(tool, 0)

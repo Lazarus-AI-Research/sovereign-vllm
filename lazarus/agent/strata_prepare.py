@@ -16,6 +16,7 @@ build is done.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import platform
@@ -111,12 +112,17 @@ def main() -> int:
     if size not in mac_fit.MAC_MODELS:
         raise SystemExit(f"{size} is not a size Strata serves on a Mac")
     out = Path(arguments.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ, STRATA_GGUF_PY=str(strata / "third_party" / "llama.cpp" / "gguf-py"))
-    build_pack(strata, snapshot / first, out / "pack", environment)
     streams = mac_fit.streams(size, arguments.memory_gb)
     drafts = mac_fit.stream_mtp(streams, arguments.memory_gb)
-    if drafts:
-        build_draft(strata, snapshot, tensors, files, out / "draft", environment)
+    # Two deployments of the same files build one pack: the second waits
+    # for the first and finds it done.
+    with open(out.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        build_pack(strata, snapshot / first, out / "pack", environment)
+        if drafts:
+            build_draft(strata, snapshot, tensors, files, out / "draft", environment)
     if arguments.settings is None:
         return 0
     window = request["context_length"]

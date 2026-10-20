@@ -195,6 +195,9 @@ class Agent:
         default_root = self.config_path.parent / "models" if self.config_path else Path.home() / ".sovereign" / "models"
         self.model_root = Path(os.environ.get("SOVEREIGN_AGENT_MODEL_ROOT", default_root)).resolve()
         self.available_engines: list[dict] = []
+        # The files of Strata deployments being built and started that are
+        # not yet recorded, whose packs no pruning may take.
+        self.strata_building: list[str] = []
 
     async def discover_engines(self) -> None:
         """The installed llama-server's version, and SlimServe's, mlx-lm's,

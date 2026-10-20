@@ -26,7 +26,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from lazarus.agent import log_level
 
 from lazarus.agent.queueing import Queueing
-from lazarus.agent.strata import STRATA, STRATA_MAX_REQUESTS, STRATA_READY_TIMEOUT, StrataPack, prepare_strata, settings_path, strata_command, strata_options
+from lazarus.agent.strata import (
+    STRATA, STRATA_MAX_REQUESTS, STRATA_READY_TIMEOUT, StrataPack, prepare_strata, prepared, prune_strata, settings_path, strata_command,
+    strata_options,
+)
 
 if TYPE_CHECKING:
     from lazarus.agent.server import Agent, ServerProcess
@@ -546,7 +549,7 @@ class DeploymentRequest(BaseModel):
         mlx_options(self.kind, self.mlx, self.slimserve, self.components, self.mmproj, self.thinking_budget, self.sha256)
         embeddinggemma_options(self.kind, self.engine, self.slimserve, self.mlx, self.components)
         strata_options(self.kind, self.strata, [self.slimserve, self.mlx, self.engine], self.components, self.mmproj, self.thinking_budget, self.sha256)
-        if self.strata is not None and (self.context_length is None or (self.requests or 1) > STRATA_MAX_REQUESTS):
+        if self.strata is not None and (not 128 <= (self.context_length or 0) <= LLAMA_WINDOW_LIMIT or (self.requests or 1) > STRATA_MAX_REQUESTS):
             raise ValueError(f"a Strata deployment names its window, and runs at most {STRATA_MAX_REQUESTS} requests at once")
         if self.requests is not None and (self.kind != "generation" or self.slimserve is not None or self.mlx is not None):
             raise ValueError("requests apply to a language model llama-server or Strata serves")
@@ -1089,10 +1092,11 @@ def start_deployment(agent: Agent, deployment_id: str, verify: bool = False, rec
         if not agent.config.strata:
             raise ValueError("Strata is not installed on this host")
         # Settings written as the request arrived are used as they are; only
-        # a restart from agent.yaml that finds none writes them here.
+        # a restart from agent.yaml that finds them, or the pack they name,
+        # gone or unfinished makes them again here.
         record = deployment.model_dump(mode="json")
         settings = settings_path(agent, deployment_id, record)
-        if not settings.is_file():
+        if not prepared(agent, record, settings):
             settings = prepare_strata(agent, deployment_id, record)
         command = strata_command(agent, deployment, settings)
     else:
@@ -1220,7 +1224,14 @@ async def apply_deployment(agent: Agent, deployment_id: str, request: Deployment
             "context_length": request_window(request), "served_model_name": request.served_model_name,
             "requests": request.requests or 1, "thinking": request.thinking,
         }
-        await asyncio.to_thread(prepare_strata, agent, deployment_id, record)
+        agent.strata_building.append(record["sha256"])
+        try:
+            await asyncio.to_thread(prepare_strata, agent, deployment_id, record)
+            transition = Transition()
+            return await run_transition(agent, replace_deployment(agent, deployment_id, request, model, None, {}, transition), transition, http_request)
+        finally:
+            agent.strata_building.remove(record["sha256"])
+            prune_strata(agent, set(agent.strata_building))
     else:
         model = await asyncio.to_thread(agent.resolve_model, request.artifact, request.sha256, suffixes)
     mmproj = None
@@ -1387,6 +1398,8 @@ async def forget_deployment(agent: Agent, deployment_id: str, transition: Transi
                 raise PersistenceError(f"deployment stopped but not forgotten: {exc}") from exc
         agent.deployment_admission.pop(deployment_id, None)
         agent.deployment_queueing.pop(deployment_id, None)
+        if previous.strata is not None:
+            prune_strata(agent, set(agent.strata_building))
         return {"status": "stopped", "id": deployment_id}
 
 

@@ -2,9 +2,11 @@
 busiest on the GPU. A deployment names the files Strata builds its pack
 from: the model's two GGUF shards and the draft layer's tensors, read out of
 Qwen's checkpoint, each pinned by its checksum. The agent builds the pack and
-the draft layer from them once per snapshot (strata_prepare.py, in Strata's
-own Python, offline), writes the run settings at every start, and runs
-Strata's server on loopback behind its guard like every other."""
+the draft layer from them once per set of files (strata_prepare.py, in
+Strata's own Python, offline) and writes the run settings as a request
+arrives, both before any serving process is touched; it removes what no
+deployment serves from any more, and runs Strata's server on loopback
+behind its guard like every other."""
 
 from __future__ import annotations
 
@@ -12,6 +14,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
@@ -23,8 +27,8 @@ if TYPE_CHECKING:
     from lazarus.agent.server import Agent
 
 STRATA = "strata"
-# Loading maps tens of gigabytes, and a first start builds the pack and the
-# draft layer before the server starts at all.
+# Loading maps tens of gigabytes; measured at about 30 s on an M3 Max with the
+# files in the cache, minutes from a cold disk.
 STRATA_READY_TIMEOUT = 1800.0
 # The most requests one Strata process decodes together.
 STRATA_MAX_REQUESTS = 8
@@ -129,8 +133,10 @@ def strata_home(agent: Agent) -> Path:
     return home / "strata"
 
 
+# In GiB, as Strata's own fitting (strata_control.mac_fit) counts a Mac's
+# memory.
 def unified_memory_gb() -> float:
-    return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True).stdout) / 1e9
+    return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True).stdout) / 2**30
 
 
 # What the run settings are written from: a deployment's files, window,
@@ -146,10 +152,29 @@ def settings_path(agent: Agent, name: str, record: dict) -> Path:
     return strata_home(agent) / "deployments" / f"{name}.{hashlib.sha256(written_from.encode()).hexdigest()[:16]}.json"
 
 
+def pack_of(agent: Agent, record: dict) -> Path:
+    return strata_home(agent) / "packs" / record["sha256"]
+
+
+def prepared(agent: Agent, record: dict, settings: Path) -> bool:
+    """Whether the run settings and everything they name were made whole: a
+    pack or draft layer removed or interrupted since is built again."""
+    if not settings.is_file():
+        return False
+    pack = pack_of(agent, record)
+    try:
+        drafts = "--mtp" in json.loads(settings.read_text())["args"]
+    except (OSError, ValueError, KeyError):
+        return False
+    return (pack / "pack" / ".done").is_file() and (not drafts or (pack / "draft" / ".done").is_file())
+
+
 def prepare_strata(agent: Agent, name: str, record: dict) -> Path:
     """The pack and the draft layer built for the record's files where they
     are not yet, and the run settings written from the record. Called off
-    the event loop; a first build takes minutes, a later one seconds."""
+    the event loop; a first build takes minutes, a later one seconds. A
+    build that fails or runs out of time is a ValueError naming its log, and
+    leaves none of its tools running."""
     root = Path(agent.config.strata)
     settings = settings_path(agent, name, record)
     settings.parent.mkdir(parents=True, exist_ok=True)
@@ -157,12 +182,43 @@ def prepare_strata(agent: Agent, name: str, record: dict) -> Path:
     request.write_text(json.dumps({field: record.get(field) for field in SETTINGS_FIELDS}))
     command = [
         str(root / "python" / "bin" / "python3"), "-I", str(Path(__file__).with_name("strata_prepare.py")),
-        "--strata", str(root), "--request", str(request), "--out", str(strata_home(agent) / "packs" / record["sha256"]),
+        "--strata", str(root), "--request", str(request), "--out", str(pack_of(agent, record)),
         "--memory-gb", f"{unified_memory_gb():.1f}", "--settings", str(settings),
     ]
-    with open(strata_home(agent) / "deployments" / f"{name}.prepare.log", "ab") as log:
-        subprocess.run(command, stdout=log, stderr=log, check=True, timeout=PREPARE_TIMEOUT)
+    log_path = strata_home(agent) / "deployments" / f"{name}.prepare.log"
+    with open(log_path, "ab") as log:
+        # Its own session, so a build that runs out of time ends with every
+        # tool it started rather than leaving them writing into the pack.
+        build = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)
+        try:
+            code = build.wait(timeout=PREPARE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(build.pid, signal.SIGKILL)
+            build.wait()
+            raise ValueError(f"Strata's pack for {name} was not built within {PREPARE_TIMEOUT:.0f} s; see {log_path}") from None
+    if code != 0:
+        raise ValueError(f"Strata's pack for {name} could not be built; see {log_path}")
     return settings
+
+
+def prune_strata(agent: Agent, building: set[str]) -> None:
+    """What no recorded deployment serves from any more goes: packs of files
+    none names, and run settings none was started with. A pack being built
+    for a request not yet recorded (its sha256 in building) stays."""
+    home = strata_home(agent)
+    records = {name: record for name, record in agent.config.deployments.items() if record.strata is not None}
+    kept = {record.sha256 for record in records.values()} | building
+    for pack in (home / "packs").glob("*"):
+        if pack.is_dir() and pack.name not in kept:
+            shutil.rmtree(pack, ignore_errors=True)
+            pack.with_suffix(".lock").unlink(missing_ok=True)
+    current = {settings_path(agent, name, record.model_dump(mode="json")).name.removesuffix(".json") for name, record in records.items()}
+    for written in (home / "deployments").glob("*.*.json"):
+        stem = written.name.removesuffix(".request.json").removesuffix(".json")
+        # Settings a request being started has not recorded yet may go too:
+        # its start finds them gone and writes them again in seconds.
+        if stem not in current:
+            written.unlink(missing_ok=True)
 
 
 # Strata's server on loopback, offline, holding as many requests at once as
